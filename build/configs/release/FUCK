@@ -30,7 +30,10 @@ fat32=1
 devfs=1
 e1000=1
 virtio_net=1
-ath9k=0
+# ath9k=1：真机 Atheros(AR928x) 原生 WiFi 试验（scan + WPA2-PSK connect）。
+# 注意：无匹配 Atheros 卡或硬件 init 失败时 driver_init 返回非零 →
+# DKM-E39 启动即 panic（承认高风险，见 CLAUDE.md 零降级策略）。
+ath9k=1
 ps2kbd=1
 ioapic_init=1
 lapic_enable=1
