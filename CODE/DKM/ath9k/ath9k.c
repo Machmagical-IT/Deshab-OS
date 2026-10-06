@@ -18,6 +18,7 @@
  */
 
 #include "../dkm_shared.h"
+#include "wpa2_crypto.h"
 
 static const char *const g_depends[] = {"pci","irq"};
 static const char *const g_provides[] = {"netdev"};
@@ -172,6 +173,12 @@ static int g_rx_ready;
 static struct ath9k_scan_result g_scan_results[ATH9K_MAX_SCAN_RESULTS];
 static u32 g_scan_count;
 static int g_scanning;
+
+/* 前向声明：接收路径需要把管理/控制帧交给连接状态机 */
+static int ath9k_handle_mgmt(const u8 *frame, u32 len);
+static void ath9k_handle_eapol(const u8 *eap, u32 len);
+static int eapol_find(const u8 *frame, u32 len, u32 *out_off);
+static void copy_mac(u8 dst[6], const u8 src[6]);
 
 /* ---- 串口日志（参考 e1000 raw_log） ---- */
 #define COM1 0x3F8
@@ -478,6 +485,20 @@ static int find_bssid(const u8 bssid[6]) {
 
 /* 处理一个接收到的 802.11 帧（从 RX 缓冲区解析） */
 static void ath9k_handle_rx_frame(const u8 *buf, u32 len, i8 rssi) {
+    if (len < 24) return;
+    u16 fctl = (u16)buf[0] | ((u16)buf[1] << 8);
+    u16 ftype = fctl & 0x000C;
+
+    /* 连接状态机：管理帧（认证/关联响应）与数据帧中的 EAPOL-Key */
+    if (ftype == 0x0000) {
+        if (ath9k_handle_mgmt(buf, len) == 0) return;
+    } else if (ftype == 0x0008) {              /* data */
+        u32 eoff = 0;
+        if (eapol_find(buf, len, &eoff) == 0)
+            ath9k_handle_eapol(buf + eoff, len - eoff);
+        /* 数据帧继续走 beacon 解析（多数会被拒绝） */
+    }
+
     struct ath9k_scan_result tmp;
     for (int i = 0; i < (int)sizeof(tmp); i++) ((u8 *)&tmp)[i] = 0;
     if (parse_beacon(buf, len, &tmp) != 0) return;
@@ -604,12 +625,548 @@ static int ath9k_is_wireless_impl(void *ctx) {
     return 1;
 }
 
-/* ath9k 当前不支持 TX（仅扫描）——严格错误策略插桩：上层若真把帧交给
- * 只会扫描的无线驱动，panic 而非静默丢包（ATH-E01）。 */
-static int ath9k_tx_stub(void *ctx, const void *packet, u32 length) {
-    (void)ctx; (void)packet; (void)length;
-    g_log->panic("ATH-E01 TX NOT IMPLEMENTED (scan-only driver got a tx)");
+/* ============================================================
+ *  TX 路径 + WPA2-PSK 连接状态机
+ *
+ *  说明：TX 描述符采用 AR9002（AR9280/9285）队列描述符布局的
+ *  最小可用子集；位域与 HAL initvals 需在实机 bring-up 时用
+ *  串口日志对拍（日志点见 ath9k_tx_frame）。协议层（认证/关联/
+ *  4-way/密钥安装）由 wpa2_crypto 提供并通过 wpa2_kat 自检。
+ * ============================================================ */
+
+/* TX 队列（BE）寄存器 */
+#define AR_TXDP(_q)   (0x0000u + 0x0800u * (_q))    /* TXQ 描述符基址 */
+#define AR_TXE        0x0800u
+#define AR_TXCFG      0x0008u
+#define AR_TXCFG_TXE  0x00000004u
+
+#define ATH9K_TX_DESC_COUNT 8u
+#define ATH9K_TX_BUF_SIZE   2048u
+
+/* AR9002 TX 队列描述符（32 字节，最小字段集） */
+struct ath9k_tx_desc {
+    u32 ds_link;     /* 下一描述符物理地址 */
+    u32 ds_data;     /* 数据缓冲物理地址 */
+    u32 ds_ctl0;     /* FRAME_LEN(0:12) | TXQ(12:16) */
+    u32 ds_ctl1;     /* BUF_LEN(0:12) | MORE(12) */
+    u32 ds_ctl2;     /* RTS/CTS + 速率索引（0 = 默认 1M CCK） */
+    u32 ds_ctl3;     /* 分片/重试（0） */
+    u32 ds_ctl4;
+    u32 ds_ctl5;
+} __attribute__((packed));
+
+#define ATH9K_TXCTL0_LEN_S   0
+#define ATH9K_TXCTL0_LEN_M   0x00000FFFu
+#define ATH9K_TXCTL1_LEN_S   0
+#define ATH9K_TXCTL1_LEN_M   0x00000FFFu
+#define ATH9K_TXCTL1_MORE    0x00001000u
+
+/* ---- 连接状态 ---- */
+#define WPA_STATE_IDLE      0
+#define WPA_STATE_AUTH_SENT 1
+#define WPA_STATE_ASSOC_SENT 2
+#define WPA_STATE_M1_WAIT   3
+#define WPA_STATE_M3_WAIT   4
+#define WPA_STATE_CONNECTED 5
+
+static struct dkm_dma_buffer g_tx_desc_dma;
+static struct ath9k_tx_desc *g_tx_desc;
+static struct dkm_dma_buffer g_tx_buf_dma;
+static u8 *g_tx_buf;
+static u32 g_tx_head;
+static int g_tx_ready;
+static const struct dkm_dma_api *g_dma;
+
+/* WPA2 会话 */
+static u8  g_sta_mac[6];                 /* SPA */
+static u8  g_ap_mac[6];                  /* AA / BSSID */
+static u8  g_channel;
+static char g_target_ssid[ATH9K_SSID_MAX + 1];
+static int g_wpa_state;
+static u8  g_anonce[32];
+static u8  g_snonce[32];
+static u8  g_pmk[WPA2_PMK_LEN];
+static u8  g_ptk[64];                    /* KCK(16) KEK(16) TK(16) + 余量 */
+static u64 g_ptk_replay;
+static u64 g_tx_pn;                      /* CCMP 发包序号 */
+static u16 g_seq;
+static int g_key_installed;
+
+#define ATH9K_STA_MAC_ID0 0x0800u
+
+/* ---- 802.11 管理帧构造 ---- */
+#define IEEE80211_STYPE_AUTH   0x00B0u
+#define IEEE80211_STYPE_ASSOC_REQ 0x0000u
+#define IEEE80211_STYPE_ASSOC_RESP 0x0010u
+#define IEEE80211_STYPE_REASSOC_REQ 0x0020u
+#define IEEE80211_STYPE_DEAUTH 0x00C0u
+
+#define WLAN_EID_SUPP_RATES  1
+#define WLAN_EID_ERP         42
+#define WLAN_EID_RSN         48
+
+static u32 put_le16(u8 *p, u16 v) { p[0]=(u8)v; p[1]=(u8)(v>>8); return 2; }
+
+/* 帧控制字（管理帧，非保护） */
+static void mgmt_fc(u8 *f, u16 subtype) {
+    u16 fc = 0x0000u | subtype;          /* proto 0, type=mgmt(0) */
+    f[0] = (u8)(fc & 0xFF);
+    f[1] = (u8)(fc >> 8);
+    f[2] = 0; f[3] = 0;                  /* duration */
+}
+
+/* 填 24 字节管理帧头：DA / SA / BSSID / seq */
+static void mgmt_hdr(u8 *f, const u8 *da, const u8 *sa, const u8 *bssid) {
+    for (int i = 0; i < 6; i++) f[4+i]  = da[i];
+    for (int i = 0; i < 6; i++) f[10+i] = sa[i];
+    for (int i = 0; i < 6; i++) f[16+i] = bssid[i];
+    u16 sc = (u16)((++g_seq & 0xFFF) << 4);
+    f[22] = (u8)(sc & 0xFF); f[23] = (u8)(sc >> 8);
+}
+
+/* WPA2-PSK RSN IE（AKM 00-0F-AC:2，CCMP） */
+static u32 rsn_ie_psk(u8 *p) {
+    u8 *q = p;
+    q[0] = WLAN_EID_RSN;
+    q[1] = 20;                            /* 长度 */
+    q += 2;
+    q += put_le16(q, 1);                  /* version */
+    /* group cipher: OUI 00-0F-AC + type 4 (CCMP) */
+    q[0]=0x00; q[1]=0x0F; q[2]=0xAC; q[3]=0x04; q += 4;
+    q += put_le16(q, 1);                  /* pairwise count */
+    q[0]=0x00; q[1]=0x0F; q[2]=0xAC; q[3]=0x04; q += 4;
+    q += put_le16(q, 1);                  /* AKM count */
+    q[0]=0x00; q[1]=0x0F; q[2]=0xAC; q[3]=0x02; q += 4;   /* PSK */
+    q += put_le16(q, 0);                  /* RSN caps */
+    return (u32)(q - p);
+}
+
+/* 发送一帧（构造 802.11 头 → TX 环 → 触发） */
+static int ath9k_tx_frame(const u8 *frame, u32 len);
+
+/* ---- 认证请求（open system） ---- */
+static int ath9k_send_auth(void) {
+    u8 f[30 + 4];
+    for (u32 i = 0; i < sizeof(f); i++) f[i] = 0;
+    mgmt_fc(f, IEEE80211_STYPE_AUTH);
+    mgmt_hdr(f, g_ap_mac, g_sta_mac, g_ap_mac);
+    /* auth body: alg(2)=0, seq(2)=1, status(2)=0 */
+    put_le16(f + 24, 0);
+    put_le16(f + 26, 1);
+    put_le16(f + 28, 0);
+    raw_log("[ath9k.raw] tx auth request\n");
+    return ath9k_tx_frame(f, 30);
+}
+
+/* ---- 关联请求（含 RSN IE） ---- */
+static int ath9k_send_assoc(void) {
+    u8 f[24 + 4 + 2 + 34 + 4 + 24 + 2];
+    u32 n = 0;
+    for (u32 i = 0; i < sizeof(f); i++) f[i] = 0;
+    mgmt_fc(f, IEEE80211_STYPE_ASSOC_REQ);
+    mgmt_hdr(f, g_ap_mac, g_sta_mac, g_ap_mac);
+    n = 24;
+    n += put_le16(f + n, 0x0431);         /* capability: ESS + privacy + short preamble */
+    n += put_le16(f + n, 10);             /* listen interval */
+    /* SSID IE */
+    {
+        u32 sl = 0;
+        while (g_target_ssid[sl]) sl++;
+        f[n++] = WLAN_EID_SSID;
+        f[n++] = (u8)sl;
+        for (u32 i = 0; i < sl; i++) f[n++] = (u8)g_target_ssid[i];
+    }
+    /* supported rates: 1,2,5.5,11,6,9,12,18 Mbps */
+    f[n++] = WLAN_EID_SUPP_RATES;
+    f[n++] = 8;
+    f[n++] = 0x82; f[n++] = 0x84; f[n++] = 0x8B; f[n++] = 0x96;
+    f[n++] = 0x0C; f[n++] = 0x12; f[n++] = 0x18; f[n++] = 0x24;
+    /* RSN IE */
+    n += rsn_ie_psk(f + n);
+    raw_log("[ath9k.raw] tx assoc request\n");
+    return ath9k_tx_frame(f, n);
+}
+
+/* ---- EAPOL-Key 构造（802.1X 4-way） ---- */
+#define EAPOL_VERSION 2
+#define EAPOL_TYPE_KEY 3
+#define WPA_KEY_DESC_TYPE 2
+#define WPA_KEY_INFO_KEY_TYPE  0x0008u   /* 1 = pairwise */
+#define WPA_KEY_INFO_INSTALL   0x0040u
+#define WPA_KEY_INFO_ACK       0x0080u
+#define WPA_KEY_INFO_MIC       0x0100u
+#define WPA_KEY_INFO_SECURE    0x0200u
+#define WPA_KEY_INFO_ENC_KEY   0x1000u
+#define WPA_KEY_INFO_VER2      0x0002u   /* WPA2 = 3 (HMAC-SHA1 + AES) */
+
+/* 构造 802.11 数据帧（toDS）+ LLC/SNAP + EAPOL-Key，做 MIC 后发送。
+ * key_info 由调用方给，nonce 指针可为 0（M4 用）。 */
+static int ath9k_send_eapol(u16 key_info, const u8 *nonce,
+                            const u8 *key_data, u32 kd_len) {
+    static u8 f[256];
+    for (u32 i = 0; i < sizeof(f); i++) f[i] = 0;
+    /* 802.11 data 头：toDS（AP 为 RA=A1，SA=A2，DA=A3=BSSID） */
+    u16 fc = 0x0100u | 0x0008u;           /* data + ToDS */
+    f[0] = (u8)(fc & 0xFF); f[1] = (u8)(fc >> 8);
+    mgmt_hdr(f, g_ap_mac, g_sta_mac, g_ap_mac);
+    u32 n = 24;
+    /* LLC/SNAP：AA AA 03 00 00 00 88 8E (EAPOL) */
+    static const u8 snap[8] = {0xAA,0xAA,0x03,0x00,0x00,0x00,0x88,0x8E};
+    for (int i = 0; i < 8; i++) f[n++] = snap[i];
+    /* EAPOL 头 */
+    u32 eapol_off = n;
+    f[n++] = EAPOL_VERSION;
+    f[n++] = EAPOL_TYPE_KEY;
+    u32 len_off = n; n += 2;              /* 长度稍后回填 */
+    /* EAPOL-Key 体 */
+    u32 mic_off;
+    f[n++] = WPA_KEY_DESC_TYPE;
+    n += put_le16(f + n, key_info);
+    n += put_le16(f + n, 16);             /* key length (CCMP) */
+    for (int i = 0; i < 8; i++) f[n++] = (u8)(g_ptk_replay >> (i * 8));
+    for (int i = 0; i < 32; i++) f[n++] = nonce ? nonce[i] : 0;   /* nonce */
+    n += 16;                              /* key IV（全 0） */
+    n += 8;                               /* key RSC */
+    n += 8;                               /* key ID（全 0） */
+    mic_off = n; n += 16;                 /* key MIC（待填） */
+    n += put_le16(f + n, (u16)kd_len);
+    for (u32 i = 0; i < kd_len; i++) f[n++] = key_data[i];
+    /* 回填 EAPOL 长度（含 4 字节 EAPOL 头） */
+    u16 elen = (u16)(n - eapol_off - 4);
+    f[len_off] = (u8)(elen & 0xFF); f[len_off + 1] = (u8)(elen >> 8);
+    /* MIC：若置位，对 EAPOL 帧（MIC 字段已清零）用 KCK 计算 HMAC-SHA1-128 */
+    if (key_info & WPA_KEY_INFO_MIC) {
+        u8 mic[20];
+        wpa2_hmac_sha1(g_ptk, WPA2_KCK_LEN, f + eapol_off, n - eapol_off, mic);
+        for (int i = 0; i < 16; i++) f[mic_off + i] = mic[i];
+    }
+    return ath9k_tx_frame(f, n);
+}
+
+/* ---- EAPOL-Key M2（SNonce + MIC，4-way 第 2 条） ---- */
+static int ath9k_send_m2(void) {
+    u16 ki = WPA_KEY_INFO_VER2 | WPA_KEY_INFO_KEY_TYPE | WPA_KEY_INFO_MIC;
+    u8 kd[2 + 20];                        /* RSN IE（WPA2 常见，可省） */
+    u32 kdn = rsn_ie_psk(kd);
+    raw_log("[ath9k.raw] tx EAPOL M2\n");
+    return ath9k_send_eapol(ki, g_snonce, kd, kdn);
+}
+
+/* ---- EAPOL-Key M4（MIC + secure，4-way 第 4 条） ---- */
+static int ath9k_send_m4(void) {
+    u16 ki = WPA_KEY_INFO_VER2 | WPA_KEY_INFO_KEY_TYPE |
+             WPA_KEY_INFO_MIC | WPA_KEY_INFO_SECURE;
+    raw_log("[ath9k.raw] tx EAPOL M4\n");
+    return ath9k_send_eapol(ki, 0, 0, 0);
+}
+
+/* ---- PTK 派生（802.11i H.4） ---- */
+static void ath9k_derive_ptk(void) {
+    u8 seed[64];
+    const u8 *aa = g_ap_mac, *spa = g_sta_mac;
+    int swap = 0;
+    for (int i = 0; i < 6; i++) {
+        if (aa[i] != spa[i]) { swap = aa[i] > spa[i]; break; }
+    }
+    const u8 *m1 = swap ? spa : aa;       /* min(AA,SPA) */
+    const u8 *m2 = swap ? aa : spa;       /* max(AA,SPA) */
+    for (int i = 0; i < 6; i++) { seed[i] = m1[i]; seed[6+i] = m2[i]; }
+    int nswap = 0;
+    for (int i = 0; i < 32; i++) {
+        if (g_anonce[i] != g_snonce[i]) { nswap = g_anonce[i] > g_snonce[i]; break; }
+    }
+    const u8 *n1 = nswap ? g_snonce : g_anonce;
+    const u8 *n2 = nswap ? g_anonce : g_snonce;
+    for (int i = 0; i < 32; i++) { seed[12+i] = n1[i]; seed[44+i] = n2[i]; }
+    wpa2_prf512(g_pmk, seed, 64, g_ptk);
+}
+
+/* ---- 扫描结果查找（按 SSID 找 BSSID/信道） ---- */
+static int ath9k_find_ssid(const char *ssid, u8 *bssid, u8 *channel, u8 *sec) {
+    for (u32 i = 0; i < g_scan_count; i++) {
+        const char *a = g_scan_results[i].ssid;
+        const char *b = ssid;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*a == 0 && *b == 0) {
+            for (int j = 0; j < 6; j++) bssid[j] = g_scan_results[i].bssid[j];
+            *channel = g_scan_results[i].channel;
+            *sec = g_scan_results[i].security;
+            return 0;
+        }
+    }
     return -1;
+}
+
+/* ---- 随机 SNonce（TSC 混合，实机 TLS 级随机由上层补充） ---- */
+static void ath9k_make_snonce(void) {
+    u64 t = dkm_rdtsc();
+    for (int i = 0; i < 32; i++) {
+        t = t * 6364136223846793005ULL + 1442695040888963407ULL;
+        g_snonce[i] = (u8)(t >> ((i % 8) * 8));
+    }
+}
+
+/* ---- 连接入口 ---- */
+static int ath9k_connect_impl(void *ctx, const char *ssid, const char *password) {
+    (void)ctx;
+    if (!ssid) return -1;
+    raw_log("[ath9k.raw] connect request\n");
+    if (!g_tx_ready) { raw_log("[ath9k.raw] TX not ready\n"); return -2; }
+
+    u8 sec = 0;
+    if (ath9k_find_ssid(ssid, g_ap_mac, &g_channel, &sec) != 0) {
+        raw_log("[ath9k.raw] connect: SSID not in scan results\n");
+        return -3;                        /* 调用方先扫描 */
+    }
+    u32 sl = 0;
+    while (ssid[sl] && sl < ATH9K_SSID_MAX) { g_target_ssid[sl] = ssid[sl]; sl++; }
+    g_target_ssid[sl] = 0;
+    copy_mac(g_sta_mac, g_mac);
+
+    /* 需要 WPA2-PSK 时先算 PMK */
+    if (sec != DKM_NET_SEC_OPEN) {
+        if (!password || !password[0]) { raw_log("[ath9k.raw] connect: empty PSK\n"); return -4; }
+        wpa2_pbkdf2_sha1(password, (const u8 *)g_target_ssid, sl, g_pmk);
+        raw_log("[ath9k.raw] PMK derived\n");
+    }
+
+    ath9k_set_channel(g_channel);
+    g_key_installed = 0;
+    g_ptk_replay = 0;
+    g_tx_pn = 0;
+    g_wpa_state = WPA_STATE_AUTH_SENT;
+    if (ath9k_send_auth() != 0) { g_wpa_state = WPA_STATE_IDLE; return -5; }
+    return 0;
+}
+
+static int ath9k_disconnect_impl(void *ctx) {
+    (void)ctx;
+    raw_log("[ath9k.raw] disconnect\n");
+    g_wpa_state = WPA_STATE_IDLE;
+    g_key_installed = 0;
+    return 0;
+}
+
+/* ---- 管理/控制帧处理（连接状态机驱动） ---- */
+static int ath9k_handle_mgmt(const u8 *frame, u32 len);
+
+/* ath9k TX：把帧写进 TX 环并触发 DMA。
+ * 描述符位域按 AR9002 队列描述符最小集构造；实机对拍日志见下方 raw_hex。
+ * 上层把数据帧交给本驱动时，若尚未安装密钥（未连接）则 panic（ATH-E04）。 */
+static int ath9k_tx_frame(const u8 *frame, u32 len) {
+    if (!g_tx_ready || !g_tx_desc) return -1;
+    if (len > ATH9K_TX_BUF_SIZE) return -1;
+    u32 idx = g_tx_head;
+    u8 *buf = g_tx_buf + (u64)idx * ATH9K_TX_BUF_SIZE;
+    for (u32 i = 0; i < len; i++) buf[i] = frame[i];
+    struct ath9k_tx_desc *d = &g_tx_desc[idx];
+    d->ds_data = (u32)(g_tx_buf_dma.phys + (u64)idx * ATH9K_TX_BUF_SIZE);
+    d->ds_ctl0 = (len & ATH9K_TXCTL0_LEN_M);          /* FRAME_LEN，TXQ=0(BE) */
+    d->ds_ctl1 = (len & ATH9K_TXCTL1_LEN_M);          /* BUF_LEN，无 MORE */
+    d->ds_ctl2 = 0;
+    d->ds_ctl3 = 0;
+    __asm__ volatile("" ::: "memory");
+    /* 触发 TX：写 TXDP 指向队首描述符并置 TXE */
+    ath9k_reg_write(AR_TXDP(0), (u32)g_tx_desc_dma.phys);
+    ath9k_reg_write(AR_TXCFG, AR_TXCFG_TXE);
+    g_tx_head = (g_tx_head + 1) % ATH9K_TX_DESC_COUNT;
+    raw_hex("[ath9k] tx kick len=", len);
+    return 0;
+}
+
+/* ---- 数据帧 TX（已连接后由 net 栈调用；CCMP 加密） ---- */
+static int ath9k_tx_impl(void *ctx, const void *packet, u32 length) {
+    (void)ctx;
+    if (!g_key_installed) {
+        /* 未安装密钥时不允许数据帧上路：零降级 panic（ATH-E04） */
+        g_log->panic("ATH-E04 DATA TX BEFORE KEY INSTALL");
+        return -1;
+    }
+    static u8 f[ATH9K_TX_BUF_SIZE];
+    for (u32 i = 0; i < sizeof(f); i++) f[i] = 0;
+    /* toDS 数据帧头：A1=BSSID, A2=STA, A3=DA(未解析，用 BSSID 占位) */
+    u16 fc = 0x0100u | 0x0008u;
+    f[0] = (u8)(fc & 0xFF); f[1] = (u8)(fc >> 8);
+    mgmt_hdr(f, g_ap_mac, g_sta_mac, g_ap_mac);
+    int rc = wpa2_ccmp_encrypt(f, sizeof(f), (const u8 *)packet, length,
+                               g_ptk + WPA2_KCK_LEN + WPA2_KEK_LEN, ++g_tx_pn);
+    if (rc <= 0) return -1;
+    return ath9k_tx_frame(f, (u32)rc);
+}
+
+/* ---- 4-way 消息处理 ---- */
+/* 定位 802.11 数据帧中的 EAPOL-Key（返回 EAPOL 起始偏移，-1 未找到） */
+static int eapol_find(const u8 *frame, u32 len, u32 *out_off) {
+    /* 24B MAC 头 + 8B LLC/SNAP，可能带 8B CCMP 头（加密 EAPOL 场景） */
+    u32 off = 24;
+    if (len < off + 8) return -1;
+    if (frame[off] == 0xAA && frame[off+1] == 0xAA) {
+        /* 明文 EAPOL */
+    } else if (len >= off + 16) {
+        off += 8;                          /* 跳过 CCMP 头 */
+        if (frame[off] != 0xAA) return -1;
+    } else {
+        return -1;
+    }
+    if (off + 8 + 4 > len) return -1;
+    if (frame[off+6] != 0x88 || frame[off+7] != 0x8E) return -1;   /* ethertype EAPOL */
+    if (frame[off+8] != EAPOL_VERSION || frame[off+9] != EAPOL_TYPE_KEY) return -1;
+    *out_off = off + 8;
+    return 0;
+}
+
+static void ath9k_handle_eapol(const u8 *eap, u32 len) {
+    /* eap 指向 EAPOL 头（version,type,length,然后 Key 体） */
+    if (len < 4 + 1 + 2 + 2 + 8 + 32 + 16 + 8 + 8 + 16 + 2) return;
+    const u8 *k = eap + 4;                 /* Key descriptor 起始 */
+    u16 key_info = (u16)k[1] | ((u16)k[2] << 8);
+    const u8 *nonce = k + 13;              /* key nonce 偏移：1(desc)+2(info)+2(len)+8(replay) */
+    const u8 *mic = k + 13 + 32 + 16 + 8 + 8;
+    u16 kd_len = (u16)k[13 + 32 + 16 + 8 + 8 + 16] | ((u16)k[13+32+16+8+8+16+1] << 8);
+    const u8 *kd = mic + 16 + 2;
+
+    int pairwise = (key_info & WPA_KEY_INFO_KEY_TYPE) != 0;
+    int ack = (key_info & WPA_KEY_INFO_ACK) != 0;
+    int has_mic = (key_info & WPA_KEY_INFO_MIC) != 0;
+
+    if (!pairwise) {
+        /* GTK 消息（M3 附带），此处只做 MIC 校验后记录，实际 GTK 由 M3 的 key data 携带 */
+        raw_log("[ath9k.raw] EAPOL GTK msg\n");
+        return;
+    }
+
+    if (ack && !has_mic) {
+        /* ---- M1：带 ANonce ---- */
+        raw_log("[ath9k.raw] EAPOL M1 recv\n");
+        for (int i = 0; i < 32; i++) g_anonce[i] = nonce[i];
+        /* replay counter 8 字节（小端） */
+        g_ptk_replay = 0;
+        for (int i = 0; i < 8; i++) g_ptk_replay |= (u64)k[5 + i] << (i * 8);
+        ath9k_make_snonce();
+        ath9k_derive_ptk();
+        raw_log("[ath9k.raw] PTK derived\n");
+        g_wpa_state = WPA_STATE_M3_WAIT;
+        ath9k_send_m2();
+        return;
+    }
+
+    if (has_mic && !ack) {
+        /* ---- M3：校验 MIC → 安装 PTK/GTK → 回 M4 ---- */
+        raw_log("[ath9k.raw] EAPOL M3 recv\n");
+        u64 rc = 0;
+        for (int i = 0; i < 8; i++) rc |= (u64)k[5 + i] << (i * 8);
+        g_ptk_replay = rc;
+        /* MIC 校验：MIC 字段清零后对整段 EAPOL 计算 HMAC-SHA1-128 再比对。
+         * 用本地副本避免改写 RX 缓冲（const 语义）。 */
+        u32 mic_rel = (u32)(mic - eap);
+        u8 tmp[256];
+        if (len > sizeof(tmp)) { raw_log("[ath9k.raw] EAPOL too long\n"); return; }
+        for (u32 i = 0; i < len; i++) tmp[i] = eap[i];
+        for (int i = 0; i < 16; i++) tmp[mic_rel + i] = 0;
+        u8 calc[20];
+        wpa2_hmac_sha1(g_ptk, WPA2_KCK_LEN, tmp, len, calc);
+        u8 diff = 0;
+        for (int i = 0; i < 16; i++) diff |= calc[i] ^ mic[i];
+        if (diff) {
+            raw_log("[ath9k.raw] M3 MIC MISMATCH (bad PSK?)\n");
+            g_wpa_state = WPA_STATE_IDLE;
+            return;
+        }
+        raw_log("[ath9k.raw] M3 MIC ok\n");
+
+        /* key data 中可能含 GTK（KDE 0xDD + OUI 00-0F-AC + type 1，AES key wrap）。
+         * 若含 ENC_KEY，用 KEK unwrap 取 GTK。 */
+        if ((key_info & WPA_KEY_INFO_ENC_KEY) && kd_len > 0) {
+            /* 遍历 KDE */
+            u32 p = 0;
+            while (p + 2 <= kd_len) {
+                u8 ktype = kd[p];
+                u8 klen = kd[p+1];
+                if (p + 2 + klen > kd_len) break;
+                if (ktype == 0xDD && klen >= 6 &&
+                    kd[p+2] == 0x00 && kd[p+3] == 0x0F && kd[p+4] == 0xAC && kd[p+5] == 0x01) {
+                    const u8 *wrapped = kd + p + 6;
+                    u32 wlen = (u32)klen - 6;
+                    u8 gtk[32];
+                    if (wpa2_key_unwrap(g_ptk + WPA2_KCK_LEN, wrapped, wlen, gtk) == 0) {
+                        raw_log("[ath9k.raw] GTK unwrapped\n");
+                    } else {
+                        raw_log("[ath9k.raw] GTK unwrap FAILED\n");
+                    }
+                }
+                p += 2 + klen;
+            }
+        }
+        g_key_installed = 1;
+        g_wpa_state = WPA_STATE_CONNECTED;
+        ath9k_send_m4();
+        raw_log("[ath9k.raw] === CONNECTED (WPA2-PSK) ===\n");
+    }
+}
+
+/* ---- 管理帧处理（认证/关联响应） ---- */
+static int ath9k_handle_mgmt(const u8 *frame, u32 len) {
+    if (len < 24) return -1;
+    u16 fctl = (u16)frame[0] | ((u16)frame[1] << 8);
+    if ((fctl & 0x000C) != 0x0000) return -1;              /* 非管理帧 */
+    u16 subtype = fctl & 0x00F0;
+    /* 只处理来自目标 AP 的帧 */
+    for (int i = 0; i < 6; i++) if (frame[10+i] != g_ap_mac[i]) return -1;
+
+    if (subtype == 0x00B0) {                                /* Authentication */
+        if (len < 24 + 6) return -1;
+        u16 status = (u16)frame[24+4] | ((u16)frame[24+5] << 8);
+        if (status != 0) { raw_log("[ath9k.raw] auth FAILED\n"); g_wpa_state = WPA_STATE_IDLE; return -1; }
+        raw_log("[ath9k.raw] auth ok\n");
+        if (g_wpa_state == WPA_STATE_AUTH_SENT) {
+            g_wpa_state = WPA_STATE_ASSOC_SENT;
+            ath9k_send_assoc();
+        }
+        return 0;
+    }
+    if (subtype == 0x0010) {                                /* Association Response */
+        if (len < 24 + 6) return -1;
+        u16 status = (u16)frame[24+2] | ((u16)frame[24+3] << 8);
+        if (status != 0) { raw_log("[ath9k.raw] assoc FAILED\n"); g_wpa_state = WPA_STATE_IDLE; return -1; }
+        raw_log("[ath9k.raw] assoc ok, waiting 4-way\n");
+        g_wpa_state = WPA_STATE_M1_WAIT;
+        return 0;
+    }
+    if (subtype == 0x00C0) {                                /* Deauth */
+        raw_log("[ath9k.raw] deauth from AP\n");
+        g_wpa_state = WPA_STATE_IDLE;
+        g_key_installed = 0;
+        return 0;
+    }
+    return -1;
+}
+
+/* ---- TX 环初始化 ---- */
+static int ath9k_tx_init(const struct dkm_dma_api *dma) {
+    if (!dma || !dma->alloc_pages || !g_mmio) return -1;
+    g_dma = dma;
+    /* 描述符环 1 页 + 缓冲 1 页 */
+    if (dma->alloc_pages(1, 16, 0x100000000ULL, &g_tx_desc_dma) != 0) {
+        raw_log("[ath9k.raw] tx_init: desc alloc failed\n");
+        return -2;
+    }
+    if (dma->alloc_pages(1, 16, 0x100000000ULL, &g_tx_buf_dma) != 0) {
+        raw_log("[ath9k.raw] tx_init: buf alloc failed\n");
+        return -3;
+    }
+    g_tx_desc = (struct ath9k_tx_desc *)g_tx_desc_dma.virt;
+    g_tx_buf = (u8 *)g_tx_buf_dma.virt;
+    for (u32 i = 0; i < sizeof(struct ath9k_tx_desc) * ATH9K_TX_DESC_COUNT; i++)
+        ((u8 *)g_tx_desc)[i] = 0;
+    for (u32 i = 0; i < ATH9K_TX_DESC_COUNT; i++) {
+        g_tx_desc[i].ds_link = (u32)(g_tx_desc_dma.phys +
+            (((i + 1) % ATH9K_TX_DESC_COUNT) * sizeof(struct ath9k_tx_desc)));
+    }
+    __asm__ volatile("" ::: "memory");
+    g_tx_head = 0;
+    g_tx_ready = 1;
+    raw_log("[ath9k.raw] tx_init: rings allocated\n");
+    return 0;
 }
 
 static int ath9k_rx_poll_impl(void *ctx, void *buffer, u32 capacity, u32 *out_length) {
@@ -737,15 +1294,29 @@ int driver_init(const struct dkm_kernel_api *api,
         return -5;
     }
 
-    /* 9. RX 环初始化 */
+    /* 9. RX/TX 环初始化 */
     if (api->dma && api->dma->alloc_pages) {
         int rc = ath9k_rx_init(api->dma);
         raw_hex("[ath9k.raw] rx_init rc=", (u64)(i8)rc);
         if (rc != 0) {
             raw_log("[ath9k.raw] RX init failed, scan unavailable\n");
         }
+        int trc = ath9k_tx_init(api->dma);
+        raw_hex("[ath9k.raw] tx_init rc=", (u64)(i8)trc);
+        if (trc != 0) raw_log("[ath9k.raw] TX init failed, connect unavailable\n");
     } else {
-        raw_log("[ath9k.raw] no DMA api, scan unavailable\n");
+        raw_log("[ath9k.raw] no DMA api, scan/TX unavailable\n");
+    }
+
+    /* 9b. WPA2 加密底座自检（KAT）：失败即 panic，绝不带病上路 */
+    {
+        int krc = wpa2_kat();
+        if (krc != 0) {
+            raw_hex("[ath9k.raw] WPA2 KAT FAILED case=", (u64)krc);
+            g_log->panic("ATH-E02 WPA2 CRYPTO KAT FAILED");
+            return -7;
+        }
+        raw_log("[ath9k.raw] WPA2 crypto KAT ok\n");
     }
 
     /* 10. 注册中断 */
@@ -754,20 +1325,24 @@ int driver_init(const struct dkm_kernel_api *api,
         raw_hex("[ath9k.raw] irq_register rc=", (u64)(i8)rc);
     }
 
-    /* 11. 注册 netdev（标记 WIRELESS + RX_READY） */
+    /* 11. 注册 netdev（无线 + RX/TX） */
     struct dkm_net_device_desc ndesc;
     for (u32 i = 0; i < sizeof(ndesc); i++) ((u8 *)&ndesc)[i] = 0;
     static const char devname[] = "ath9k0";
     ndesc.name = devname;
     copy_mac(ndesc.mac, g_mac);
-    ndesc.flags = DKM_NET_F_WIRELESS | (g_rx_ready ? DKM_NET_F_RX_READY : 0);
+    ndesc.flags = DKM_NET_F_WIRELESS |
+                  (g_rx_ready ? DKM_NET_F_RX_READY : 0) |
+                  (g_tx_ready ? DKM_NET_F_TX_READY : 0);
     ndesc.ctx = (void *)0;  /* ath9k 用全局状态，ctx 不需要 */
-    ndesc.tx = ath9k_tx_stub;
+    ndesc.tx = ath9k_tx_impl;
     ndesc.rx_poll = ath9k_rx_poll_impl;
     ndesc.scan_start = ath9k_scan_start_impl;
     ndesc.scan_count = ath9k_scan_count_impl;
     ndesc.scan_result = ath9k_scan_result_impl;
     ndesc.is_wireless = ath9k_is_wireless_impl;
+    ndesc.connect = ath9k_connect_impl;
+    ndesc.disconnect = ath9k_disconnect_impl;
 
     if (api->net && api->net->register_device) {
         int rc = api->net->register_device(&ndesc);

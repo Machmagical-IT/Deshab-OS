@@ -120,6 +120,22 @@ function Build-DkmDriver([string]$SourcePath, [string]$OutputPath) {
     Write-Host "[build] DKM driver Output: $OutputPath"
 }
 
+# 多源 DKM 驱动（如 ath9k + wpa2_crypto）：逐文件编译后 ld -r 合并
+function Build-DkmDriverMulti([string[]]$SourcePaths, [string]$OutputPath) {
+    $outDir = Split-Path -Parent $OutputPath
+    if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
+    $objs = @()
+    foreach ($src in $SourcePaths) {
+        $obj = Join-Path $BuildTmp (([System.IO.Path]::GetFileNameWithoutExtension($src)) + '.o')
+        & $clang -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -O2 -c $src -o $obj
+        if ($LASTEXITCODE -ne 0) { throw "failed to compile DKM driver source: $src" }
+        $objs += $obj
+    }
+    & $lld -r -o $OutputPath @objs
+    if ($LASTEXITCODE -ne 0) { throw "failed to link DKM driver: $OutputPath" }
+    Write-Host "[build] DKM driver Output: $OutputPath"
+}
+
 function Set-Le16([byte[]]$Buffer, [int]$Offset, [int]$Value) {
     $Buffer[$Offset] = [byte]($Value -band 0xff)
     $Buffer[$Offset + 1] = [byte](($Value -shr 8) -band 0xff)
@@ -1037,7 +1053,8 @@ Build-DkmDriver (Join-Path $Root 'CODE\DKM\devfs\devfs.c')   (Join-Path $SystemD
 Write-Host '[build] Building DKM network drivers...'
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir 'driver\net\e1000.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\virtio_net\virtio_net.c') (Join-Path $SystemDir 'driver\net\virtio_net.drv')
-Build-DkmDriver (Join-Path $Root 'CODE\DKM\ath9k\ath9k.c') (Join-Path $SystemDir 'driver\net\ath9k.drv')
+Build-DkmDriverMulti @((Join-Path $Root 'CODE\DKM\ath9k\ath9k.c'),
+                       (Join-Path $Root 'CODE\DKM\ath9k\wpa2_crypto.c')) (Join-Path $SystemDir 'driver\net\ath9k.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\wlan\wlan.c') (Join-Path $SystemDir 'driver\net\wlan.drv')
 
 # stage3: input — ps2kbd 注册 IRQ1。
