@@ -509,7 +509,11 @@ void draw_ctx_menu(void);
 void taskbar_draw(void);
 int  taskbar_click(int mx, int my);
 int  taskbar_init(int (*read_to)(const char *, unsigned char *,
-                                 unsigned int, unsigned int *));   /* M2: logo 纹理 */
+                                 unsigned int, unsigned int *));
+/* ---- taskbar.c WiFi 快捷卡片 ---- */
+extern int g_wifi_open;                 /* 卡片是否展开 */
+int wifi_key(u8 sc, int shift);         /* shell.c handle_key 路由；1=已消费 */
+/* M2: logo 纹理 */
 extern int g_tb2_start_rect[4];
 extern int g_tb2_tv_rect[4];
 extern int g_tb2_app_rect[MAX_WINDOWS][4];

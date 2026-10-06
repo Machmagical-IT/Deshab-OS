@@ -478,6 +478,9 @@ int handle_key(u8 sc) {
     if (sc == 0xB8) { g_alt = 0; return 0; }
     if (sc & 0x80) { g_e0 = 0; return 0; }   /* 其他释放码忽略 */
 
+    /* WiFi 快捷卡片（模态：Esc 收起 / 密码模式接管输入） */
+    if (g_wifi_open) return wifi_key(sc, g_shift);
+
     /* Esc：关闭 overlay */
     if (sc == 0x01) {
         if (g_taskview) { g_taskview = 0; return 1; }

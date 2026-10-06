@@ -93,6 +93,11 @@ typedef struct dkm_net_api {
     int  (*scan_count)(u32 index);
     int  (*scan_result)(u32 index, u32 n, dkm_net_scan_result *out);
     int  (*is_wireless)(u32 index);
+    /* 无线关联（dispatch 到 wlan 驱动回调；尾部追加，ABI 兼容。
+     * 槽位布局必须与 UTSM include/utsm/net.h 镜像一致：
+     * connect @0x48, disconnect @0x50, device_stats @0x58）。 */
+    int  (*connect)(u32 index, const char *ssid, const char *password);
+    int  (*disconnect)(u32 index);
     int  (*device_stats)(u32 index, dkm_net_stats *out);
 } dkm_net_api;
 
