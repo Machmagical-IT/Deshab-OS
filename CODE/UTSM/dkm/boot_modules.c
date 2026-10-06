@@ -1,4 +1,4 @@
-﻿#include <utsm/dkm.h>
+#include <utsm/dkm.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/arena.h>
@@ -29,6 +29,10 @@
 #define R_X86_64_32 10
 #define R_X86_64_32S 11
 #define R_X86_64_PC32 2
+/* PLT32：lld 对（可能被覆盖的）全局函数调用生成，静态可重定位场景下
+ * 语义与 PC32 相同（patch = S + A - P）。多编译单元驱动（如 ath9k +
+ * wpa2_crypto）跨 TU 调用即为此类型。 */
+#define R_X86_64_PLT32 4
 
 void *memset(void *dst, int value, usize len);
 void *memcpy(void *dst, const void *src, usize len);
@@ -363,7 +367,7 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
                 patch = S + A;
             } else if (reloc_type == R_X86_64_32 || reloc_type == R_X86_64_32S) {
                 patch = (u64)((i64)(i32)(S + A));
-            } else if (reloc_type == R_X86_64_PC32) {
+            } else if (reloc_type == R_X86_64_PC32 || reloc_type == R_X86_64_PLT32) {
                 patch = (u64)((i64)(i32)(S + A - P));
             } else {
                 log_error("[DKM] unsupported relocation type");
@@ -376,7 +380,7 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
             /* Bounds check: use the actual write width, not always 8. */
             u32 reloc_width = (reloc_type == R_X86_64_64) ? 8 : 4;
             if (rela->offset + reloc_width <= target->size) {
-                if (reloc_type == R_X86_64_32 || reloc_type == R_X86_64_32S || reloc_type == R_X86_64_PC32) {
+                if (reloc_type != R_X86_64_64) {
                     *(u32 *)(target_base + rela->offset) = (u32)patch;
                 } else {
                     *(u64 *)(target_base + rela->offset) = patch;
