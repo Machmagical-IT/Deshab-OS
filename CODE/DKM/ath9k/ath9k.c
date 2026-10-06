@@ -263,6 +263,23 @@ static int ath9k_find(u8 *bus, u8 *dev) {
         raw_log(hex); raw_log("\n");
         return 0;
     }
+
+    /* 无匹配 Atheros 设备：打印本机所有无线控制器 (class 02:80) 的
+     * vendor:device，便于确认实机卡型号（ATH 硬件要求见 CLAUDE.md）。 */
+    {
+        u32 found = 0;
+        for (u8 d = 0; d < 32; d++) {
+            u32 vd = pci_read(0, d, 0, PCI_VENDOR_ID);
+            if ((vd & 0xffff) == 0xffff) continue;
+            u32 cls = pci_read(0, d, 0, 0x08);
+            if (((cls >> 24) & 0xff) != 0x02 || (((cls >> 16) & 0xff) != 0x80)) continue;
+            raw_hex("[ath9k.raw] wireless ctrl (non-Atheros) dev=", (u64)d);
+            raw_hex("[ath9k.raw]   vendor:device=", ((u64)(vd & 0xffff) << 16) | (u64)(vd >> 16));
+            found++;
+        }
+        raw_hex("[ath9k.raw] wireless controllers found=", (u64)found);
+        raw_log("[ath9k.raw] NO SUPPORTED ATHEROS DEVICE (need AR928x PCIe, vendor 168c)\n");
+    }
     return -1;
 }
 

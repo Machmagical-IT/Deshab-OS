@@ -147,7 +147,12 @@ build.ps1 自动把 Git usr/bin 加入 PATH（sh.exe + mkdir），解决 make `m
 
 当前 UTSM 已有首阶段内核代码骨架和构建脚本，可生成 utsm.elf 与 GPT（FAT32 引导分区 + ext4 数据分区）镜像。早期启动要求：进入 C 前 `cli/cld`，early serial 不允许无限等待硬件 ready 位，未启用 FPU/SSE 前编译必须使用 `-mno-sse -mno-sse2 -mno-mmx -msoft-float`。DATA/BSS 段使用 PF_R|PF_W|PF_X（SAS-R0 下驱动模块内存需可执行）。
 
-DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解析 + Limine boot module 预加载 + 4 stage 分阶段加载 + 全部 14 个外部 `.drv` ET_REL 装载（ELF64/SHT_NOBITS/R_X86_64_64/32/32S/PC32 relocation + driver_desc 校验 + driver_init 调用）。当前镜像额外预加载 `driver/test.fat32` 作为 FAT32 驱动测试镜像。
+DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解析 + Limine boot module 预加载 + 4 stage 分阶段加载 + 全部外部 `.drv` ET_REL 装载（ELF64/SHT_NOBITS/R_X86_64_64/32/32S/PC32/PLT32 relocation + driver_desc 校验 + driver_init 调用）。当前镜像额外预加载 `driver/test.fat32` 作为 FAT32 驱动测试镜像。
+
+> **relocation 集合注意**：`R_X86_64_PLT32(4)` 语义等同 PC32（静态可重定位下的 `S+A-P`）。多编译单元驱动（如 `ath9k.drv = ath9k.o + wpa2_crypto.o`）跨 TU 的全局函数调用会被 lld 生成为 PLT32；loader 不支持即启动 `DKM-E37`。新增多源 `.drv` 前用 `llvm-readobj --relocations` 核对类型是否在上述集合内。
+
+> **ath9k 硬件要求（实机 WiFi 试验）**：原生驱动仅支持 **Atheros AR928x 系列 PCIe 无线网卡（vendor `168c`，如 AR9285/9280/9287）**。FUCK `[drivers] ath9k=1` 时才加载。若机器无匹配 Atheros 卡、BAR0 位于 4G 以上、或复位/初始化失败，`driver_init` 返回非零 → `DKM-E39 EXTERNAL DRIVER INIT FAILED` **开机即 panic**（零降级，不豁免）；串口会打印本机所有无线控制器 (class 02:80) 的 vendor:device 供确认卡型号。Intel/Realtek/MediaTek 等其他厂商网卡**不支持**。`wlan.drv` 为框架骨架，在有无线控制器的机器上只注册设备，其 scan/connect 调用即 `NETWL-E10/E11` panic。
+
 
 当前已实现 14 个真实 DKM 驱动：
 - **timer** (stage0): PIT 校准, 100ms busy-wait demo
