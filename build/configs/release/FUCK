@@ -30,10 +30,13 @@ fat32=1
 devfs=1
 e1000=1
 virtio_net=1
-# ath9k=1：真机 Atheros(AR928x) 原生 WiFi 试验（scan + WPA2-PSK connect）。
-# 注意：无匹配 Atheros 卡或硬件 init 失败时 driver_init 返回非零 →
-# DKM-E39 启动即 panic（承认高风险，见 CLAUDE.md 零降级策略）。
-ath9k=1
+# ath9k=0：原生 Atheros 驱动仅支持 AR928x，其他厂商（Intel/Realtek/MediaTek）
+# 无匹配设备时 driver_init 返回非零 → DKM-E39 开机 panic。普通网卡走
+# linuxguest 后端（guest 内 mt76/iwlwifi/rtw88 + wpa_supplicant，状态回传）。
+ath9k=0
+# wlan=0：框架骨架，在有无线控制器的机器上会注册设备，其 scan/connect
+# 调用即 NETWL-E10/E11 panic。等 linuxguest 后端落地前先关闭。
+wlan=0
 ps2kbd=1
 ioapic_init=1
 lapic_enable=1
@@ -73,8 +76,12 @@ require_sched=1
 require_drr=1
 require_fs_fat32_rw=1
 require_fs_ext4_rw=1
-require_net_wired=1
-# NET-E01 wlan 栈未实现
+# require_net_wired=0：当前原生驱动仅覆盖 Intel 8254x(e1000)/virtio-net。
+# 测试机为 Realtek 8168 有线 + MediaTek MT7920 无线，均无原生驱动 →
+# net_total=0。属白名单①（该机器不具备受支持网卡），待 linuxguest 后端
+# （guest 内发行版驱动）落地后删除本豁免行。实现后逐项删除。
+require_net_wired=0
+# NET-E01 wlan 栈未实现（linuxguest 后端落地后删除）
 require_net_wlan=0
 # VMX 为 guest 能力，真机不强制
 require_vmm_vmx=0
@@ -101,6 +108,30 @@ skip_firstinit=0
 mouse_init=1
 netman=1
 session=native
+
+# === "极差用户体验" 整蛊系统 ===
+# enable=1 打开总开关；下列各项 =0 可单独关闭。
+# 触发：开机进桌面后 boot_demo_sec 秒串烧演示 + 使用中每 interval_sec 秒随机一个。
+[prank]
+enable=1
+# 发布版不做开机演示（真机不受验证串烧打扰）；使用中仍随机整蛊
+boot_demo_sec=0
+# 使用中自动整蛊间隔（秒），0=关
+interval_sec=120
+# 屏幕压暗 + 特大 FUCK 跟随鼠标后消失
+fuck_cursor=1
+# 假蓝屏（Win 风格）
+fake_bsod=1
+# 全屏反色闪烁
+invert_flash=1
+# 假"程序未响应"对话框
+fake_hang=1
+# 打字乱码（按键被随机重映射）
+garble_typing=1
+# 任务栏图标乱飞
+taskbar_fly=1
+# 假"系统即将关机"倒计时
+fake_shutdown=1
 
 [debug]
 enabled=0
