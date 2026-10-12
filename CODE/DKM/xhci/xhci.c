@@ -562,7 +562,8 @@ static u32 xhci_pci_diag_code(void) {
     return 0x13;
 }
 
-static int xhci_find(u8 *out_bus, u8 *out_dev, u8 *out_func) {
+static int xhci_find_nth(int nth, u8 *out_bus, u8 *out_dev, u8 *out_func) {
+    int seen = 0;
     for (u16 bus = 0; bus < 256; bus++) {
         for (u8 dev = 0; dev < 32; dev++) {
             u32 vd = dkm_pci_read((u8)bus, dev, 0, PCI_VENDOR_ID);
@@ -582,10 +583,13 @@ static int xhci_find(u8 *out_bus, u8 *out_dev, u8 *out_func) {
                 if (class_code == XHCI_CLASS_SERIAL &&
                     subclass  == XHCI_SUBCLASS_USB &&
                     prog_if   == XHCI_PROGIF_XHCI) {
-                    *out_bus  = (u8)bus;
-                    *out_dev  = dev;
-                    *out_func = func;
-                    return 0;
+                    if (seen == nth) {
+                        *out_bus  = (u8)bus;
+                        *out_dev  = dev;
+                        *out_func = func;
+                        return 0;
+                    }
+                    seen++;
                 }
             }
         }
@@ -1104,8 +1108,12 @@ static int xhci_reset_port(u32 port_idx) {
     /* Already enabled? */
     if (portsc & PORTSC_PED) return 0;
 
-    /* Clear any change bits (W1C), then assert port reset */
-    mmio_write32(port_off, portsc | PORTSC_PR);
+    /* 只置 PR，并清掉 RW1C 位。把读到的 PORTSC 原样或上 PR 会把
+     * PED=0 和已经为 1 的变化位写回去，实机上复位经常起不来。 */
+    u32 cmd = portsc & ~((1u << 1) | PORTSC_PR | 0x00FE0000u);
+    cmd |= PORTSC_PR;
+    if (portsc & (1u << 9)) cmd |= (1u << 9);
+    mmio_write32(port_off, cmd);
 
     /* Wait for PED (Port Enabled) with 500ms timeout */
     u64 deadline = dkm_rdtsc() + dkm_tsc_per_ms * 500;
@@ -1920,6 +1928,8 @@ static int xhci_enum_msc_device(u32 port_idx) {
  *  driver_init — main entry point
  * ================================================================ */
 
+#define XHCI_TRY_NEXT do { xhci_nth++; if (xhci_nth < 4) goto again_ctrl; return 0; } while (0)
+
 __attribute__((visibility("default")))
 int driver_init(const struct dkm_kernel_api *api,
                 struct dkm_driver_handle *handle) {
@@ -1935,7 +1945,10 @@ int driver_init(const struct dkm_kernel_api *api,
 
     /* ---- Phase 1: PCI discovery ---- */
     u8 bus = 0, dev = 0, func = 0;
-    if (xhci_find(&bus, &dev, &func) != 0) {
+    /* 实机常有不止一只 xHCI。U 盘可能不在第一只上，找不到 MSC 就试下一只。 */
+    int xhci_nth = 0;
+again_ctrl:
+    if (xhci_find_nth(xhci_nth, &bus, &dev, &func) != 0) {
         g_log->info("[xhci] xHCI controller not found");
         /* BUG-FIX: 不 halt。xhci 是可选驱动（manifest required=false），
          * 无 xHCI 的平台（Intel 6 系/纯 EHCI）必须继续引导到 EHCI/DSK，
@@ -1955,6 +1968,18 @@ int driver_init(const struct dkm_kernel_api *api,
     log_hex("[xhci] vendor=", vd & 0xffff);
     log_hex("[xhci] device=", vd >> 16);
 
+    /* Intel PCH 默认把 USB2 口留在 EHCI。不把路由切到 xHCI，
+     * U 盘在 xHCI 上永远没有 CCS，块设备就不会注册。 */
+    if ((vd & 0xffff) == 0x8086) {
+        u32 usb2_mask = dkm_pci_read(bus, dev, func, 0xD4);
+        u32 usb3_mask = dkm_pci_read(bus, dev, func, 0xDC);
+        if (usb2_mask) dkm_pci_write(bus, dev, func, 0xD0, usb2_mask);
+        if (usb3_mask) dkm_pci_write(bus, dev, func, 0xD8, usb3_mask);
+        log_hex("[xhci] intel usb2 route=", usb2_mask);
+        log_hex("[xhci] intel usb3 route=", usb3_mask);
+        dkm_delay_ms(200);
+    }
+
     /* Enable PCI MEM + BUSM, disable INTx (polling mode) */
     u32 command = dkm_pci_read(bus, dev, func, PCI_COMMAND) & 0xffff;
     command |= PCI_CMD_MEM | PCI_CMD_BUSM | (1u << 10);
@@ -1968,7 +1993,7 @@ int driver_init(const struct dkm_kernel_api *api,
     if (bar0_lo & 1u) {
         g_log->warn("[xhci] BAR0 is IO space; unsupported");
         FB_FATAL(api, 0x02);  /* 红: BAR0 是 IO 空间 */
-        return 0;
+        XHCI_TRY_NEXT;
     }
     if ((bar0_lo & 0x6u) == 0x4u) {
         bar_phys = ((u64)bar1_hi << 32) | (u64)(bar0_lo & 0xFFFFFFF0u);
@@ -1984,7 +2009,7 @@ int driver_init(const struct dkm_kernel_api *api,
     if (!api->hhdm_offset || !bar_phys) {
         g_log->warn("[xhci] missing HHDM or BAR0; skip");
         FB_FATAL(api, 0x02);  /* 红: 缺 HHDM/BAR */
-        return 0;
+        XHCI_TRY_NEXT;
     }
 
     /* ---- Phase 1: MMIO mapping ---- */
@@ -1992,14 +2017,14 @@ int driver_init(const struct dkm_kernel_api *api,
     if (!g_mmio) {
         g_log->error("[xhci] BAR MMIO unavailable; driver inactive");
         FB_FATAL(api, 0x03);  /* 红: BAR MMIO 映射失败 */
-        return 0;
+        XHCI_TRY_NEXT;
     }
 
     /* ---- Phase 1: Parse capabilities ---- */
     if (xhci_parse_caps() != 0) {
         g_log->error("[xhci] capability parse failed");
         FB_FATAL(api, 0x04);  /* 红: capability 解析失败 */
-        return 0;
+        XHCI_TRY_NEXT;
     }
 
     /* ---- Phase 1: BIOS Handoff ---- */
@@ -2009,27 +2034,27 @@ int driver_init(const struct dkm_kernel_api *api,
     if (xhci_controller_reset() != 0) {
         g_log->error("[xhci] controller reset failed");
         FB_FATAL(api, 0x05);  /* 红: 控制器 reset 失败 */
-        return 0;
+        XHCI_TRY_NEXT;
     }
 
     /* ---- Phase 2: Setup Rings + DCBAA + Scratchpad ---- */
     if (!api->dma) {
         g_log->warn("[xhci] DMA API unavailable");
         FB_FATAL(api, 0x06);  /* 红: DMA API 缺失 */
-        return 0;
+        XHCI_TRY_NEXT;
     }
 
     if (xhci_setup_rings() != 0) {
         g_log->error("[xhci] ring setup failed");
         FB_FATAL(api, 0x06);  /* 红: ring 初始化失败 */
-        return 0;
+        XHCI_TRY_NEXT;
     }
 
     /* ---- Phase 2: Start Controller ---- */
     if (xhci_controller_start() != 0) {
         g_log->error("[xhci] controller start failed");
         FB_FATAL(api, 0x07);  /* 红: 控制器启动失败 */
-        return 0;
+        XHCI_TRY_NEXT;
     }
 
     /* ---- Phase 3: Port Scan + Device Enumeration ---- */
@@ -2039,53 +2064,56 @@ int driver_init(const struct dkm_kernel_api *api,
      * attachment and update port status.  Without this delay, PORTSC.CCS
      * may read 0 even though a device is physically connected.
      */
-    g_log->info("[xhci] waiting 100ms for port settle...");
-    dkm_delay_ms(100);
-
-    g_msc.ready = 0;
+    /* 控制器复位后端口掉电。先全部上电，再等 U 盘重新连接。
+     * 20ms 就读 CCS 时，实机上的 U 盘还没出现，于是不会注册块设备。 */
     for (u32 port = 0; port < g_max_ports; port++) {
         u32 port_off = g_port_base + port * XHCI_PORT_STRIDE + XHCI_PORT_SC;
         u32 portsc = mmio_read32(port_off);
+        if (g_ppc && !(portsc & (1u << 9))) {
+            mmio_write32(port_off, portsc | (1u << 9));
+        }
+    }
+    g_log->info("[xhci] waiting 1500ms for port settle...");
+    dkm_delay_ms(1500);
 
-        /* Always log PORTSC for debugging, even if no device is connected */
-        log_hex("[xhci] port=", port);
-        log_hex("[xhci] PORTSC=", portsc);
+    g_msc.ready = 0;
+    int saw_ccs = 0;
+    int saw_reset_fail = 0;
+    for (int pass = 0; pass < 2 && !g_msc.ready; pass++) {
+        if (pass == 1) {
+            g_log->info("[xhci] second port scan");
+            dkm_delay_ms(1500);
+        }
+        for (u32 port = 0; port < g_max_ports; port++) {
+            u32 port_off = g_port_base + port * XHCI_PORT_STRIDE + XHCI_PORT_SC;
+            u32 portsc = mmio_read32(port_off);
 
-        if (!(portsc & PORTSC_CCS)) {
-            /*
-             * If PPC (Per-Port Power Control) is supported, the port may
-             * need to be powered on before CCS reflects device connection.
-             * Set PP (Port Power) bit in PORTSC to enable port power.
-             * If PPC=0, ports are always powered and this write is a no-op.
-             */
-            if (g_ppc && !(portsc & (1u << 9))) {
-                g_log->info("[xhci] enabling port power");
-                mmio_write32(port_off, portsc | (1u << 9));
-                /* Wait briefly for power to stabilize */
-                dkm_delay_ms(20);
-                portsc = mmio_read32(port_off);
-                log_hex("[xhci] PORTSC after PP=", portsc);
+            log_hex("[xhci] port=", port);
+            log_hex("[xhci] PORTSC=", portsc);
+
+            if (!(portsc & PORTSC_CCS)) continue;
+
+            saw_ccs = 1;
+            g_log->info("[xhci] device connected");
+
+            if (xhci_reset_port(port) != 0) {
+                g_log->warn("[xhci] port reset failed");
+                saw_reset_fail = 1;
+                continue;
             }
-            if (!(portsc & PORTSC_CCS)) continue;  /* Still no device */
+            g_log->info("[xhci] port reset OK");
+
+            if (xhci_enum_msc_device(port) == 0) {
+                g_log->info("[xhci] MSC enumeration successful");
+                break;
+            }
+
+            g_log->warn("[xhci] MSC enumeration failed; trying next port");
         }
-
-        g_log->info("[xhci] device connected");
-
-        /* Port Reset */
-        if (xhci_reset_port(port) != 0) {
-            /* 严格错误策略插桩：端口复位失败 = 设备不可用，零降级 panic */
-            g_log->panic("XHC-E01 PORT RESET FAILED");
-            continue;
-        }
-        g_log->info("[xhci] port reset OK");
-
-        /* Try to enumerate as MSC device */
-        if (xhci_enum_msc_device(port) == 0) {
-            g_log->info("[xhci] MSC enumeration successful");
-            break;  /* First MSC device is enough for now */
-        }
-
-        g_log->warn("[xhci] MSC enumeration failed; trying next port");
+    }
+    if (!g_msc.ready && saw_ccs && xhci_nth >= 3) {
+        g_log->panic(saw_reset_fail ? "XHC-E01 PORT RESET FAILED"
+                                    : "XHC-E02 MSC ENUM FAILED");
     }
 
     /* ---- Phase 5: Register Block Device ---- */
@@ -2105,12 +2133,18 @@ int driver_init(const struct dkm_kernel_api *api,
         }
     } else {
         g_log->info("[xhci] no MSC device found; block provider not registered");
+        if (xhci_nth < 3) {
+            xhci_nth++;
+            g_log->info("[xhci] trying next controller");
+            goto again_ctrl;
+        }
         FB_FATAL(api, 0x08);  /* 黄: 所有端口无设备/枚举全部失败 */
     }
 
     g_log->info("[xhci] driver ready");
     return 0;
 }
+#undef XHCI_TRY_NEXT
 
 __attribute__((visibility("default")))
 int driver_exit(struct dkm_driver_handle *handle) {

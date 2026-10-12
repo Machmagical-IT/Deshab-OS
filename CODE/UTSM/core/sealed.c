@@ -35,22 +35,25 @@ __attribute__((used, section(".sealed")))
 static const char g_sealed_brand[] = "DESHAB-SEALED-MEMORY-V1-DEAICUP";
 
 /* 极早期封缄初始化：任何不就绪都在这里 panic，绝不带病前进 */
-void utsm_sealed_early_init(void) {
+int utsm_sealed_early_init(void) {
     u64 region = (u64)(__sealed_end - __sealed_start);
     if (region == 0) {
         /* .sealed 区为空 = 没有任何数据被真正封缄 = 基础设施未就绪 */
         panic_full("UTSM-E01 SEALED MEMORY NOT READY",
                    ".sealed section is empty: sealing infrastructure not implemented", 0);
+        return -1;
     }
     const u64 *rk = drr_get_root_key();
     if (!rk) {
         panic_full("UTSM-E02 SEALED NO ROOT KEY",
                    "root key unavailable before sealing .sealed region", 0);
+        return -1;
     }
     utsm_blake2b(__sealed_start, region, rk, 32, g_sealed_mac, UTSM_SEALED_MAC_LEN);
     g_sealed_ready = 1;
     log_hex64("[SEAL] .sealed region bytes=", region);
     log_info("[SEAL] sealed MAC established");
+    return 0;
 }
 
 /* 封缄完整性校验：重算 MAC 并与 init 时的封缄比对 */
@@ -58,6 +61,7 @@ void utsm_sealed_verify(void) {
     if (!g_sealed_ready) {
         panic_full("UTSM-E04 SEALED VERIFY BEFORE INIT",
                    "utsm_sealed_verify called before utsm_sealed_early_init", 0);
+        return;
     }
     u64 region = (u64)(__sealed_end - __sealed_start);
     u8 mac[UTSM_SEALED_MAC_LEN];

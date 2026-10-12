@@ -172,6 +172,14 @@
           "provides": ["netdev"]
         },
         {
+          "name": "mt7920",
+          "path": "driver/net/mt7920.drv",
+          "class": "net",
+          "required": false,
+          "depends": ["pci"],
+          "provides": ["netdev"]
+        },
+        {
           "name": "ath9k",
           "path": "driver/net/ath9k.drv",
           "class": "net",

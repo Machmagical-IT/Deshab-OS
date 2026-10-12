@@ -15,6 +15,8 @@
  *   ascii_font.c    ASCII 位图字体单副本
  *   zhfont.c        中文位图字库（.dbf）加载与渲染（M1）
  *   wallpaper.c     壁纸背景层缓存（M1）
+ *   files.c         窗口化文件资源管理器（目录遍历 + 打开文本）
+ *   startmenu.c     M3 Win11 开始菜单（搜索 + 应用瓦片 + 电源行）
  *
  * 依赖单向：main → shell → (pages/appreg/launcher/lxc) → wm/compositor → input。
  * 全局状态按"最 owning 模块定义、此处 extern"原则组织。
@@ -100,7 +102,7 @@ static __inline__ u64 rdtsc(void) {
 #define MAX_CPAGES         4    /* 自定义页上限 */
 #define MAX_FILES          24   /* FILES 面板条目上限 */
 #define MAX_ICONS          24
-#define MAX_APPS           24
+#define MAX_APPS           32   /* M3: 开始菜单注册 + 内置/LINUXAPP/PEAPPS/lnk 并存 */
 
 /* 应用固定状态地址（单实例策略 → 每类应用唯一实例） */
 #define ADDR_TERM1   0x4000000ULL
@@ -109,6 +111,7 @@ static __inline__ u64 rdtsc(void) {
 #define ADDR_EDDASH  0x5000000ULL
 #define ADDR_EDWIN   0x5100000ULL
 #define ADDR_CALC    0x6000000ULL
+#define ADDR_FILEMAN 0x6800000ULL   /* 文件资源管理器状态（calc 与 sprite 之间） */
 
 /* 双缓冲：渲染到 sprite buffer，完成后一次性 flip 到真实 framebuffer */
 #define SPRITE_BUF_ADDR 0x7000000ULL          /* 112MB，在 identity-mapped 区域 */
@@ -187,6 +190,9 @@ typedef struct {
     const char *pe_args;
     /* M2: 1 = 来自 user/desktop/*.lnk 的用户快捷方式（桌面只显示这些） */
     int user_desktop;
+    /* M3: 按路径启动的外部 ELF（STARTMENU.CNF 的 bin/xxx.elf 条目）。
+     * 与 elf_name（FAT32 根 8.3 名）互斥，launch_app 优先走 elf_path。 */
+    const char *elf_path;
 } app_descriptor;
 
 /* 桌面图标 */
@@ -326,6 +332,12 @@ extern desktop_icon g_icons[MAX_ICONS];
 extern int g_icon_count;
 extern int g_vscode_app_id;   /* 第一个名为 "vscode" 的注册项 */
 
+/* ---- appreg.c：M3 开始菜单注册表（STARTMENU.CNF，缺失时回退全量） ---- */
+#define SM_MAX_APPS     24     /* 开始菜单条目上限 */
+extern int  g_sm_ids[SM_MAX_APPS];       /* → g_apps 下标 */
+extern char g_sm_labels[SM_MAX_APPS][48];/* 瓦片中文标签（UTF-8） */
+extern int  g_sm_count;
+
 /* ---- launcher.c：PE 运行时 ---- */
 extern int   g_pe_running;
 extern int   g_pe_win_id;
@@ -463,15 +475,25 @@ void *calc_on_create(app_ctx *ctx);
 void  calc_on_event(void *state, app_ctx *ctx, desktop_event *ev);
 void  calc_on_draw(void *state, app_ctx *ctx);
 void  calc_on_destroy(void *state);
+void  editor_open_text(const char *disp, const u8 *data, u32 size);
+
+/* ---- files.c：窗口化文件资源管理器 ---- */
+void *fileman_on_create(app_ctx *ctx);
+void  fileman_on_event(void *state, app_ctx *ctx, desktop_event *ev);
+void  fileman_on_draw(void *state, app_ctx *ctx);
+void  fileman_on_destroy(void *state);
 
 /* ---- appreg.c ---- */
 void register_apps(void);
 void setup_desktop_icons(void);
 void draw_app_icon(du_context *ctx, int app_id, int cx, int cy);
 void draw_circle_outline(du_context *ctx, int cx, int cy, int r, u32 color);
+/* M3: app_id → Fluent 图标（返回 wf_icon_id，int 传递避免头依赖） */
+int desktop_app_icon(int app_id);
 
 /* ---- launcher.c ---- */
 void launch_external_elf(const char *name11);
+void launch_external_elf_path(const char *path);
 void fill_app_ctx(app_ctx *ctx, desktop_window *win);
 void launch_app(int app_id);
 void launch_pe_app(int app_id);
@@ -510,9 +532,21 @@ void taskbar_draw(void);
 int  taskbar_click(int mx, int my);
 int  taskbar_init(int (*read_to)(const char *, unsigned char *,
                                  unsigned int, unsigned int *));
+
+/* ---- startmenu.c（M3 开始菜单，taskbar 开始按钮弹出） ---- */
+void startmenu_open(void);
+void startmenu_close(void);
+void startmenu_toggle(void);
+void startmenu_draw(void);            /* taskbar_draw 末尾叠加 */
+int  startmenu_click(int mx, int my); /* 1=已消费（面板内） */
+int  startmenu_key(u8 sc, int shift); /* 1=已消费（模态输入） */
+extern int g_sm_open;
+
 /* ---- taskbar.c WiFi 快捷卡片 ---- */
 extern int g_wifi_open;                 /* 卡片是否展开 */
 int wifi_key(u8 sc, int shift);         /* shell.c handle_key 路由；1=已消费 */
+/* ---- taskbar.c 快速设置卡片（音量/亮度） ---- */
+extern int g_qs_open;
 /* M2: logo 纹理 */
 extern int g_tb2_start_rect[4];
 extern int g_tb2_tv_rect[4];
@@ -522,6 +556,25 @@ extern int g_tb2_net_rect[4];
 extern int g_tb2_vol_rect[4];
 extern int g_tb2_pwr_rect[4];
 extern int g_tb2_clk_rect[4];
+
+/* ---- prank.c：整蛊系统（FUCK [prank] 段控制） ---- */
+extern int g_prank_enabled;    /* 总开关 */
+extern int g_prank_boot_demo;  /* 进桌面后演示秒数，0=关 */
+extern int g_prank_interval;   /* 使用中自动整蛊间隔（秒），0=关 */
+extern int g_prank_fuck;       /* FUCK 跟随鼠标遮屏 */
+extern int g_prank_bsod;       /* 假蓝屏 */
+extern int g_prank_invert;     /* 反色闪屏 */
+extern int g_prank_hang;       /* 假"未响应"对话框 */
+extern int g_prank_garble;     /* 打字乱码 */
+extern int g_prank_fly;        /* 任务栏图标乱飞 */
+extern int g_prank_shutdown;   /* 假"系统即将关机"倒计时 */
+void prank_config_line(const char *line, int len);
+void prank_boot_demo_start(void);
+void prank_tick(void);
+int  prank_active(void);
+int  prank_wants_redraw(void);
+u8   prank_filter_key(u8 sc);
+void prank_draw(du_context *ctx);
 
 /* ---- main.c ---- */
 void dsk_entry(const dsk_boot_context *ctx);

@@ -40,7 +40,8 @@ typedef int (*block_write_fn)(u32 index, u64 lba, u32 count, const void *buf);
  * 在此定义镜像结构体并用 _Static_assert 校验 block 字段偏移
  * 与 dkm.h 中 dkm_kernel_api.block (0xA8) 一致。 */
 typedef struct dsk_block_api_mirror {
-    void *pad0; void *pad1;  /* register_device, device_count */
+    void *pad0;
+    u32 (*device_count)(void);
     block_read_fn  read;
     block_write_fn write;
     void *pad2; void *pad3; void *pad4;  /* sector_size, device_name, set_write_fn */
@@ -132,17 +133,18 @@ DSK_STAT_DECL(fat32_write);
 DSK_STAT_DECL(elf_load);
 DSK_STAT_DECL(mod_schedule);
 
+static u32 g_fat_dev;
 static int fat32_read_sectors(u32 lba, u32 count, u8 *out) {
     DSK_STAT_INC(fat32_read);
-    return g_block_read ? g_block_read(0, (u64)lba + g_fat_lba_off, count, out) : -1;
+    return g_block_read ? g_block_read(g_fat_dev, (u64)lba + g_fat_lba_off, count, out) : -1;
 }
 static int fat32_write_sectors(u32 lba, u32 count, const u8 *buf) {
     DSK_STAT_INC(fat32_write);
-    return g_block_write ? g_block_write(0, (u64)lba + g_fat_lba_off, count, buf) : -1;
+    return g_block_write ? g_block_write(g_fat_dev, (u64)lba + g_fat_lba_off, count, buf) : -1;
 }
 
 static void fat32_probe_esp(void) {
-    g_fat_lba_off = (u32)fat32_part_probe(g_block_read, 0);
+    g_fat_lba_off = (u32)fat32_part_probe(g_block_read, g_fat_dev);
     logh("[DSK] FAT32 volume LBA=", (u64)g_fat_lba_off);
 }
 
@@ -637,8 +639,6 @@ static void dsk_draw_string(u32 *fb, const char *s, i64 x, i64 y, u32 fg, int sp
  *  不再静默跳过，必须整屏 fatal 显示错误码后停机。
  *  错误码体系：FS-E<nn>（文件系统层）。
  * =================================================================== */
-static u64 dsk_fat_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
-
 /* 莲花 panic 界面：深蓝底 + ohMyLogo 莲花居中 + 错误码 + 停机落款。
  * 与 login.elf / UTSM F1 panic 同一视觉体系。 */
 static void dsk_fatal_lotus(u32 *fb, const char *sym) {
@@ -647,14 +647,23 @@ static void dsk_fatal_lotus(u32 *fb, const char *sym) {
         u32 *line = (u32 *)((u8 *)fb + y * g_fb_p);
         for (u64 x = 0; x < g_fb_w; x++) line[x] = 0xFF020F22u;
     }
-    /* 莲花居中（偏上，给错误码留空间） */
-    i64 lx = ((i64)g_fb_w - g_panic_logo_w) / 2;
-    i64 ly = ((i64)g_fb_h - g_panic_logo_h) / 2 - 60;
-    if (ly < 0) ly = 0;
-    for (i64 r = 0; r < g_panic_logo_h; r++) {
-        for (i64 c = 0; c < g_panic_logo_w; c++) {
+    /* 莲花按步进缩小，错误码折行钉在屏内（长串不再被左右裁掉） */
+    i64 spacing = g_ascii_w;
+    i64 text_need = (g_ascii_h + 6) * 4;
+    i64 step = 1;
+    while (step < 8 &&
+           (i64)g_panic_logo_h / step + text_need + 24 > (i64)g_fb_h)
+        step++;
+    i64 dw = (i64)g_panic_logo_w / step;
+    i64 dh = (i64)g_panic_logo_h / step;
+    i64 lx2 = ((i64)g_fb_w - dw) / 2;
+    i64 ly2 = ((i64)g_fb_h - dh - text_need) / 2;
+    if (ly2 < 4) ly2 = 4;
+    for (i64 r = 0; r < dh; r++) {
+        for (i64 c = 0; c < dw; c++) {
             const unsigned char *px4 =
-                g_panic_logo_rgba + ((u64)r * g_panic_logo_w + (u64)c) * 4;
+                g_panic_logo_rgba + (((u64)r * (u64)step) * (u64)g_panic_logo_w
+                                     + (u64)c * (u64)step) * 4;
             u32 a = px4[3];
             if (a < 8) continue;
             u32 col = 0xFF000000u | ((u32)px4[0] << 16) | ((u32)px4[1] << 8) | px4[2];
@@ -666,24 +675,48 @@ static void dsk_fatal_lotus(u32 *fb, const char *sym) {
                 u32 bb = ((bg & 0xFF) * na + (col & 0xFF) * a) >> 8;
                 col = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
             }
-            i64 xx = lx + c, yy = ly + r;
+            i64 xx = lx2 + c, yy = ly2 + r;
             if (xx < 0 || (u64)xx >= g_fb_w || yy < 0 || (u64)yy >= g_fb_h) continue;
             *(u32 *)((u8 *)fb + (u64)yy * g_fb_p + (u64)xx * 4) = col;
         }
     }
-    /* 错误码 + 停机落款（莲花下方） */
-    i64 ty = ly + g_panic_logo_h + 24;
-    i64 spacing = g_ascii_w + 1;
-    dsk_draw_string(fb, sym,
-                    ((i64)g_fb_w - (i64)dsk_fat_strlen(sym) * spacing) / 2, ty,
-                    0xFFF2D8D8u, (int)spacing);
-    dsk_draw_string(fb, "DESHAB FS FATAL - SYSTEM HALTED",
-                    ((i64)g_fb_w - 31 * spacing) / 2, ty + g_ascii_h + 16,
-                    0xFFB08890u, (int)spacing);
+    i64 ty = ly2 + dh + 12;
+    i64 y_limit = (i64)g_fb_h - 4;
+    if (ty + text_need > y_limit) ty = y_limit - text_need;
+    if (ty < 4) ty = 4;
+    i64 cols = (i64)g_fb_w / spacing - 2;
+    if (cols < 8) cols = 8;
+    if (cols > 120) cols = 120;
+    {
+        const char *s = sym ? sym : "";
+        while (*s && ty + g_ascii_h <= y_limit) {
+            char line[121];
+            i64 n = 0;
+            while (s[n] && n < cols) { line[n] = s[n]; n++; }
+            line[n] = 0;
+            s += n;
+            dsk_draw_string(fb, line, ((i64)g_fb_w - n * spacing) / 2, ty,
+                            0xFFF2D8D8u, (int)spacing);
+            ty += g_ascii_h + 6;
+        }
+    }
+    if (ty + g_ascii_h <= y_limit) {
+        dsk_draw_string(fb, "DESHAB FS FATAL - SYSTEM HALTED",
+                        ((i64)g_fb_w - 31 * spacing) / 2, ty,
+                        0xFFB08890u, (int)spacing);
+    }
 }
+
+/* DSK_BOOT_FLAG_PANIC_FALLBACK（FUCK [panic] mode=fallback）：dsk_fatal 只留
+ * 串口坐标后返回，调用点紧跟备用路径；未置位 = strict，整屏莲花后停机。 */
+static int g_panic_fallback;
 
 static void dsk_fatal(const char *sym) {
     logl(sym);
+    if (g_panic_fallback) {
+        logl("[DSK:FALLBACK] fatal point hit, taking backup path");
+        return;
+    }
     if (g_fb_addr) {
         dsk_fatal_lotus((u32 *)(u64)g_fb_addr, sym);
     }
@@ -1411,7 +1444,7 @@ static int dsk_load_elf(u8 *data, u32 size, void **entry_out) {
                 logh("[DSK] ELF: min_vaddr=", min_vaddr);
                 logh("[DSK] ELF: isize=", isize);
                 dsk_fatal("ELF-E01 RELA OUT OF BOUNDS");
-                continue;
+                return -1;   /* fallback：拒绝加载未重定位的镜像 */
             }
             if (rela_off + rela_sz > min_vaddr + isize) {
                 logl("[DSK] ELF: rela table extends beyond image, clamping");
@@ -1813,17 +1846,28 @@ static void dsk_persist_userconf(const dsk_boot_context *ctx) {
     logl("[DSK] writing USER.CONF");
     int wrc = fat32_write_root_file(cn, conf, (u32)conf_sz);
     logh("[DSK] USER.CONF write rc=", (u64)(i64)wrc);
-    if (wrc != 0) dsk_fatal("FS-E02 USER.CONF WRITE FAILED");
+    if (wrc != 0) {
+        dsk_fatal("FS-E02 USER.CONF WRITE FAILED");
+        /* fallback：不翻 firstInit.txt，下次启动重跑向导 */
+        return;
+    }
 
     /* 1b. Write-verify: 回读 USER.CONF 逐字节比对，确保 FAT32 写路径真的落盘 */
     {
         u8 *vdata = 0; u32 vsize = 0;
-        if (fat32_read_root_file(cn, &vdata, &vsize) != 0)
+        if (fat32_read_root_file(cn, &vdata, &vsize) != 0) {
             dsk_fatal("FS-E04 USER.CONF VERIFY READ FAILED");
-        if (vsize != (u32)conf_sz)
+            return;
+        }
+        if (vsize != (u32)conf_sz) {
             dsk_fatal("FS-E04 USER.CONF VERIFY SIZE MISMATCH");
+            return;
+        }
         for (u32 i = 0; i < (u32)conf_sz; i++) {
-            if (vdata[i] != conf[i]) dsk_fatal("FS-E04 USER.CONF VERIFY DATA MISMATCH");
+            if (vdata[i] != conf[i]) {
+                dsk_fatal("FS-E04 USER.CONF VERIFY DATA MISMATCH");
+                return;
+            }
         }
         logl("[DSK] USER.CONF verify ok");
     }
@@ -1923,6 +1967,7 @@ static int dsk_run_login(const dsk_boot_context *ctx) {
  * FUCK config controls: show_logo, skip_login, mouse_init, netman, dev_mode. */
 static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
     const dsk_boot_context *ctx = (const dsk_boot_context *)boot_ctx_ptr;
+    u32 (*block_dev_count)(void) = 0;
     { u64 api_addr = ctx->dkm_kernel_api;
       logh("[DSK] kernel_api addr=", api_addr);
       if (!api_addr) { logl("[DSK] FATAL: kernel_api is NULL"); for(;;)__asm__("hlt"); }
@@ -1931,17 +1976,20 @@ static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
       logh("[DSK] block_api addr=", (u64)(u64)blk);
       g_block_read  = blk ? blk->read  : 0;
       g_block_write = blk ? blk->write : 0;
+      block_dev_count = blk ? blk->device_count : 0;
       logh("[DSK] block_read fn=", (u64)g_block_read);
       logh("[DSK] block_write fn=", (u64)g_block_write);
-      fat32_probe_esp(); }
-    milestone_write(2, "block API ready");
-
+    }
     g_fb_addr=ctx->framebuffer_address; g_fb_w=ctx->framebuffer_width;
     g_fb_h=ctx->framebuffer_height; g_fb_p=ctx->framebuffer_pitch;
     if (!g_fb_addr) { logl("[DSK] FATAL: framebuffer address is NULL"); for(;;)__asm__("hlt"); }
 
-    /* ext4 p2 数据分区挂载 + 启动读写自检（任何失败 fatal panic，FS-E2x/FS-E3x） */
+    /* 先选中卷标 DESHAB 的盘，FAT 与 ext4 共用该设备号。 */
+    if (block_dev_count) ext4_set_device_count(block_dev_count());
     ext4_mount(g_block_read, g_block_write, dsk_fatal, logl, logh);
+    g_fat_dev = ext4_device_index();
+    fat32_probe_esp();
+    milestone_write(2, "block API ready");
     ext4_boot_selftest();
     u32 *sfb=(u32*)(u64)g_fb_addr;
     logh("[DSK] block_read ptr=", (u64)g_block_read);
@@ -2161,23 +2209,24 @@ static void dsk_spinner_and_check(const void *boot_ctx_ptr) {
         en[6]='~';en[7]='1';en[8]='E';en[9]='L';en[10]='F';en[11]=0;
         logl("[DSK] loading FirstInit");
         if (dsk_load_and_run(en, ctx) != 0) {
-            /* 严格错误策略：首次启动却没有 FirstInit.elf = 未实现路径，零降级 */
+            /* 严格错误策略：首次启动却没有 FirstInit.elf = 未实现路径，零降级。
+             * fallback：跳过向导与登录，直接进桌面。 */
             dsk_fatal("FS-E07 FIRSTINIT.ELF NOT FOUND");
-            return;
-        }
-        logl("[DSK] FirstInit returned, persisting user.conf");
-        dsk_persist_userconf(ctx);
-        logh("[DSK:STAT] fat32_read_count=", (u64)fat32_read_count);
-        logh("[DSK:STAT] fat32_write_count=", (u64)fat32_write_count);
-        logh("[DSK:STAT] elf_load_count=", (u64)elf_load_count);
-        logh("[DSK:STAT] mod_schedule_count=", (u64)mod_schedule_count);
+        } else {
+            logl("[DSK] FirstInit returned, persisting user.conf");
+            dsk_persist_userconf(ctx);
+            logh("[DSK:STAT] fat32_read_count=", (u64)fat32_read_count);
+            logh("[DSK:STAT] fat32_write_count=", (u64)fat32_write_count);
+            logh("[DSK:STAT] elf_load_count=", (u64)elf_load_count);
+            logh("[DSK:STAT] mod_schedule_count=", (u64)mod_schedule_count);
 
-        /* 向导完成后强制重新登录：进桌面前必须再走一次 login.elf。
-         * 零降级策略：登录被跳过/失败（如 Esc 跳过）不允许静默进桌面。 */
-        if (skip_login) {
-            logl("[DSK:SCHED] first-boot login skipped by FUCK config");
-        } else if (!dsk_run_login(ctx)) {
-            dsk_fatal("FS-E06 LOGIN REQUIRED AFTER FIRSTINIT");
+            /* 向导完成后强制重新登录：进桌面前必须再走一次 login.elf。
+             * 零降级策略：登录被跳过/失败（如 Esc 跳过）不允许静默进桌面。 */
+            if (skip_login) {
+                logl("[DSK:SCHED] first-boot login skipped by FUCK config");
+            } else if (!dsk_run_login(ctx)) {
+                dsk_fatal("FS-E06 LOGIN REQUIRED AFTER FIRSTINIT");
+            }
         }
 
         logl("[DSK] loading desktop");
@@ -2192,6 +2241,8 @@ void dsk_entry(const dsk_boot_context *ctx) {
     logl("[DSK] boot");
     if(!ctx||ctx->magic!=DSK_BOOT_MAGIC){logl("[DSK] bad context");for(;;)__asm__("hlt");}
     logl("[DSK] context ok");
+    g_panic_fallback = (ctx->flags & DSK_BOOT_FLAG_PANIC_FALLBACK) ? 1 : 0;
+    if (g_panic_fallback) logl("[DSK] panic mode=fallback");
     dsk_spinner_and_check(ctx);
     logl("[DSK] SELFTEST PASS");
     for(;;)__asm__("hlt");

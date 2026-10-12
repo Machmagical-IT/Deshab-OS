@@ -1,5 +1,6 @@
 param(
-    [ValidateSet('dev','release','both')][string]$Variant = 'both',
+    # dev/realtest: panic=strict; release: panic=fallback. both = dev+release, all = all three.
+    [ValidateSet('dev','release','realtest','both','all')][string]$Variant = 'all',
     [switch]$Vhd
 )
 
@@ -15,6 +16,7 @@ $Output = Join-Path $SystemDir 'boot\utsm.elf'
 $DskOutput = Join-Path $SystemDir 'system\deshab64\deshab.elf'
 $DevImagePath = Join-Path $IsoDir 'deshab-dev.img'
 $ReleaseImagePath = Join-Path $IsoDir 'deshab-release.img'
+$RealtestImagePath = Join-Path $IsoDir 'deshab-realtest.img'
 $BuildTmp = Join-Path $Root '.build_tmp'
 
 # Legacy single-FAT32 ESP size helper (New-GptFat32Image). Dual-partition
@@ -1055,6 +1057,7 @@ Build-DkmDriver (Join-Path $Root 'CODE\DKM\e1000\e1000.c') (Join-Path $SystemDir
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\virtio_net\virtio_net.c') (Join-Path $SystemDir 'driver\net\virtio_net.drv')
 Build-DkmDriverMulti @((Join-Path $Root 'CODE\DKM\ath9k\ath9k.c'),
                        (Join-Path $Root 'CODE\DKM\ath9k\wpa2_crypto.c')) (Join-Path $SystemDir 'driver\net\ath9k.drv')
+Build-DkmDriver (Join-Path $Root 'CODE\DKM\mt7920\mt7920.c') (Join-Path $SystemDir 'driver\net\mt7920.drv')
 Build-DkmDriver (Join-Path $Root 'CODE\DKM\wlan\wlan.c') (Join-Path $SystemDir 'driver\net\wlan.drv')
 
 # stage3: input — ps2kbd 注册 IRQ1。
@@ -1073,18 +1076,23 @@ if (Test-Path $LegacyImg) {
 }
 
 Write-Host '[build] Packaging SYSTEM to GPT images (p1 FAT32 ESP + p2 ext4, not a single FAT32 disk)...'
-if ($Variant -in @('dev','both')) {
-    Write-Host '[build] === Building DEV image (QEMU test, dev_mode=1, debug on) ==='
+if ($Variant -in @('dev','both','all')) {
+    Write-Host '[build] === Building DEV image (QEMU test, dev_mode=1, debug on, panic=strict) ==='
     Build-ImageVariant 'dev' $DevImagePath
     Write-Host "[build] DEV image done: $DevImagePath"
 }
-if ($Variant -in @('release','both')) {
-    Write-Host '[build] === Building RELEASE image (real hardware, dev_mode=0, debug off) ==='
+if ($Variant -in @('release','both','all')) {
+    Write-Host '[build] === Building RELEASE image (real hardware, dev_mode=0, debug off, panic=fallback) ==='
     Build-ImageVariant 'release' $ReleaseImagePath
     Write-Host "[build] RELEASE image done: $ReleaseImagePath"
 }
+if ($Variant -in @('realtest','all')) {
+    Write-Host '[build] === Building REALTEST image (real hardware, release options, panic=strict) ==='
+    Build-ImageVariant 'realtest' $RealtestImagePath
+    Write-Host "[build] REALTEST image done: $RealtestImagePath"
+}
 # Restore SYSTEM to dev config (dev is the primary development target)
-if ($Variant -eq 'both') {
+if ($Variant -in @('both','all')) {
     Write-Host '[build] Restoring SYSTEM to dev config for development...'
     Build-ImageVariant 'dev' $null
 }

@@ -81,8 +81,9 @@ desktop_window *win_create(int app_id, const char *title, int x, int y, int w, i
 
 void win_destroy(desktop_window *w) {
     int idx = -1;
+    int id = w->id;
     for (int i = 0; i < g_win_count; i++) {
-        if (g_windows[i].id == w->id) { idx = i; break; }
+        if (g_windows[i].id == id) { idx = i; break; }
     }
     if (idx < 0) return;
 
@@ -92,9 +93,10 @@ void win_destroy(desktop_window *w) {
     if (w->app_id >= 0 && w->app_id < g_app_count && g_apps[w->app_id].on_destroy && w->app_state) {
         g_apps[w->app_id].on_destroy(w->app_state);
     }
+    /* 挪位之后 w 指向的是下一扇窗口，关闭判断必须用挪位前记下的 id。 */
     for (int i = idx; i < g_win_count - 1; i++) g_windows[i] = g_windows[i+1];
     g_win_count--;
-    if (g_focused_win == w->id) {
+    if (g_focused_win == id) {
         g_focused_win = -1;
         for (int i = g_win_count - 1; i >= 0; i--) {
             if (g_windows[i].ws == g_ws_cur && g_windows[i].visible && !g_windows[i].minimized) {
@@ -148,7 +150,8 @@ static int wm_fluent_hit_btn(desktop_window *w, int mx, int my, int btn) {
 static int g_wm_btn_hover = 0;
 
 int win_hit_close_btn(desktop_window *w, int mx, int my) {
-    if (g_fluent) return wm_fluent_hit_btn(w, mx, my, 3);
+    /* 绘制顺序是 min=*3、max=*2、close=*1（最右）。命中必须跟绘制同一序号。 */
+    if (g_fluent) return wm_fluent_hit_btn(w, mx, my, 1);
     int bx = w->x + w->w - CLOSE_BTN_OFFSET;
     int by = w->y + (KATE_TITLEBAR_H - CLOSE_BTN_SIZE) / 2;
     return mx >= bx && mx < bx + CLOSE_BTN_SIZE &&
@@ -156,7 +159,7 @@ int win_hit_close_btn(desktop_window *w, int mx, int my) {
 }
 
 int win_hit_min_btn(desktop_window *w, int mx, int my) {
-    return g_fluent ? wm_fluent_hit_btn(w, mx, my, 1) : 0;
+    return g_fluent ? wm_fluent_hit_btn(w, mx, my, 3) : 0;
 }
 
 int win_hit_max_btn(desktop_window *w, int mx, int my) {

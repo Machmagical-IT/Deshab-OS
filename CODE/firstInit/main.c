@@ -189,31 +189,6 @@ static i64 fb_text_width(const char *s) {
     return n * ASCII_STEP;
 }
 
-/* Alpha-blended ASCII text — same as fb_text but multiplied by a global alpha,
- * used to fade English subtitles in/out alongside the Chinese bitmaps. */
-static void fb_text_alpha(u32 *fb, const char *s, i64 x, i64 y, u32 fg, u32 bg, u32 global_alpha) {
-    for (i64 i=0; s[i]; i++) {
-        u32 ch = (u32)(u8)s[i];
-        if (ch < ' ' || ch > '~') ch = ' ';
-        u32 idx = ch - ' ';
-        const u8 *g = g_ascii[idx];
-        for (i64 r=0; r<ASCII_H; r++) {
-            i64 yy = y + r;
-            if (yy < 0 || (u64)yy >= fb_h) continue;
-            u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
-            for (i64 c=0; c<ASCII_W; c++) {
-                u32 a = g[r * ASCII_W + c];
-                if (a == 0) continue;
-                u32 eff_a = ((u32)a * global_alpha) >> 8;
-                if (eff_a == 0) continue;
-                i64 xx = x + i*ASCII_STEP + c;
-                if (xx < 0 || (u64)xx >= fb_w) continue;
-                line[(u64)xx] = (eff_a == 255) ? fg : blend(bg, fg, eff_a);
-            }
-        }
-    }
-}
-
 /* draw pre-rendered grayscale bitmap – writes only, no framebuffer read */
 static void fb_bitmap_alpha(u32 *fb, const u8 *data, i64 w, i64 h, i64 x, i64 y, u32 fg, u32 bg, u32 global_alpha) {
     for (i64 r=0; r<h; r++) {
@@ -236,21 +211,33 @@ static void fb_bitmap_alpha(u32 *fb, const u8 *data, i64 w, i64 h, i64 x, i64 y,
  * 整屏显示错误码后停机。 */
 #include "../login/ohmylogo_data.c"
 
-static u64 fi_fat_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
-
 static void fill_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 color);
+/* DSK_BOOT_FLAG_PANIC_FALLBACK：firstinit_fatal 只留串口坐标后返回，调用点走备用路径 */
+static int g_panic_fallback;
 static void firstinit_fatal(const char *sym) {
     logl(sym);
+    if (g_panic_fallback) {
+        logl("[FirstInit:FALLBACK] fatal point hit, taking backup path");
+        return;
+    }
     if (fb_a) {
         u32 *fb = (u32 *)(u64)fb_a;
         fill_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h, 0xFF020F22u);
-        i64 lx = ((i64)fb_w - g_panic_logo_w) / 2;
-        i64 ly = ((i64)fb_h - g_panic_logo_h) / 2 - 60;
-        if (ly < 0) ly = 0;
-        for (i64 r = 0; r < g_panic_logo_h; r++) {
-            for (i64 c = 0; c < g_panic_logo_w; c++) {
+        i64 text_need = (ASCII_H + 6) * 4;
+        i64 step = 1;
+        while (step < 8 &&
+               (i64)g_panic_logo_h / step + text_need + 24 > (i64)fb_h)
+            step++;
+        i64 dw = (i64)g_panic_logo_w / step;
+        i64 dh = (i64)g_panic_logo_h / step;
+        i64 lx = ((i64)fb_w - dw) / 2;
+        i64 ly = ((i64)fb_h - dh - text_need) / 2;
+        if (ly < 4) ly = 4;
+        for (i64 r = 0; r < dh; r++) {
+            for (i64 c = 0; c < dw; c++) {
                 const unsigned char *px4 =
-                    g_panic_logo_rgba + ((u64)r * g_panic_logo_w + (u64)c) * 4;
+                    g_panic_logo_rgba + (((u64)r * (u64)step) * (u64)g_panic_logo_w
+                                         + (u64)c * (u64)step) * 4;
                 u32 a = px4[3];
                 if (a < 8) continue;
                 u32 col = 0xFF000000u | ((u32)px4[0] << 16) | ((u32)px4[1] << 8) | px4[2];
@@ -267,11 +254,28 @@ static void firstinit_fatal(const char *sym) {
                 *(u32 *)((u8 *)fb + (u64)yy * fb_p + (u64)xx * 4) = col;
             }
         }
-        i64 ty = ly + g_panic_logo_h + 24;
-        fb_text(fb, sym, ((i64)fb_w - (i64)fi_fat_strlen(sym) * ASCII_STEP) / 2,
-                ty, 0xFFF2D8D8u, 0);
-        fb_text(fb, "DESHAB NET FATAL - SYSTEM HALTED",
-                ((i64)fb_w - 32 * ASCII_STEP) / 2, ty + ASCII_H + 16, 0xFFB08890u, 0);
+        i64 ty = ly + dh + 12;
+        i64 y_limit = (i64)fb_h - 4;
+        if (ty + text_need > y_limit) ty = y_limit - text_need;
+        if (ty < 4) ty = 4;
+        i64 cols = (i64)fb_w / ASCII_STEP - 2;
+        if (cols < 8) cols = 8;
+        if (cols > 120) cols = 120;
+        {
+            const char *s = sym ? sym : "";
+            while (*s && ty + ASCII_H <= y_limit) {
+                char line[121];
+                i64 n = 0;
+                while (s[n] && n < cols) { line[n] = s[n]; n++; }
+                line[n] = 0;
+                s += n;
+                fb_text(fb, line, ((i64)fb_w - n * ASCII_STEP) / 2, ty, 0xFFF2D8D8u, 0);
+                ty += ASCII_H + 6;
+            }
+        }
+        if (ty + ASCII_H <= y_limit)
+            fb_text(fb, "DESHAB NET FATAL - SYSTEM HALTED",
+                    ((i64)fb_w - 32 * ASCII_STEP) / 2, ty, 0xFFB08890u, 0);
     }
     for (;;) __asm__("cli; hlt");
 }
@@ -296,22 +300,20 @@ static u32 bg_at_y(i64 y) {
     return blend(BG_TOP, BG_BOTTOM, (u32)(((u64)y * 255ULL) / (fb_h - 1)));
 }
 
-static void fill_gradient_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
-    for (i64 r=0; r<h; r++) {
-        i64 yy = y + r;
-        if (yy < 0 || (u64)yy >= fb_h) continue;
-        u32 color = bg_at_y(yy);
-        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
-        for (i64 c=0; c<w; c++) {
-            i64 xx = x + c;
-            if (xx < 0 || (u64)xx >= fb_w) continue;
-            line[(u64)xx] = color;
-        }
-    }
-}
-
 /* 模糊化的桌面壁纸（与 login 共用，构建期盒模糊 back.rgba） */
 #include "../login/back_blur_data.c"
+
+static u32 wallpaper_at(i64 x, i64 y) {
+    if (fb_w == 0 || fb_h == 0) return BG_MID;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if ((u64)x >= fb_w) x = (i64)fb_w - 1;
+    if ((u64)y >= fb_h) y = (i64)fb_h - 1;
+    u64 sy = (u64)y * WALLPAPER_BLUR_H / fb_h;
+    u64 sx = (u64)x * WALLPAPER_BLUR_W / fb_w;
+    const unsigned char *px = g_wall_blur_rgba + (sy * WALLPAPER_BLUR_W + sx) * 4;
+    return 0xFF000000u | ((u32)px[0] << 16) | ((u32)px[1] << 8) | px[2];
+}
 
 static void draw_blur_wallpaper(u32 *fb) {
     for (i64 y = 0; y < (i64)fb_h; y++) {
@@ -322,6 +324,20 @@ static void draw_blur_wallpaper(u32 *fb) {
             u64 sx = (u64)x * WALLPAPER_BLUR_W / fb_w;
             const unsigned char *px = srow + sx * 4;
             line[x] = 0xFF000000u | ((u32)px[0] << 16) | ((u32)px[1] << 8) | px[2];
+        }
+    }
+}
+
+/* 卡片重绘不能再用深色渐变铺底，否则圆角外会留下一圈黑框。 */
+static void restore_wallpaper_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
+    for (i64 r = 0; r < h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c = 0; c < w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            line[(u64)xx] = wallpaper_at(xx, yy);
         }
     }
 }
@@ -383,11 +399,54 @@ static void delay_frame(void) {
 
 #include "text_bitmaps.c"
 
+/* 开场文字画在壁纸上。透明字素跳过，抗锯齿边缘按该点壁纸颜色混合，
+ * 不再铺一块灰渐变当底。 */
+static void fb_bitmap_on_wall(u32 *fb, const u8 *data, i64 w, i64 h, i64 x, i64 y, u32 fg, u32 global_alpha) {
+    for (i64 r = 0; r < h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        for (i64 c = 0; c < w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            u8 val = data[r * (u64)w + (u64)c];
+            if (val == 0) continue;
+            u32 a = ((u32)val * global_alpha) >> 8;
+            if (a == 0) continue;
+            u32 bg = wallpaper_at(xx, yy);
+            line[(u64)xx] = (a >= 255) ? fg : blend(bg, fg, a);
+        }
+    }
+}
+
+static void fb_text_on_wall(u32 *fb, const char *s, i64 x, i64 y, u32 fg, u32 global_alpha) {
+    for (i64 i = 0; s[i]; i++) {
+        u32 ch = (u32)(u8)s[i];
+        if (ch < ' ' || ch > '~') ch = ' ';
+        const u8 *g = g_ascii[ch - ' '];
+        for (i64 r = 0; r < ASCII_H; r++) {
+            i64 yy = y + r;
+            if (yy < 0 || (u64)yy >= fb_h) continue;
+            u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+            for (i64 c = 0; c < ASCII_W; c++) {
+                u32 a = g[r * ASCII_W + c];
+                if (a == 0) continue;
+                u32 eff = (a * global_alpha) >> 8;
+                if (eff == 0) continue;
+                i64 xx = x + i * ASCII_STEP + c;
+                if (xx < 0 || (u64)xx >= fb_w) continue;
+                u32 bg = wallpaper_at(xx, yy);
+                line[(u64)xx] = (eff >= 255) ? fg : blend(bg, fg, eff);
+            }
+        }
+    }
+}
+
 static void fade_ring(u32 *fb, i64 cx, i64 cy, u32 bg) {
-    /* Erase the spinner sprite area with gradient background in one frame. */
+    /* 擦掉 DSK 加载环，露出壁纸，不再盖一块灰渐变。 */
     (void)bg;
     i64 r = 72;
-    fill_gradient_rect(fb, cx-r, cy-r, r*2+1, r*2+1);
+    restore_wallpaper_rect(fb, cx - r, cy - r, r * 2 + 1, r * 2 + 1);
 }
 
 static void draw_card(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 card, u32 bg_color) {
@@ -535,7 +594,7 @@ static void redraw_setup_card(u32 *fb, i64 card_x, i64 card_y, char *pc, char *u
     u32 card = CARD_BG;
     u32 sub_fg = 0xFF9098A0;  /* dimmer English subtitle color on card */
     cursor_erase(fb);
-    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    restore_wallpaper_rect(fb, card_x - 24, card_y - 24, 948, 648);
     draw_card(fb, card_x, card_y, 900, 600, card, bg);
     fb_bitmap_alpha(fb, g_txt_title, g_txt_title_w, g_txt_title_h, card_x+40, card_y+40, fg, card, 255);
     fb_text(fb, "Account Setup", card_x+40, card_y+40+g_txt_title_h+2, sub_fg, card);
@@ -763,7 +822,7 @@ static void draw_option_row(u32 *fb, i64 x, i64 y, i64 w, i64 h,
 static void redraw_prefs_card(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs, int active, i64 mx, i64 my, u32 bg, u32 fg) {
     u32 card = CARD_BG;
     cursor_erase(fb);
-    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    restore_wallpaper_rect(fb, card_x - 24, card_y - 24, 948, 648);
     draw_card(fb, card_x, card_y, 900, 600, card, bg);
     fb_bitmap_alpha(fb, g_txt_prefs_title, g_txt_prefs_title_w, g_txt_prefs_title_h, card_x+40, card_y+40, fg, card, 255);
     fb_text(fb, "Preferences", card_x+40, card_y+40+g_txt_prefs_title_h+2, 0xFF9098A0, card);
@@ -1154,7 +1213,7 @@ static void draw_wifi_row(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int r
 static void redraw_network_card(u32 *fb, i64 card_x, i64 card_y, setup_net *net, int active, i64 mx, i64 my, u32 bg, u32 fg) {
     u32 card = CARD_BG;
     cursor_erase(fb);
-    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    restore_wallpaper_rect(fb, card_x - 24, card_y - 24, 948, 648);
     draw_card(fb, card_x, card_y, 900, 600, card, bg);
     fb_bitmap_alpha(fb, g_txt_network_title, g_txt_network_title_w, g_txt_network_title_h, card_x+40, card_y+40, fg, card, 255);
     fb_text(fb, "Network", card_x+40, card_y+40+g_txt_network_title_h+2, 0xFF9098A0, card);
@@ -1273,8 +1332,9 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
                 if (*mx >= card_x + 680 && *mx < card_x + 860 && *my >= card_y + 310 && *my < card_y + 354) {
                     /* 严格错误策略：无 wlan 驱动栈 —— 零降级 panic */
                     firstinit_fatal("NET-E01 WLAN CONNECT NOT IMPLEMENTED");
+                    /* fallback：不连接，按"保存配置"处理（connected=配置已存，非已联网） */
                     net->connected = 1;
-                    logl("[FirstInit] network connect requested");
+                    logl("[FirstInit] network connect unavailable, profile saved");
                     redraw_network_card(fb, card_x, card_y, net, NET_ACT_CONNECT, *mx, *my, bg, fg);
                     for (int i=0;i<30;i++) delay_frame();
                     return;
@@ -1328,8 +1388,9 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
             } else if (active == NET_ACT_CONNECT) {
                 /* 严格错误策略：无 wlan 驱动栈，"连接"是未实现路径 —— 零降级 panic */
                 firstinit_fatal("NET-E01 WLAN CONNECT NOT IMPLEMENTED");
+                /* fallback：不连接，按"保存配置"处理（connected=配置已存，非已联网） */
                 net->connected = 1;
-                logl("[FirstInit] network connect requested");
+                logl("[FirstInit] network connect unavailable, profile saved");
                 redraw_network_card(fb, card_x, card_y, net, active, *mx, *my, bg, fg);
                 for (int i=0;i<30;i++) delay_frame();
                 return;
@@ -1443,6 +1504,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
         logl("[FirstInit] bad context");
         for(;;) __asm__("hlt");
     }
+    g_panic_fallback = (ctx->flags & DSK_BOOT_FLAG_PANIC_FALLBACK) ? 1 : 0;
 
     fb_a = ctx->framebuffer_address;
     fb_w = ctx->framebuffer_width;
@@ -1479,9 +1541,9 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     logl("[FirstInit] fading in welcome");
     for (u32 a=0; a<=255; a+=17) {
-        fill_gradient_rect(fb, tx-4, ty-4, tw+8, g_txt_welcome_h + 6 + ASCII_H + 4);
-        fb_bitmap_alpha(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, bg_at_y(ty + g_txt_welcome_h / 2), a);
-        fb_text_alpha(fb, welcome_en, en_x, en_y, sub_fg, bg_at_y(en_y + ASCII_H/2), a);
+        restore_wallpaper_rect(fb, tx-4, ty-4, tw+8, g_txt_welcome_h + 6 + ASCII_H + 4);
+        fb_bitmap_on_wall(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, a);
+        fb_text_on_wall(fb, welcome_en, en_x, en_y, sub_fg, a);
         delay_frame();
     }
     logl("[FirstInit] welcome drawn");
@@ -1505,11 +1567,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
     for (u32 step=0; step<=15; step++) {
         u32 a2 = step * 17;
         u32 a1 = 255 - a2;
-        fill_gradient_rect(fb, area_x-4, ty-4, area_w+8, area_h);
-        fb_bitmap_alpha(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, bg_at_y(ty + g_txt_welcome_h / 2), a1);
-        fb_text_alpha(fb, welcome_en, en_x, en_y, sub_fg, bg_at_y(en_y + ASCII_H/2), a1);
-        fb_bitmap_alpha(fb, g_txt_setup, tw2, g_txt_setup_h, tx2, ty, WELCOME_FG, bg_at_y(ty + g_txt_setup_h / 2), a2);
-        fb_text_alpha(fb, setup_en, en2_x, en_y, sub_fg, bg_at_y(en_y + ASCII_H/2), a2);
+        restore_wallpaper_rect(fb, area_x-4, ty-4, area_w+8, area_h);
+        fb_bitmap_on_wall(fb, g_txt_welcome, tw, g_txt_welcome_h, tx, ty, WELCOME_FG, a1);
+        fb_text_on_wall(fb, welcome_en, en_x, en_y, sub_fg, a1);
+        fb_bitmap_on_wall(fb, g_txt_setup, tw2, g_txt_setup_h, tx2, ty, WELCOME_FG, a2);
+        fb_text_on_wall(fb, setup_en, en2_x, en_y, sub_fg, a2);
         delay_frame();
     }
     logl("[FirstInit] setup message drawn");
@@ -1673,17 +1735,17 @@ void dsk_entry(const dsk_boot_context *ctx) {
     logl("[FirstInit] config ready for DSK to write");
 
     cursor_erase(fb);
-    fill_gradient_rect(fb, card_x - 24, card_y - 24, 948, 648);
-    fb_bitmap_alpha(fb, g_txt_done, g_txt_done_w, g_txt_done_h, cx - g_txt_done_w/2, cy - 30, fg, bg_at_y(cy), 255);
+    restore_wallpaper_rect(fb, card_x - 24, card_y - 24, 948, 648);
+    fb_bitmap_on_wall(fb, g_txt_done, g_txt_done_w, g_txt_done_h, cx - g_txt_done_w/2, cy - 30, fg, 255);
     /* English subtitle below the Chinese done bitmap */
     {   const char *done_en = "Setup Complete";
         i64 dw = fb_text_width(done_en);
-        fb_text(fb, done_en, cx - dw/2, cy + 2, 0xFFA8B8C8, bg_at_y(cy + 10));
+        fb_text_on_wall(fb, done_en, cx - dw/2, cy + 2, 0xFFA8B8C8, 255);
     }
     /* status line below the subtitle */
     {   const char *status = "System starting...";
         i64 sw = fb_text_width(status);
-        fb_text(fb, status, cx - sw/2, cy + 28, 0xFF808088, bg_at_y(cy + 36));
+        fb_text_on_wall(fb, status, cx - sw/2, cy + 28, 0xFF808088, 255);
     }
     logl("[FirstInit] user setup finished");
 

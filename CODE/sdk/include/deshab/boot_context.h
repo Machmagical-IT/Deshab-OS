@@ -21,6 +21,7 @@
 #define DSK_BOOT_FLAG_DKM_READY  (1ULL << 1)
 #define DSK_BOOT_FLAG_FAT32_PATH (1ULL << 2)
 #define DSK_BOOT_FLAG_PROBE_INFO (1ULL << 3)
+#define DSK_BOOT_FLAG_PANIC_FALLBACK (1ULL << 4)  /* FUCK [panic] mode=fallback */
 
 /* ---- reserved 槽位索引（dsk_boot_context.reserved[]） ---- */
 #define DSB_BOOT_RESERVED_PE_SERVICE      4u

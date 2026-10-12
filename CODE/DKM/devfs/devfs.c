@@ -26,6 +26,26 @@ struct dkm_log_api {
     void (*panic)(const char *msg);
 };
 
+/* D6 万物互联：dkm_bus 镜像（布局对齐 UTSM include/utsm/dkm.h） */
+struct dkm_bus_service {
+    char name[48];
+    u32 version;
+    u32 flags;
+    void *fn;
+    const void *provider;
+};
+
+struct dkm_bus_api {
+    u32 magic;
+    u32 version;
+    int (*register_service)(const char *name, u32 version, void *fn);
+    int (*unregister_service)(const char *name);
+    int (*lookup)(const char *name, void **out_fn, u32 *out_version);
+    int (*probe)(const char *name, void **out_fn, u32 *out_version);
+    u32 (*count)(void);
+    const struct dkm_bus_service *(*at)(u32 index);
+};
+
 struct dkm_kernel_api {
     u32 version;
     u32 size;
@@ -47,6 +67,19 @@ struct dkm_kernel_api {
     u64 fb_pitch;
     u16 fb_bpp;
     const void *boot_modules_response;
+    /* —— 尾部追加字段镜像（DKM_ABI v1；到 bus 为止） —— */
+    void *irq_register;        /* int (*)(u8, void*) */
+    u64 hhdm_offset;
+    const void *block;
+    const void *mmio;
+    void *mm_map_mmio;
+    void *mm_unmap_mmio;
+    void *register_apic_eoi;
+    void *irq_vector_alloc;
+    void *irq_vector_free;
+    const void *sched;
+    const void *kapi;
+    const struct dkm_bus_api *bus;
 };
 
 struct dkm_driver_handle;
@@ -183,6 +216,31 @@ int driver_init(const struct dkm_kernel_api *api,
             for (u32 i = 0; i <= p; i++) info[i] = tmp[i];
         }
         devfs_file("fb0", info);
+    }
+
+    /* /dev/services — D6 万物互联：总线已注册服务清单 */
+    if (api->bus && api->bus->magic == 0x53425553u /* "SBUS" */) {
+        char cnt[24];
+        cnt[0] = '0'; cnt[1] = 'x';
+        u64 v = api->bus->count();
+        u32 p = 2;
+        if (v == 0) cnt[p++] = '0';
+        else {
+            char r[18]; u32 q = 0;
+            while (v) { r[q++] = "0123456789abcdef"[v&0xf]; v>>=4; }
+            while (q) cnt[p++] = r[--q];
+        }
+        cnt[p] = 0;
+        devfs_file("services", cnt);
+
+        g_log->info("[devfs] /dev/services/");
+        for (u32 i = 0; i < api->bus->count(); i++) {
+            const struct dkm_bus_service *s = api->bus->at(i);
+            if (s && s->name[0]) {
+                g_log->info("[devfs]   ");
+                g_log->info(s->name);
+            }
+        }
     }
 
     /* /dev/modules — count from boot_modules */

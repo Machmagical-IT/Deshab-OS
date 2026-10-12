@@ -7,8 +7,21 @@
 static ext4_block_read_fn  rd_fn;
 static ext4_block_write_fn wr_fn;
 static void (*fatalf)(const char *sym);
+static void (*user_fatal)(const char *sym);
 static void (*logl_fn)(const char *s);
 static void (*logh_fn)(const char *p, ext4_u64 v);
+
+/* panic fallback：全部 fatalf 经 ext4_fail 中转。strict 时 user_fatal 不返回；
+ * fallback 时 user_fatal 返回，ext4_fail 长跳回最外层公开入口（EXT4_ENTER），
+ * 该入口关闭 ext4 并返回失败，DSK 走 FAT32 ESP 路径。 */
+static void *g_ext4_jb[5];
+static int g_ext4_depth;
+
+static void ext4_fail(const char *sym) {
+    user_fatal(sym);
+    if (g_ext4_depth > 0) __builtin_longjmp(g_ext4_jb, 1);
+    for (;;) __asm__ volatile("cli; hlt");
+}
 
 /* ---------------- 小端读取 ---------------- */
 static ext4_u16 r16(const ext4_u8 *p) { return (ext4_u16)(p[0] | (p[1] << 8)); }
@@ -21,6 +34,7 @@ static void w32(ext4_u8 *p, ext4_u32 v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v
 static void w16(ext4_u8 *p, ext4_u16 v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; }
 
 /* ---------------- 状态 ---------------- */
+static ext4_u32 g_dev;            /* 块设备号：优先卷标 DESHAB，而不是注册表第 0 号 */
 static ext4_u64 g_part_lba;        /* ext4 分区起始 LBA */
 static ext4_u32 g_block_size;      /* 4096 */
 static ext4_u32 g_sec_per_block;   /* 8 */
@@ -42,6 +56,7 @@ static ext4_u8  g_blk2[4096];      /* 第二 scratch（inode 表与目录并行�
 #define EXT4_ROOT_INO     2
 
 /* incompat feature 位 */
+#define COMPAT_HAS_JOURNAL     0x0004u
 #define INCOMPAT_FILETYPE      0x0002u
 #define INCOMPAT_RECOVER       0x0004u
 #define INCOMPAT_META_BG       0x0010u
@@ -59,31 +74,121 @@ static ext4_u8  g_blk2[4096];      /* 第二 scratch（inode 表与目录并行�
 
 /* ---------------- 底层 IO（失败即 fatal） ---------------- */
 static void rd_sec(ext4_u64 lba, ext4_u32 cnt, void *buf) {
-    if (rd_fn(0, lba, cnt, buf) != 0) fatalf("FS-E20 EXT4 BLOCK READ FAILED");
+    if (rd_fn(g_dev, lba, cnt, buf) != 0) fatalf("FS-E20 EXT4 BLOCK READ FAILED");
 }
 static void wr_sec(ext4_u64 lba, ext4_u32 cnt, const void *buf) {
-    if (wr_fn(0, lba, cnt, buf) != 0) fatalf("FS-E21 EXT4 BLOCK WRITE FAILED");
+    if (wr_fn(g_dev, lba, cnt, buf) != 0) fatalf("FS-E21 EXT4 BLOCK WRITE FAILED");
 }
 /* 块号 → LBA */
 static ext4_u64 blk_lba(ext4_u32 blk) { return g_part_lba + (ext4_u64)blk * g_sec_per_block; }
 static void rd_blk(ext4_u32 blk, void *buf)  { rd_sec(blk_lba(blk), g_sec_per_block, buf); }
 static void wr_blk(ext4_u32 blk, const void *buf) { wr_sec(blk_lba(blk), g_sec_per_block, buf); }
 
+/* 第一份对不上的 ext4，供 FS-E24 屏上读出。 */
+static ext4_u32 g_miss_dev;
+static ext4_u64 g_miss_lba;
+static ext4_u8 g_miss_name[6];
+static ext4_u8 g_miss_label[6];
+static ext4_u32 g_miss_feat;
+static int g_miss_boot;
+static char g_probe_map[8];
+static int g_boot_dev = -1;
+static int g_ext4_ok;
+static ext4_u32 g_ndev = 8;
+
+void ext4_set_device_count(unsigned int count) {
+    g_ndev = count > 8 ? 8 : (ext4_u32)count;
+}
+
+static void ext4_note_miss(ext4_u32 dev, ext4_u64 lba, const ext4_u8 *name,
+                           const ext4_u8 *label, ext4_u32 feat, int boot) {
+    g_miss_dev = dev;
+    g_miss_lba = lba;
+    g_miss_feat = feat;
+    g_miss_boot = boot;
+    for (int j = 0; j < 6; j++) {
+        g_miss_name[j] = name[j * 2];
+        g_miss_label[j] = label[j];
+    }
+}
+
+static void ext4_fatal_not_found(void) {
+    static char msg[72];
+    static const char hex[] = "0123456789ABCDEF";
+    const char *p = "FS-E24 DEV ";
+    int n = 0;
+    while (p[n]) { msg[n] = p[n]; n++; }
+    msg[n++] = (char)('0' + (g_miss_dev % 10));
+    p = " LBA ";
+    while (*p) msg[n++] = *p++;
+    for (int s = 28; s >= 0; s -= 4) msg[n++] = hex[(g_miss_lba >> s) & 0xF];
+    msg[n++] = ' ';
+    for (int j = 0; j < 6; j++) {
+        ext4_u8 c = g_miss_name[j];
+        msg[n++] = (c >= 32 && c < 127) ? (char)c : '.';
+    }
+    msg[n++] = '/';
+    for (int j = 0; j < 6; j++) {
+        ext4_u8 c = g_miss_label[j];
+        msg[n++] = (c >= 32 && c < 127) ? (char)c : '.';
+    }
+    msg[n++] = ' ';
+    for (int s = 28; s >= 0; s -= 4) msg[n++] = hex[(g_miss_feat >> s) & 0xF];
+    msg[n++] = g_miss_boot ? 'B' : '-';
+    msg[n++] = ' ';
+    for (int j = 0; j < 8; j++) msg[n++] = g_probe_map[j] ? g_probe_map[j] : '-';
+    msg[n] = 0;
+    fatalf(msg);
+}
+
 /* ---------------- GPT 探测 ext4 分区 ---------------- */
-static void gpt_find_ext4(void) {
+/* 返回 2 = 卷标 DESHAB，1 = 其它 ext4，0 = 这块盘没有可用 ext4。探测失败不 panic。 */
+static int probe_ext4_dev(ext4_u32 dev, ext4_u64 *out_lba, ext4_u8 *out_sb) {
     ext4_u8 gpt[512];
-    rd_sec(1, 1, gpt);
-    if (gpt[0] != 'E' || gpt[1] != 'F' || gpt[2] != 'I' || gpt[3] != ' ')
-        fatalf("FS-E22 GPT SIGNATURE NOT FOUND");
+    if (dev >= g_ndev) return 0;
+    if (dev < 8) g_probe_map[dev] = 'r';
+    if (rd_fn(dev, 1, 1, gpt) != 0) return 0;
+    if (gpt[0] != 'E' || gpt[1] != 'F' || gpt[2] != 'I' || gpt[3] != ' ') {
+        if (dev < 8) {
+            g_probe_map[dev] = 'n';
+            ext4_u8 mbr[512];
+            if (rd_fn(dev, 0, 1, mbr) == 0 && mbr[510] == 0x55 && mbr[511] == 0xAA)
+                g_probe_map[dev] = 'm';
+        }
+        return 0;
+    }
+    if (dev < 8) g_probe_map[dev] = 'g';
     ext4_u64 ent_lba = r64(gpt + 0x48);
     ext4_u32 ent_num = r32(gpt + 0x50);
     ext4_u32 ent_sz  = r32(gpt + 0x54);
-    if (ent_sz < 128 || ent_num == 0 || ent_num > 128)
-        fatalf("FS-E23 GPT ENTRY TABLE INVALID");
-    static ext4_u8 ents[128 * 128];
-    rd_sec(ent_lba, (ent_num * ent_sz + 511) / 512, ents);
-    for (ext4_u32 i = 0; i < ent_num; i++) {
-        const ext4_u8 *e = ents + i * ent_sz;
+    if (ent_sz < 128 || ent_num == 0 || ent_num > 128) return 0;
+    /* 逐扇区读分区表。U 盘驱动对一次几十扇区的 READ 会失败，
+     * 整表读取失败会被当成“没有启动盘”（FS-E24）。 */
+    int boot_disk = 0;
+    {
+        ext4_u8 bpb[512];
+        if (rd_fn(dev, 2048, 1, bpb) == 0 && bpb[510] == 0x55 && bpb[511] == 0xAA) {
+            static const char fatlab[] = "DESHABBOOT";
+            int ok = 1;
+            for (int j = 0; j < 10; j++) if (bpb[71 + j] != (ext4_u8)fatlab[j]) ok = 0;
+            if (ok) {
+                boot_disk = 1;
+                if (g_boot_dev < 0) g_boot_dev = (int)dev;
+            }
+        }
+    }
+    int best = 0;
+    ext4_u32 ent_secs = (ent_num * ent_sz + 511) / 512;
+    if (ent_secs > 32) ent_secs = 32;
+    for (ext4_u32 sec = 0; sec < ent_secs; sec++) {
+        ext4_u8 secbuf[512];
+        if (rd_fn(dev, ent_lba + sec, 1, secbuf) != 0) break;
+        ext4_u32 per = 512 / ent_sz;
+        if (per == 0) per = 1;
+        for (ext4_u32 k = 0; k < per; k++) {
+            ext4_u32 i = sec * per + k;
+            if (i >= ent_num) break;
+            const ext4_u8 *e = secbuf + k * ent_sz;
         static const ext4_u8 linux_guid[16] = {
             0xAF,0x3D,0xC6,0x0F, 0x83,0x84, 0x72,0x47,
             0x8E,0x79, 0x3D,0x69,0xD8,0x47,0x7D,0xE4 };
@@ -92,24 +197,76 @@ static void gpt_find_ext4(void) {
         if (!is_linux) continue;
         ext4_u64 start = r64(e + 0x20);
         if (start == 0) continue;
-        /* 探测 superblock 魔数（offset 1024 处 0xEF53） */
+        /* GPT 分区名 UTF-16LE，打包时为 DESHAB。不依赖超级块卷标。 */
+        int name_ok = 1;
+        static const char want[] = "DESHAB";
+        for (int j = 0; j < 6; j++) {
+            if (e[0x38 + j * 2] != (ext4_u8)want[j] || e[0x39 + j * 2] != 0) name_ok = 0;
+        }
         ext4_u8 sb_probe[1024];
-        rd_sec(start + 2, 2, sb_probe);
-        if (r16(sb_probe + 0x38) == EXT4_SUPER_MAGIC) {
-            g_part_lba = start;
-            for (int j = 0; j < 1024; j++) g_sb[j] = sb_probe[j];
-            return;
+        if (rd_fn(dev, start + 2, 1, sb_probe) != 0) continue;
+        if (rd_fn(dev, start + 3, 1, sb_probe + 512) != 0) continue;
+        if (r16(sb_probe + 0x38) != EXT4_SUPER_MAGIC) continue;
+        int label_ok = 1;
+        for (int j = 0; j < 6; j++) if (sb_probe[0x78 + j] != (ext4_u8)want[j]) label_ok = 0;
+        /* 分区名和卷标都在各自扇区的前 512 字节里。读全了就必然对上 DESHAB。
+         * 对不上仍接受打包特征：4K 块且 incompat 恰好是 FILETYPE|EXTENTS|FLEX_BG。
+         * 普通发行版 ext4 带 64bit/metadata_csum，不会是 0x242。 */
+        ext4_u32 log_bs = r32(sb_probe + 0x18);
+        ext4_u32 incompat = r32(sb_probe + 0x60);
+        int feat_ok = (log_bs == 2 && incompat == 0x242u);
+        if (name_ok || label_ok || boot_disk || feat_ok) {
+            *out_lba = start;
+            for (int j = 0; j < 1024; j++) out_sb[j] = sb_probe[j];
+            if (dev < 8) g_probe_map[dev] = 'D';
+            return 2;
+        }
+        if (best == 0) {
+            best = 1;
+            if (dev < 8) g_probe_map[dev] = 'o';
+            ext4_note_miss(dev, start, e + 0x38, sb_probe + 0x78, incompat, boot_disk);
+        }
         }
     }
-    fatalf("FS-E24 EXT4 PARTITION NOT FOUND IN GPT");
+    if (dev < 8 && boot_disk && g_probe_map[dev] != 'D') g_probe_map[dev] = 'B';
+    return best;
+}
+
+static void gpt_find_ext4(void) {
+    int saw_other = 0;
+    g_boot_dev = -1;
+    g_ext4_ok = 0;
+    for (int j = 0; j < 8; j++) g_probe_map[j] = '-';
+    for (ext4_u32 dev = 0; dev < 8; dev++) {
+        ext4_u64 lba = 0;
+        static ext4_u8 sb[1024];
+        int hit = probe_ext4_dev(dev, &lba, sb);
+        if (hit == 2) {
+            g_dev = dev;
+            g_part_lba = lba;
+            for (int j = 0; j < 1024; j++) g_sb[j] = sb[j];
+            logh_fn("[EXT4] DESHAB disk=", dev);
+            g_ext4_ok = 1;
+            return;
+        }
+        if (hit == 1) saw_other = 1;
+    }
+    /* 机器里那份 primary ext4 不能挂。U 盘如果已经露出 DESHABBOOT，
+     * 桌面仍从它的 FAT 启动，不因为 ext4 身份对不上而停在莲花屏。 */
+    if (g_boot_dev >= 0) {
+        g_dev = (ext4_u32)g_boot_dev;
+        g_ext4_ok = 0;
+        logh_fn("[EXT4] FAT boot disk, ext4 skipped, dev=", (ext4_u64)g_boot_dev);
+        return;
+    }
+    (void)saw_other;
+    ext4_fatal_not_found();
 }
 
 /* ---------------- 挂载 ---------------- */
-int ext4_mount(ext4_block_read_fn rd, ext4_block_write_fn wr,
-               void (*fatal)(const char *sym), void (*logl)(const char *s),
-               void (*logh)(const char *p, ext4_u64 v)) {
-    rd_fn = rd; wr_fn = wr; fatalf = fatal; logl_fn = logl; logh_fn = logh;
+static int ext4_mount_impl(void) {
     gpt_find_ext4();
+    if (!g_ext4_ok) return 0;
     logh_fn("[EXT4] partition LBA=", g_part_lba);
     if (r16(g_sb + 0x38) != EXT4_SUPER_MAGIC) fatalf("FS-E25 SUPERBLOCK MAGIC MISMATCH");
 
@@ -125,15 +282,44 @@ int ext4_mount(ext4_block_read_fn rd, ext4_block_write_fn wr,
     if (g_desc_size < 32) g_desc_size = 32;
     g_blocks_count       = r32(g_sb + 0x04);
 
+    ext4_u32 compat = r32(g_sb + 0x5C);
     ext4_u32 incompat = r32(g_sb + 0x60);
-    if (incompat & INCOMPAT_RECOVER)        fatalf("FS-E27 JOURNAL DIRTY (RECOVER SET)");
-    if (incompat & (INCOMPAT_64BIT | INCOMPAT_METADATA_CSUM | INCOMPAT_MMP |
-                    INCOMPAT_INLINE_DATA | INCOMPAT_META_BG))
-        fatalf("FS-E28 UNSUPPORTED EXT4 FEATURE");
-    if (incompat & ~INCOMPAT_SUPPORTED)     fatalf("FS-E28 UNSUPPORTED EXT4 FEATURE");
+    int is_deshab = 1;
+    {
+        static const char want[] = "DESHAB";
+        for (int j = 0; j < 6; j++) if (g_sb[0x78 + j] != (ext4_u8)want[j]) is_deshab = 0;
+    }
+    /* 打包卷没有 journal，实机扫到的其它 ext4 也经常带着 needs_recovery。
+     * 驱动不做 journal 回放：两个标志都清掉再挂载，避免 FS-E27 挡住启动。 */
+    (void)is_deshab;
+    if (incompat & INCOMPAT_RECOVER) {
+        incompat &= ~INCOMPAT_RECOVER;
+        w32(g_sb + 0x60, incompat);
+        logl_fn("[EXT4] cleared needs_recovery");
+    }
+    if (compat & COMPAT_HAS_JOURNAL) {
+        compat &= ~COMPAT_HAS_JOURNAL;
+        w32(g_sb + 0x5C, compat);
+        logl_fn("[EXT4] cleared has_journal");
+    }
+    if ((incompat & (INCOMPAT_64BIT | INCOMPAT_METADATA_CSUM | INCOMPAT_MMP |
+                     INCOMPAT_INLINE_DATA | INCOMPAT_META_BG)) ||
+        (incompat & ~INCOMPAT_SUPPORTED)) {
+        static char msg[28];
+        static const char hex[] = "0123456789ABCDEF";
+        const char *p = "FS-E28 FEAT ";
+        int n = 0;
+        while (p[n]) { msg[n] = p[n]; n++; }
+        for (int s = 28; s >= 0; s -= 4) msg[n++] = hex[(incompat >> s) & 0xF];
+        msg[n] = 0;
+        fatalf(msg);
+    }
 
     ext4_u16 state = r16(g_sb + 0x3A);
-    if (state != 1) fatalf("FS-E29 FILESYSTEM NOT CLEAN");
+    if (state != 1) {
+        w16(g_sb + 0x3A, 1);
+        logl_fn("[EXT4] forced clean state");
+    }
 
     if (g_inode_size != 256) fatalf("FS-E2A UNSUPPORTED INODE SIZE");
     if (g_first_data_block != 0) fatalf("FS-E2B UNEXPECTED FIRST DATA BLOCK");
@@ -161,6 +347,28 @@ int ext4_mount(ext4_block_read_fn rd, ext4_block_write_fn wr,
     logl_fn("[EXT4] mounted");
     return 0;
 }
+
+static int ext4_abort(void) {
+    g_ext4_depth = 0;
+    g_ext4_ok = 0;
+    logl_fn("[EXT4] fallback: operation aborted, ext4 disabled (FAT32 ESP only)");
+    return -1;
+}
+
+int ext4_mount(ext4_block_read_fn rd, ext4_block_write_fn wr,
+               void (*fatal)(const char *sym), void (*logl)(const char *s),
+               void (*logh)(const char *p, ext4_u64 v)) {
+    rd_fn = rd; wr_fn = wr; logl_fn = logl; logh_fn = logh;
+    user_fatal = fatal;
+    fatalf = ext4_fail;
+    if (__builtin_setjmp(g_ext4_jb)) return ext4_abort();
+    g_ext4_depth = 1;
+    int rc = ext4_mount_impl();
+    g_ext4_depth = 0;
+    return rc;
+}
+
+unsigned int ext4_device_index(void) { return g_dev; }
 
 /* ---------------- 组描述符访问 ---------------- */
 /* 32B 组描述符：0x00 block_bitmap, 0x04 inode_bitmap, 0x08 inode_table,
@@ -445,7 +653,7 @@ static void resolve_parent(const char *path, ext4_u32 *parent_ino,
 }
 
 /* ---------------- 读文件 ---------------- */
-int ext4_read_file(const char *path, ext4_u8 **out, ext4_u32 *size) {
+static int ext4_read_file_impl(const char *path, ext4_u8 **out, ext4_u32 *size) {
     ext4_u32 parent; const char *name; ext4_u32 name_len;
     resolve_parent(path, &parent, &name, &name_len);
     ext4_u8 dir_ino[256];
@@ -463,6 +671,15 @@ int ext4_read_file(const char *path, ext4_u8 **out, ext4_u32 *size) {
     *out = g_fdata;
     *size = (ext4_u32)fsize;
     return 0;
+}
+
+int ext4_read_file(const char *path, ext4_u8 **out, ext4_u32 *size) {
+    if (g_ext4_depth > 0) return ext4_read_file_impl(path, out, size);
+    if (__builtin_setjmp(g_ext4_jb)) return ext4_abort();
+    g_ext4_depth = 1;
+    int rc = ext4_read_file_impl(path, out, size);
+    g_ext4_depth = 0;
+    return rc;
 }
 
 /* ---------------- 目录项插入 ---------------- */
@@ -556,7 +773,7 @@ static void dir_insert_new_block(ext4_u8 *dir_ino, const char *name, ext4_u32 na
 }
 
 /* ---------------- 写文件（覆写/创建） ---------------- */
-int ext4_write_file(const char *path, const ext4_u8 *data, ext4_u32 size) {
+static int ext4_write_file_impl(const char *path, const ext4_u8 *data, ext4_u32 size) {
     ext4_u32 parent; const char *name; ext4_u32 name_len;
     resolve_parent(path, &parent, &name, &name_len);
     ext4_u8 dir_ino[256];
@@ -723,8 +940,30 @@ root_done:
     return 0;
 }
 
+int ext4_write_file(const char *path, const ext4_u8 *data, ext4_u32 size) {
+    if (g_ext4_depth > 0) return ext4_write_file_impl(path, data, size);
+    if (__builtin_setjmp(g_ext4_jb)) return ext4_abort();
+    g_ext4_depth = 1;
+    int rc = ext4_write_file_impl(path, data, size);
+    g_ext4_depth = 0;
+    return rc;
+}
+
 /* ---------------- 启动自检 ---------------- */
+static void ext4_boot_selftest_impl(void);
+
 void ext4_boot_selftest(void) {
+    if (!g_ext4_ok) {
+        logl_fn("[EXT4] selftest skipped, no DESHAB volume");
+        return;
+    }
+    if (__builtin_setjmp(g_ext4_jb)) { ext4_abort(); return; }
+    g_ext4_depth = 1;
+    ext4_boot_selftest_impl();
+    g_ext4_depth = 0;
+}
+
+static void ext4_boot_selftest_impl(void) {
     /* 读测试：p2 上的 FUCK 配置副本 */
     ext4_u8 *d; ext4_u32 n;
     ext4_read_file("/system/deshab64/FUCK", &d, &n);

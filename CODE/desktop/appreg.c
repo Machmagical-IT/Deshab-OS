@@ -1,8 +1,9 @@
 /* appreg.c — 应用注册表 + 桌面图标（M0 自 main.c 平移）
  *
- * 注册来源：内置 / LINUXAPP.CNF / PEAPPS.CNF / user/desktop/*.lnk
+ * 注册来源：内置 / LINUXAPP.CNF / PEAPPS.CNF / user/desktop/*.lnk / STARTMENU.CNF
  */
 #include "desktop.h"
+#include "../UTSM/include/utsm/fluent_ui.h"   /* M3: desktop_app_icon 图标映射 */
 
 /* ---- 全局状态 ---- */
 app_descriptor g_apps[MAX_APPS];
@@ -87,14 +88,38 @@ static void draw_icon_browser(du_context *ctx, int cx, int cy) {
 }
 
 void draw_app_icon(du_context *ctx, int app_id, int cx, int cy) {
-    switch (app_id) {
-    case 0: draw_icon_terminal(ctx, cx, cy); break;
-    case 1: draw_icon_editor(ctx, cx, cy);   break;
-    case 2: draw_icon_folder(ctx, cx, cy);   break;
-    case 3: draw_icon_calc(ctx, cx, cy);     break;
-    case 4: draw_icon_browser(ctx, cx, cy);  break;
-    default: draw_icon_terminal(ctx, cx, cy); break;
+    const char *n = (app_id >= 0 && app_id < g_app_count) ? g_apps[app_id].name : 0;
+    if (!n) { draw_icon_terminal(ctx, cx, cy); return; }
+    if (n[0]=='e' && n[1]=='d') { draw_icon_editor(ctx, cx, cy); return; }
+    if (n[0]=='p' && n[1]=='r') { draw_icon_editor(ctx, cx, cy); return; }
+    if ((n[0]=='f' && n[1]=='i') || (n[0]=='f' && n[1]=='o')) {
+        draw_icon_folder(ctx, cx, cy); return;
     }
+    if (n[0]=='c' && n[1]=='a') { draw_icon_calc(ctx, cx, cy); return; }
+    if (n[0]=='b' && n[1]=='r') { draw_icon_browser(ctx, cx, cy); return; }
+    draw_icon_terminal(ctx, cx, cy);
+}
+
+/* M3: app_id → Fluent 线性图标（开始菜单瓦片 / 任务栏共用映射）。
+ * 返回值即 wf_icon_id（int 传递避免 desktop.h 依赖 fluent_ui.h）。 */
+int desktop_app_icon(int app_id) {
+    const char *n = (app_id >= 0 && app_id < g_app_count) ? g_apps[app_id].name : 0;
+    if (!n) return WF_ICON_TERMINAL;
+    if (n[0]=='s' && n[1]=='h') return WF_ICON_TERMINAL;      /* shell */
+    if (n[0]=='c' && n[1]=='m' && n[2]=='d') return WF_ICON_TERMINAL;
+    if (n[0]=='e' && n[1]=='d') return WF_ICON_EDITOR;        /* editor */
+    if (n[0]=='p' && n[1]=='r') return WF_ICON_EDITOR;        /* proedit */
+    if (n[0]=='f' && n[1]=='i') return WF_ICON_FOLDER;        /* fileman */
+    if (n[0]=='c' && n[1]=='a' && n[2]=='l') return WF_ICON_CALC;
+    if (n[0]=='b' && n[1]=='r') return WF_ICON_BROWSER;       /* browser */
+    if (n[0]=='s' && n[1]=='e') return WF_ICON_SETTINGS;      /* settings */
+    if (n[0]=='v' || n[0]=='k') return WF_ICON_BROWSER;       /* vscode/kde */
+    if (n[0]=='s' && n[1]=='y' && n[2]=='s') return WF_ICON_INFO;   /* sysinfo */
+    if (n[0]=='c' && n[1]=='l') return WF_ICON_CLOCK;         /* clock */
+    if (n[0]=='p' && n[1]=='a') return WF_ICON_PICTURE;       /* paint */
+    if (n[0]=='n' && n[1]=='o') return WF_ICON_EDITOR;        /* notes */
+    if (n[0]=='d' && n[1]=='i') return WF_ICON_DISK;          /* diskinfo */
+    return WF_ICON_APPS;
 }
 
 /* ============================================================
@@ -122,11 +147,14 @@ static int lapp_field_copy(char *dst, int dst_cap, const char *src, int n) {
 
 #define UDESK_MAX 12
 static char g_ud_name[UDESK_MAX][12];
-static char g_ud_disp[UDESK_MAX][16];
+static char g_ud_disp[UDESK_MAX][48];
 static char g_ud_path[UDESK_MAX][96];
 static char g_ud_elf[UDESK_MAX][12];
 static char g_ud_files[UDESK_MAX][64];
 static int  g_ud_nfiles;
+/* 桌面图标按 user/desktop 目录枚举顺序排，不按内置表下标。 */
+static int  g_desk_order[UDESK_MAX];
+static int  g_desk_n;
 
 static int udesk_name_taken(const char *n) {
     int i;
@@ -156,6 +184,66 @@ static int udesk_ascii_ok(const char *s) {
     return 1;
 }
 
+static int kind_word(const char *kind, const char *word) {
+    int i = 0;
+    while (word[i]) {
+        char c = kind[i];
+        char w = word[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (w >= 'a' && w <= 'z') w = (char)(w - 32);
+        if (c != w) return 0;
+        i++;
+    }
+    return kind[i] == 0 || kind[i] == ' ';
+}
+
+static int find_app_by_name(const char *name) {
+    int a, i;
+    if (!name || !name[0]) return -1;
+    for (a = 0; a < g_app_count; a++) {
+        const char *nm = g_apps[a].name;
+        if (!nm) continue;
+        i = 0;
+        while (name[i] && nm[i] && name[i] == nm[i]) i++;
+        if (name[i] == 0 && nm[i] == 0) return a;
+    }
+    return -1;
+}
+
+static void desk_place(int app_id) {
+    int i;
+    if (app_id < 0 || app_id >= g_app_count) return;
+    for (i = 0; i < g_desk_n; i++) {
+        if (g_desk_order[i] == app_id) return;
+    }
+    if (g_desk_n >= UDESK_MAX) return;
+    g_apps[app_id].user_desktop = 1;
+    g_desk_order[g_desk_n++] = app_id;
+}
+
+/* 快捷方式种类的第一个词对应内置应用。路径以 '/' 开头不能改写种类。 */
+static const char *kind_builtin_name(const char *kind) {
+    if (kind_word(kind, "FILEMAN")) return "fileman";
+    if (kind_word(kind, "EDITOR")) return "editor";
+    if (kind_word(kind, "BROWSER")) return "browser";
+    if (kind_word(kind, "SHELL")) return "shell";
+    if (kind_word(kind, "CALC")) return "calc";
+    if (kind_word(kind, "CMD")) return "cmd";
+    if (kind_word(kind, "PROEDIT")) return "proedit";
+    if (kind_word(kind, "SETTINGS")) return "settings";
+    return 0;
+}
+
+static int bind_desktop_builtin(int slot, const char *name) {
+    int a = find_app_by_name(name);
+    if (a < 0) return 0;
+    g_apps[a].display_name = g_ud_disp[slot];
+    desk_place(a);
+    slog("desktop shortcut -> builtin");
+    slog(g_ud_disp[slot]);
+    return 1;
+}
+
 static void udesk_parse_lnk(int slot, const u8 *data, u32 size) {
     const char *lines[4];
     int nlen[4];
@@ -181,19 +269,24 @@ static void udesk_parse_lnk(int slot, const u8 *data, u32 size) {
         g_ud_name[slot][0] = 'a' + (char)slot;
         g_ud_name[slot][1] = 0;
     }
-    if (nlen[0] > 0 && udesk_ascii_ok(lines[0]))
-        lapp_field_copy(g_ud_disp[slot], 16, lines[0], nlen[0]);
+    /* 第一行是桌面标签，允许 UTF-8（文件管理 / 终端 等） */
+    if (nlen[0] > 0)
+        lapp_field_copy(g_ud_disp[slot], 48, lines[0], nlen[0]);
     else
-        kstrcpy(g_ud_disp[slot], g_ud_name[slot], 16);
+        kstrcpy(g_ud_disp[slot], g_ud_name[slot], 48);
     lapp_field_copy(kind, 16, lines[1], nlen[1]);
     g_ud_path[slot][0] = 0;
     g_ud_elf[slot][0] = 0;
-    if (fat32_lfn_streq_ci(kind, "LINUX") || (n >= 3 && lines[2][0] == '/')) {
+    /* 种类优先。第三行路径经常以 '/' 开头，不能因此把 ELF / NATIVE 当成 Linux。 */
+    if (kind_word(kind, "LINUX")) {
         if (n >= 3)
             lapp_field_copy(g_ud_path[slot], 96, lines[2], nlen[2]);
-    } else if (fat32_lfn_streq_ci(kind, "NATIVE")) {
-        return;
+    } else if (kind_word(kind, "NATIVE")) {
+        if (bind_desktop_builtin(slot, g_ud_name[slot])) return;
     } else {
+        const char *bn = kind_builtin_name(kind);
+        if (bn && bind_desktop_builtin(slot, bn)) return;
+        if (bind_desktop_builtin(slot, g_ud_name[slot])) return;
         if (nlen[1] >= 11)
             lapp_field_copy(g_ud_elf[slot], 12, lines[1], 11);
         else
@@ -201,16 +294,20 @@ static void udesk_parse_lnk(int slot, const u8 *data, u32 size) {
         g_ud_elf[slot][11] = 0;
     }
     if (udesk_name_taken(g_ud_name[slot])) return;
-    if (!g_ud_path[slot][0] && !g_ud_elf[slot][0]) return;
+    if (!kind_word(kind, "NATIVE") && !g_ud_path[slot][0] && !g_ud_elf[slot][0]) return;
     if (g_app_count >= MAX_APPS) return;
-    g_apps[g_app_count] = (app_descriptor){
-        g_ud_name[slot], g_ud_disp[slot], 720, 480,
-        0, 0, 0, 0,
-        g_ud_elf[slot][0] ? g_ud_elf[slot] : 0,
-        g_ud_path[slot][0] ? g_ud_path[slot] : 0, 0, 0, 0,
-        1                                    /* user_desktop：桌面只显示 .lnk */
-    };
-    g_app_count++;
+    {
+        int id = g_app_count;
+        g_apps[id] = (app_descriptor){
+            g_ud_name[slot], g_ud_disp[slot], 720, 480,
+            0, 0, 0, 0,
+            g_ud_elf[slot][0] ? g_ud_elf[slot] : 0,
+            g_ud_path[slot][0] ? g_ud_path[slot] : 0, 0, 0, 0,
+            0
+        };
+        g_app_count++;
+        desk_place(id);
+    }
     slog("user/desktop icon:");
     slog(g_ud_disp[slot]);
     (void)i;
@@ -220,6 +317,7 @@ static void register_user_desktop_icons(void) {
     u32 dclus = 0;
     int i;
     g_ud_nfiles = 0;
+    g_desk_n = 0;
     if (f32_find_path_dir_lfn_w("user/desktop", &dclus) != 0) {
         slog("user/desktop missing, skip shared icons");
         return;
@@ -369,6 +467,203 @@ static void register_pe_apps(void) {
     }
 }
 
+/* ============================================================
+ *  M3: STARTMENU.CNF 开始菜单注册表
+ *  FAT32 根目录 STARTMENU.CNF（8.3: STARTMENUCNF），每行一个菜单项：
+ *    NAME|显示名|path|args（args 可省略）
+ *  path 四种：
+ *    builtin:<name>   → 已注册内置应用（editor/calc/fileman/settings/...）
+ *    program/xxx.exe  → GUI PE 应用（run_windowed 桌面嵌入，g++ 编译）
+ *    bin/xxx.exe      → PE 应用（同上；CLI exe 请从 cmd 运行，不入菜单）
+ *    bin/xxx.elf      → ELF 工具（按路径全屏加载）
+ *    /guest/path      → Linux guest 应用（exec_async）
+ *  显示名允许 UTF-8 中文（瓦片标签）；NAME 为 ASCII（窗口标题）。
+ *  缺失/为空时回退：全部已注册应用进开始菜单。
+ * ============================================================ */
+
+int  g_sm_ids[SM_MAX_APPS];
+char g_sm_labels[SM_MAX_APPS][48];
+int  g_sm_count = 0;
+
+static char g_smn_name[SM_MAX_APPS][12];
+static char g_smn_path[SM_MAX_APPS][96];
+static char g_smn_args[SM_MAX_APPS][96];
+
+static void sm_add(int app_id, const char *label) {
+    if (g_sm_count >= SM_MAX_APPS) return;
+    if (app_id < 0 || app_id >= g_app_count) return;
+    g_sm_ids[g_sm_count] = app_id;
+    if (label && label[0])
+        lapp_field_copy(g_sm_labels[g_sm_count], 48, label, kstrlen(label));
+    else
+        kstrcpy(g_sm_labels[g_sm_count], g_apps[app_id].display_name, 48);
+    g_sm_count++;
+}
+
+static int str_eq(const char *a, const char *b) {
+    int i = 0;
+    while (a[i] && b[i] && a[i] == b[i]) i++;
+    return a[i] == 0 && b[i] == 0;
+}
+
+static int str_ends_with_ci(const char *s, const char *suffix) {
+    int sl = kstrlen(s), fl = kstrlen(suffix);
+    if (sl < fl) return 0;
+    for (int i = 0; i < fl; i++) {
+        char c = s[sl - fl + i], d = suffix[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (d >= 'a' && d <= 'z') d = (char)(d - 32);
+        if (c != d) return 0;
+    }
+    return 1;
+}
+
+/* 已有同 pe_file / elf_path / linux_path / name 的注册项 → 复用 id */
+static int sm_find_existing(const char *name, const char *path) {
+    for (int i = 0; i < g_app_count; i++) {
+        const app_descriptor *a = &g_apps[i];
+        if (a->pe_file && str_eq(a->pe_file, path)) return i;
+        if (a->elf_path && str_eq(a->elf_path, path)) return i;
+        if (a->linux_path && str_eq(a->linux_path, path)) return i;
+    }
+    return find_app_by_name(name);
+}
+
+static void sm_register_entry(int slot) {
+    const char *name = g_smn_name[slot];
+    const char *path = g_smn_path[slot];
+    const char *args = g_smn_args[slot];
+    const char *label = g_sm_labels[slot];
+    if (!name[0] || !path[0]) return;
+
+    /* builtin:<name> → 绑定已注册应用 */
+    if (path[0]=='b' && path[1]=='u' && path[2]=='i' && path[3]=='l' &&
+        path[4]=='t' && path[5]=='i' && path[6]=='n' && path[7]==':') {
+        int a = find_app_by_name(path + 8);
+        if (a >= 0) {
+            sm_add(a, label);
+        } else {
+            slog("[startmenu] builtin not found:");
+            slog(path + 8);
+        }
+        return;
+    }
+
+    /* /guest → Linux guest 应用 */
+    if (path[0] == '/') {
+        int a = sm_find_existing(name, path);
+        if (a >= 0) { sm_add(a, label); return; }
+        if (g_app_count >= MAX_APPS) return;
+        int id = g_app_count;
+        g_apps[id] = (app_descriptor){
+            name, name, 1024, 768,
+            0, 0, 0, 0, 0,
+            path, args[0] ? args : 0
+        };
+        g_app_count++;
+        sm_add(id, label);
+        return;
+    }
+
+    /* *.exe → PE 应用（GUI，run_windowed） */
+    if (str_ends_with_ci(path, ".exe")) {
+        int a = sm_find_existing(name, path);
+        if (a >= 0) { sm_add(a, label); return; }
+        if (g_app_count >= MAX_APPS) return;
+        int id = g_app_count;
+        g_apps[id] = (app_descriptor){
+            name, name, 760, 560,
+            0, 0, pe_win_on_draw, 0, 0, 0, 0,
+            path, args[0] ? args : 0
+        };
+        g_app_count++;
+        sm_add(id, label);
+        return;
+    }
+
+    /* *.elf → 按路径加载的外部 ELF 工具（bin/xxx.elf） */
+    if (str_ends_with_ci(path, ".elf")) {
+        int a = sm_find_existing(name, path);
+        if (a >= 0) { sm_add(a, label); return; }
+        if (g_app_count >= MAX_APPS) return;
+        int id = g_app_count;
+        g_apps[id] = (app_descriptor){
+            name, name, 800, 560,
+            0, 0, 0, 0, 0, 0, 0, 0, 0
+        };
+        g_apps[id].elf_path = path;
+        g_app_count++;
+        sm_add(id, label);
+        return;
+    }
+
+    /* 兜底：按 NAME 找已注册应用 */
+    {
+        int a = find_app_by_name(name);
+        if (a >= 0) sm_add(a, label);
+    }
+}
+
+static void register_startmenu_apps(void) {
+    u8 *data = 0;
+    u32 size = 0;
+    char n11[11];
+
+    g_sm_count = 0;
+    if (f32_name_to_83_w("STARTMENU.CNF", n11) == 0 &&
+        f32_read_root_file_w(n11, &data, &size) == 0 && data && size) {
+        int slot = 0;
+        u32 pos = 0;
+        while (pos < size && slot < SM_MAX_APPS) {
+            u32 eol = pos;
+            while (eol < size && data[eol] != '\n' && data[eol] != '\r') eol++;
+            u32 line_len = eol - pos;
+            u32 next = eol;
+            while (next < size && (data[next] == '\n' || data[next] == '\r')) next++;
+
+            if (line_len == 0 || data[pos] == '#') { pos = next; continue; }
+
+            /* 按 '|' 切 4 段：NAME|DISPLAY|PATH|ARGS */
+            const char *line = (const char *)data + pos;
+            int f0 = -1, f1 = -1, f2 = -1;
+            for (u32 i = 0; i < line_len; i++) {
+                if (line[i] == '|') {
+                    if (f0 < 0) f0 = (int)i;
+                    else if (f1 < 0) f1 = (int)i;
+                    else if (f2 < 0) { f2 = (int)i; break; }
+                }
+            }
+            if (f0 > 0 && f1 > f0) {
+                int path_beg = f1 + 1;
+                int path_end = (f2 > path_beg) ? f2 : (int)line_len;
+                int args_beg = (f2 > path_beg) ? f2 + 1 : (int)line_len;
+
+                lapp_field_copy(g_smn_name[slot], 12, line, f0);
+                lapp_field_copy(g_sm_labels[slot], 48, line + f0 + 1, f1 - f0 - 1);
+                lapp_field_copy(g_smn_path[slot], 96, line + path_beg, path_end - path_beg);
+                if (args_beg < (int)line_len)
+                    lapp_field_copy(g_smn_args[slot], 96, line + args_beg, (int)line_len - args_beg);
+                else
+                    g_smn_args[slot][0] = 0;
+                slot++;
+            }
+            pos = next;
+        }
+        for (int i = 0; i < slot; i++) sm_register_entry(i);
+        slog_num("[startmenu] config entries=", g_sm_count);
+        return;
+    }
+
+    /* 无配置文件：全部已注册应用入菜单 */
+    for (int i = 0; i < g_app_count && g_sm_count < SM_MAX_APPS; i++)
+        sm_add(i, g_apps[i].display_name);
+    slog("[startmenu] no config, fallback to all apps");
+}
+
+/* ============================================================
+ *  应用注册
+ *  ============================================================ */
+
 void register_apps(void) {
     /* 命令行1：shell.elf（原生命令行 + 可运行 Linux 程序）*/
     g_apps[0] = (app_descriptor){
@@ -388,8 +683,8 @@ void register_apps(void) {
     };
     g_app_count++;
     g_apps[3] = (app_descriptor){
-        "fileman", "Files", 500, 400,
-        0, 0, 0, 0, "FILEMAN ELF"
+        "fileman", "Files", 880, 560,
+        fileman_on_create, fileman_on_event, fileman_on_draw, fileman_on_destroy, 0
     };
     g_app_count++;
     g_apps[4] = (app_descriptor){
@@ -419,16 +714,40 @@ void register_apps(void) {
     /* P5d: Windows PE 应用，来自 PEAPPS.CNF */
     register_pe_apps();
     register_user_desktop_icons();
+    /* M3: 开始菜单注册（STARTMENU.CNF；须在全部来源注册后跑以支持 builtin:/path 复用） */
+    register_startmenu_apps();
 }
 
 /* M2: 桌面图标 = user/desktop/*.lnk 用户快捷方式（user_desktop 标记）。
  * 内置应用（editor/calc/settings…）不落桌面——经任务栏/开始菜单启动。
  * 布局沿用 canvas padding 24px，列宽 104px，gap 18px，左→右换行。 */
+static void place_desktop_icon(int app_id, int *x, int *y, int pad, int max_x) {
+    if (g_icon_count >= MAX_ICONS) return;
+    if (app_id < 0 || app_id >= g_app_count) return;
+    if (*x > pad && *x + KATE_ICON_W > max_x) {
+        *x = pad;
+        *y += KATE_ICON_H + KATE_ICON_GAP;
+    }
+    g_icons[g_icon_count].app_id = app_id;
+    g_icons[g_icon_count].x = *x;
+    g_icons[g_icon_count].y = *y;
+    g_icons[g_icon_count].label = g_apps[app_id].display_name;
+    g_icons[g_icon_count].selected = 0;
+    g_icon_count++;
+    *x += KATE_ICON_W + KATE_ICON_GAP;
+}
+
 void setup_desktop_icons(void) {
     int pad = KATE_ICON_PAD;                        /* 24 */
     int x = pad;
     int y = g_fluent ? (pad + 8) : (KATE_TOPBAR_H + KATE_PAGE_PAD + pad);
     int max_x = (int)g_fb_w - pad;                  /* canvas 右缘 */
+    int k;
+    if (g_desk_n > 0) {
+        for (k = 0; k < g_desk_n; k++)
+            place_desktop_icon(g_desk_order[k], &x, &y, pad, max_x);
+        return;
+    }
     for (int i = 0; i < g_app_count; i++) {
         if (g_icon_count >= MAX_ICONS) break;
         if (!g_apps[i].user_desktop) continue;      /* M2: 只显示 .lnk 快捷方式 */

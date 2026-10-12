@@ -57,6 +57,52 @@ typedef struct {
 #define DKM_KAPI_MAGIC   0x4b415049u  /* "KAPI" */
 #define DKM_KAPI_VERSION 1u
 
+/* ===================================================================
+ *  D6 万物互联：dkm_bus 双向服务总线
+ *
+ *  kapi 是内核→模块的单向只读导出表；bus 把它双向化：
+ *  任何模块在 driver_init 里注册 srv.* 服务，任何模块按名消费。
+ *  命名空间：kern.* 仅内核可注册，srv.* 仅模块可注册（BUS-E01）。
+ *  失败策略：lookup miss = BUS-E04 panic（硬依赖未满足=编程错误）；
+ *  probe   miss = 返回 -1（能力缺席=设计内双路径，白名单登记）。
+ *  生命周期：driver_init = 注册服务；"运行"也是服务（srv.<mod>.run）。
+ *  设计定稿：docs/RE/万物互联与服务总线设计.md §1。
+ * =================================================================== */
+#define DKM_BUS_MAGIC    0x53425553u  /* "SBUS" */
+#define DKM_BUS_VERSION  1u
+#define DKM_BUS_MAX_SERVICES 128
+#define DKM_BUS_MAX_NAME 48
+
+#define DKM_BUS_F_KERNEL    1u  /* 内核注册，不可注销 */
+#define DKM_BUS_F_NO_UNLOAD 2u  /* provider 声明 NO_UNLOAD，注销即 BUS-E05 */
+
+typedef struct dkm_bus_service {
+    char name[DKM_BUS_MAX_NAME];   /* NUL 终止；必须带命名空间前缀 */
+    u32 version;                   /* 服务契约版本，消费方校验 */
+    u32 flags;                     /* DKM_BUS_F_* */
+    void *fn;                      /* 服务入口，签名由各服务契约定义 */
+    const struct dkm_driver_desc *provider;  /* NULL = 内核；存 desc 而非
+                                              * handle——loader 的 handle 是栈
+                                              * 局部变量会悬垂，desc 在驱动
+                                              * 镜像内存里持久且每驱动唯一 */
+} dkm_bus_service;
+
+typedef struct dkm_bus_api {
+    u32 magic;
+    u32 version;
+    /* 注册：name 必须带命名空间前缀且与调用方身份匹配（BUS-E01）、
+     * 重名 BUS-E02、表满 BUS-E03——全部 panic，成功返回 0。 */
+    int (*register_service)(const char *name, u32 version, void *fn);
+    /* 注销：仅 provider 本人可注销；F_KERNEL/F_NO_UNLOAD 或不存在 → BUS-E05。 */
+    int (*unregister_service)(const char *name);
+    /* 必存在查找：未命中 → BUS-E04 panic，绝不返回 NULL 伪装成功。 */
+    int (*lookup)(const char *name, void **out_fn, u32 *out_version);
+    /* 可选探测：未命中返回 -1；调用方必须显式处理缺席（白名单登记）。 */
+    int (*probe)(const char *name, void **out_fn, u32 *out_version);
+    u32 (*count)(void);                           /* 诊断 / /dev/services */
+    const dkm_bus_service *(*at)(u32 index);      /* 按 index 枚举 */
+} dkm_bus_api;
+
 typedef struct dkm_driver_desc {
     u32 magic;
     u16 abi_version;
@@ -160,6 +206,9 @@ typedef struct dkm_kernel_api {
     /* D3: 按名导出表（尾部追加，ABI 兼容）。驱动/用户态枚举内核服务并
      * 按名取函数指针；固定偏移 struct 字段不受影响。 */
     const dkm_kapi_table *kapi;
+    /* D6 万物互联：双向服务总线（尾部追加，ABI 兼容）。kern.* 与 srv.* 按名
+     * 注册-消费；driver_init = 注册服务的地方。 */
+    const dkm_bus_api *bus;
 } dkm_kernel_api;
 
 typedef enum dkm_driver_state {
@@ -191,12 +240,32 @@ void dkm_log_set_driver(const char *name);
 int dkm_load_builtin(const dkm_builtin_driver *driver);
 void dkm_scan_boot_modules(void);
 void dsm_load_by_manifest(void);
+/* P0（万物互联）：按名加载。dsm_load_named 严格版（depends 校验强制，供
+ * kern.dkm.load_by_name 等常规路径）；dsm_load_named_boot 顺序豁免版
+ * （唯一合法调用方 = kernel/main.c VMM 路径 pci+ahci 预加载，先于 apic，
+ * 否则 guest 陷入 IDTR=0 VM-exit 风暴——设计内豁免，见
+ * docs/RE/万物互联与服务总线设计.md §6）。
+ * 签名（ini_config 定义在 kernel/ini_parser.h，此处避免头依赖）：
+ *   void dsm_load_named(const ini_config *cfg, const char *name);
+ *   void dsm_load_named_boot(const ini_config *cfg, const char *name);
+ * 调用方自行前向声明（同 kernel/main.c 既有模式）。 */
 void dkm_fill_platform_info(void);
 const dkm_kernel_api *dkm_get_kernel_api(void);
 
 /* 服务表实现（drr_stub.c / sched/sched.c 提供，fill 时挂入 kernel_api） */
 const struct drr_recovery_api *drr_get_recovery_api(void);
 const struct utsm_sched_api *utsm_sched_get_api(void);
+
+/* D6 万物互联：服务总线（dkm/bus.c 提供）。dkm_bus_init 播种 kern.*
+ * 并挂入 kernel_api（dkm_fill_platform_info 内调用，先于一切驱动加载）；
+ * loader 在 driver_init 前后 set/clear provider 上下文（仿 D4 颜色上下文），
+ * kern.* 只能在 provider==NULL 时注册。 */
+void dkm_bus_init(void);
+const dkm_bus_api *dkm_bus_get_api(void);
+void dkm_bus_set_current_provider(struct dkm_driver_handle *h);
+/* loader 专用：token T 是否已有 "prefix" 或 "prefix.*" 服务注册
+ * （stage>=4 provides 校验用，DKM-E45）。命中返回 1。 */
+int dkm_bus_prefix_registered(const char *prefix);
 
 /* exposed for manifest parser */
 struct dkm_symbol_scan {

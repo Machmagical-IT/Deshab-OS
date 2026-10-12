@@ -1,10 +1,11 @@
 # Deshab-OS cross-platform build (F3: 疯不应绑 Windows)
 #
 # Linux/macOS (native or WSL):
-#   make dev          # build kernels+apps+drivers, inject dev config, pack ISO/deshab-dev.img
-#   make release      # same, release config -> ISO/deshab-release.img
-#   make realtest     # real-machine test config
+#   make dev          # build kernels+apps+drivers, inject dev config, pack ISO/deshab-dev.img (panic=strict)
+#   make release      # same, release config -> ISO/deshab-release.img (panic=fallback)
+#   make realtest     # real-machine test config, release options + panic=strict
 #   make both         # dev + release
+#   make all          # dev + release + realtest (SYSTEM restored to dev config)
 #   make kernels apps drivers   # compile only
 #
 # Requirements: clang + ld.lld (LLVM), GNU make, python3 + Pillow (logo),
@@ -53,9 +54,17 @@ DRV_OUTS := $(foreach s,$(DRV_SRCS),$(ROOT)/$(word 2,$(subst :, ,$(s))))
         inject-dev inject-release inject-realtest \
         iso-dev iso-release iso-realtest clean
 
-all: both
+# iso-* 共享 SYSTEM/ 注入点，-j 下必须串行打包
+all: kernels apps drivers
+	@$(MAKE) --no-print-directory iso-dev
+	@$(MAKE) --no-print-directory iso-release
+	@$(MAKE) --no-print-directory iso-realtest
+	@$(MAKE) --no-print-directory inject-dev
 
-both: dev release
+both: kernels apps drivers
+	@$(MAKE) --no-print-directory iso-dev
+	@$(MAKE) --no-print-directory iso-release
+	@$(MAKE) --no-print-directory inject-dev
 
 kernels:
 	@for d in $(KERNELS); do echo "[build] $$d"; $(MAKE) -C $$d -f MAKEFILE CC="$(CC)" LD="$(LD)" || exit 1; done

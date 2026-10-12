@@ -102,6 +102,17 @@ static inline int f32_disk_load(void) {
     return 0;
 }
 
+/* FAT 项。卷首 256 扇区缓存盖住时直接读；否则按扇区补读。
+ * 读失败当成链结束，避免把缓存尾部垃圾当成下一簇。 */
+static inline u32 f32_fat_entry(u32 fo) {
+    if (fo + 4u <= 256u * 512u)
+        return f32_r32(f32_disk + fo) & 0x0FFFFFFFu;
+    u8 fat_sec[512];
+    if (f32_read_sectors(fo / 512u, 1, fat_sec) != 0)
+        return 0x0FFFFFF8u;
+    return f32_r32(fat_sec + (fo % 512u)) & 0x0FFFFFFFu;
+}
+
 /* ---- 8.3 名字转换 ---- */
 
 /* "file.txt" / "NAME" → 11 字符 8.3 名（大写，空格填充）
@@ -688,9 +699,7 @@ static inline int f32_list_root(f32_list_cb emit, void *user_data) {
             f32_name_from_83(dir[e].name, disp);
             if (emit(disp, dir[e].fsize, dir[e].attr, user_data) != 0) goto done;
         }
-        u32 fo = fat_byte_off + clus * 4;
-        if (fo + 4 > sizeof(f32_disk)) break;
-        clus = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+        clus = f32_fat_entry(fat_byte_off + clus * 4);
     }
 done:
     return 0;
@@ -755,9 +764,7 @@ static inline int f32_list_dir(u32 dir_clus, f32_list_entry_cb emit, void *user_
             /* 短名项处理完毕，重置 LFN 缓冲等待下一条链 */
             fat32_lfn_init(&lfn);
         }
-        u32 fo = fat_byte_off + clus * 4;
-        if (fo + 4 > sizeof(f32_disk)) break;
-        clus = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+        clus = f32_fat_entry(fat_byte_off + clus * 4);
     }
 done:
     return 0;
@@ -879,9 +886,7 @@ static inline int f32_find_in_dir_lfn(u32 dir_clus, const char *long_name,
             }
             fat32_lfn_init(&lfn);
         }
-        u32 fo = fat_byte_off + clus * 4;
-        if (fo + 4 > sizeof(f32_disk)) break;
-        clus = f32_r32(f32_disk + fo) & 0x0FFFFFFF;
+        clus = f32_fat_entry(fat_byte_off + clus * 4);
     }
 not_found:
     return -1;

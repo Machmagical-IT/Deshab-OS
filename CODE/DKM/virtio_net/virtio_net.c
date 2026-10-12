@@ -784,7 +784,7 @@ static int virtio_net_tx_stub(void *ctx, const void *packet, u32 length) {
     (void)ctx; (void)packet;
     log_hex("[virtio_net] tx stub hit, len=", length);
     g_log->panic("VNET-E01 TX VIRTQUEUE NOT IMPLEMENTED (stub tx called)");
-    return 0;
+    return -1;
 }
 
 static int virtio_net_rx_poll_stub(void *ctx, void *buffer, u32 capacity, u32 *out_length) {

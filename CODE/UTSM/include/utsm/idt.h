@@ -58,4 +58,12 @@ void idt_irq_eoi(u8 vector);
 typedef int (*idt_exception_hook_t)(u64 vector, u64 error_code, u64 rip);
 void idt_set_exception_hook(idt_exception_hook_t hook);
 
+/* P1（万物互联）: PIC IMR 位操作 —— kern.irq.unmask/mask 总线服务后端。
+ * 仅 ISA IRQ 0-15（越界 → IRQ-E01 panic 零降级）；
+ * unmask IRQ8-15 自动放开主片 IRQ2 级联。
+ * apic_route=1 时 PIC 已全屏蔽（IOAPIC 接管），本操作无效果——该路径的
+ * 解屏蔽随 P6 真 IRQ 输入走 IOAPIC 接线。 */
+void pic_irq_unmask(u8 irq);
+void pic_irq_mask(u8 irq);
+
 #endif

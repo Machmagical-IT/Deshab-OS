@@ -60,11 +60,13 @@ Deshab 最标志性的疯点——给空气上锁。
 |------|------|---------|------|-------------------|
 | D1 | DKM 热卸载（基础） | 从"焊死"到"可拔" | ⬜ | 仅有 `DKM_F_NO_UNLOAD` 标志与状态机文档；需引用计数+资源回收，load/unload 循环 100 次不崩 |
 | D2 | 裸机器码加载器 | 真·无限自由 | ⬜ | 任意 elf/裸码塞地址即执行；能打印、能崩内核 |
-| D3 | 内核 API 导出表 | 自由也要有地图 | ⬜ | 当前为固定偏移 struct ABI（`CODE/sdk/include/deshab/kernel_api.h`）；需按名导出表 kapi() |
+| D3 | 内核 API 导出表 → **服务总线** | 自由也要有地图 | 🔶 | kapi 按名导出表 ✅（14 条，只读）；升级为**双向服务总线 dkm_bus**（kern.\*/srv.\* 注册-消费，BUS-E 系列）进行中——见 [万物互联与服务总线设计](./RE/万物互联与服务总线设计.md) |
 | D4 | DKM 彩色日志前缀 | 每个驱动有自己的脾气 | ✅ | 驱动名 FNV hash → 8 色 ANSI（确定性可复现）；init 期着色，仅串口；FUCK `color_log` 开关 |
 | D5 | 最小 REPL/shell | 自由的交互面 | ✅ | shell.elf：ls/cat/cp/mv/rm/run/probe/test/pci 等 25+ 命令 |
+| D6 | **万物互联：应用模块 DKM 化** | 没有用户态，程序即内核 | 🔶 | 向导/登录/桌面/shell/netman/cmd 全部从 DSK 加载的 PIE ELF 变为 stage4 .drv；dsk_boot_context reserved[] 硬耦合逐槽消灭，改为 srv.* 总线服务；设计定稿 [RE/万物互联与服务总线设计.md](./RE/万物互联与服务总线设计.md)，P0-P4 落地中 |
+| D7 | **万物互联：DSK 退役 + 常驻调度** | 没有主内核，万般皆平等 | ⬜ | deshab.elf/dsk_loader.c/dsk_boot_context 删除，会话排序变普通 session.drv；PCQ 调度器常驻（bootstrap park 成 idle）、desktop 任务化、IRQ1/12 真 IRQ 输入；P5-P6 |
 
-三期做完：用户能真在系统里"为所欲为"，疯得可上手。
+三期做完：用户能真在系统里"为所欲为"，疯得可上手。**D6/D7 做完：连"用户"这个概念都消失——万物皆内核，互联皆总线。**
 
 ---
 

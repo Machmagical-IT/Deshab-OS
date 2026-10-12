@@ -64,6 +64,8 @@ static const struct wlan_device_id g_wlan_ids[] = {
     {0x168C, 0x0034, "AR9462",   "ath9k"},
     {0x168C, 0x0036, "AR9565",   "ath9k"},
     {0x168C, 0x003C, "AR9462-2", "ath9k"},
+    /* MediaTek (14C3) — 由 mt7920.drv 独占，wlan 不注册 */
+    {0x14C3, 0x7920, "MT7920",   "mt7920"},
     /* Broadcom (14E4) — brcmfmac 家族 */
     {0x14E4, 0x43A0, "BCM4360",  "brcmfmac"},
     {0x14E4, 0x4365, "BCM43142", "brcmfmac"},
@@ -122,10 +124,10 @@ static void zero_bytes(void *p, u64 n) {
 /* ---- 严格错误策略骨架：原生/网守后端未落地，调用即 panic ---- */
 static struct dkm_log_api *g_log;
 
+/* strict 模式 g_log->panic 不返回；fallback 模式返回，回调随后报错返回 */
 static void wlan_panic(const char *sym, const char *detail) {
     g_log->panic(sym);
     (void)detail;
-    for (;;) __asm__ volatile("cli; hlt");
 }
 
 static int wlan_scan_start(void *ctx) {
@@ -192,6 +194,10 @@ int driver_init(const struct dkm_kernel_api *api,
 
             u16 vendor = (u16)(vd & 0xffff);
             u16 did = (u16)(vd >> 16);
+            if (vendor == 0x14C3 && did == 0x7920) {
+                g_log->info("[wlan] MT7920 left to mt7920.drv");
+                continue;
+            }
             const struct wlan_device_id *hit = 0;
             for (u32 i = 0; i < sizeof(g_wlan_ids)/sizeof(g_wlan_ids[0]); i++) {
                 if (g_wlan_ids[i].vendor == vendor && g_wlan_ids[i].did == did) {

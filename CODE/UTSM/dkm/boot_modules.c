@@ -414,7 +414,9 @@ int dkm_load_elf_rel(const void *address, u64 size, const struct dkm_symbol_scan
     handle.flags = desc->flags;
 
     dkm_log_set_driver(desc->name);           /* D4: 驱动自己的颜色 */
+    dkm_bus_set_current_provider(&handle);    /* D6: 总线 provider 上下文 */
     int result = init(dkm_get_kernel_api(), &handle);
+    dkm_bus_set_current_provider(0);
     dkm_log_set_driver(0);
     handle.init_status = result;
     if (result != 0) {

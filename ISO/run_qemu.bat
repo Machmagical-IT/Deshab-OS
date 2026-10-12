@@ -3,25 +3,28 @@ setlocal enabledelayedexpansion
 
 set "SCRIPT_DIR=%~dp0"
 
-REM ===== Variant selection: dev / release =====
+REM ===== Variant selection: dev / release / realtest =====
 REM Priority: argument > QEMU_VARIANT env > interactive menu > default dev
-REM Usage: run_qemu.bat [dev|release]
+REM Usage: run_qemu.bat [dev|release|realtest]
 set "VARIANT="
 if not "%~1"=="" set "VARIANT=%~1"
 if not defined VARIANT if defined QEMU_VARIANT set "VARIANT=%QEMU_VARIANT%"
 if not defined VARIANT (
     echo [qemu] Select image variant to boot:
-    echo   1. dev      ^(deshab-dev.img, debug all on, auto test^)
-    echo   2. release  ^(deshab-release.img, desktop + login^)
-    set /p CHOICE="Choice [1-2, Enter=dev]: "
+    echo   1. dev      ^(deshab-dev.img, debug all on, auto test, panic=strict^)
+    echo   2. release  ^(deshab-release.img, desktop + login, panic=fallback^)
+    echo   3. realtest ^(deshab-realtest.img, release options, panic=strict^)
+    set /p CHOICE="Choice [1-3, Enter=dev]: "
     if "!CHOICE!"=="2" set "VARIANT=release"
+    if "!CHOICE!"=="3" set "VARIANT=realtest"
     if not defined VARIANT set "VARIANT=dev"
 )
-REM Validate variant name (also accepts passing 1/2 as argument)
+REM Validate variant name (also accepts passing 1/2/3 as argument)
 if "%VARIANT%"=="1" set "VARIANT=dev"
 if "%VARIANT%"=="2" set "VARIANT=release"
-if not "%VARIANT%"=="dev" if not "%VARIANT%"=="release" (
-    echo [qemu] Unknown variant: %VARIANT% ^(expected dev / release^)
+if "%VARIANT%"=="3" set "VARIANT=realtest"
+if not "%VARIANT%"=="dev" if not "%VARIANT%"=="release" if not "%VARIANT%"=="realtest" (
+    echo [qemu] Unknown variant: %VARIANT% ^(expected dev / release / realtest^)
     exit /b 1
 )
 
@@ -31,7 +34,7 @@ set "NVME_IMG=%SCRIPT_DIR%..\.build_tmp\nvme_test.img"
 
 if not exist "%IMG%" (
     echo [qemu] Image not found: %IMG%
-    echo [qemu] Run ..\build.bat first -- default builds both dev and release.
+    echo [qemu] Run ..\build.bat first -- default builds dev, release and realtest.
     echo [qemu] Or build selected only: build.bat -Variant %VARIANT%
     exit /b 1
 )

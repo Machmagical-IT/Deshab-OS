@@ -478,6 +478,12 @@ int handle_key(u8 sc) {
     if (sc == 0xB8) { g_alt = 0; return 0; }
     if (sc & 0x80) { g_e0 = 0; return 0; }   /* 其他释放码忽略 */
 
+    /* M3 开始菜单（模态：Esc 关闭 / 搜索输入 / Enter 启动） */
+    if (g_sm_open) return startmenu_key(sc, g_shift);
+
+    /* 快速设置卡片（Esc 收起） */
+    if (g_qs_open && sc == 0x01) { g_qs_open = 0; return 1; }
+
     /* WiFi 快捷卡片（模态：Esc 收起 / 密码模式接管输入） */
     if (g_wifi_open) return wifi_key(sc, g_shift);
 

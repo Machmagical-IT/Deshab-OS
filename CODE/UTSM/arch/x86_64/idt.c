@@ -406,6 +406,43 @@ static void pic_remap(void) {
     outb(PIC2_DATA, 0xFF);   /* mask all slave */
 }
 
+/* P1（万物互联）: kern.irq.unmask/mask 总线服务后端 —— PIC IMR 位操作。
+ * 仅 ISA IRQ 0-15（越界 = 编程错误，IRQ-E01 零降级）。
+ * unmask IRQ8-15 时自动放开主片 IRQ2 级联。
+ * 注意 apic_route=1 时 PIC 已全屏蔽、由 IOAPIC 接管（B7）；该路径下
+ * 的解屏蔽随 P6 真 IRQ 输入走 IOAPIC 重定向表接线。 */
+void pic_irq_unmask(u8 irq) {
+    if (irq > 15) {
+        panic_full("IRQ-E01 IRQ OUT OF RANGE",
+                   "pic_irq_unmask: ISA IRQ range is 0-15", 0);
+        return;
+    }
+    if (irq < 8) {
+        u8 m = inb(PIC1_DATA);
+        outb(PIC1_DATA, m & (u8)~(1u << irq));
+    } else {
+        u8 m = inb(PIC2_DATA);
+        outb(PIC2_DATA, m & (u8)~(1u << (irq - 8)));
+        u8 m1 = inb(PIC1_DATA);
+        outb(PIC1_DATA, m1 & (u8)~(1u << 2));   /* 主片 IRQ2 级联 */
+    }
+}
+
+void pic_irq_mask(u8 irq) {
+    if (irq > 15) {
+        panic_full("IRQ-E01 IRQ OUT OF RANGE",
+                   "pic_irq_mask: ISA IRQ range is 0-15", 0);
+        return;
+    }
+    if (irq < 8) {
+        u8 m = inb(PIC1_DATA);
+        outb(PIC1_DATA, m | (u8)(1u << irq));
+    } else {
+        u8 m = inb(PIC2_DATA);
+        outb(PIC2_DATA, m | (u8)(1u << (irq - 8)));
+    }
+}
+
 /* 运行时读取当前内核 CS — 必须与实际生效的 GDT 一致。
  * 注意:UTSM 运行在 Limine 提供的 GDT 下(CS=0x28),不能假设
  * OSDev 教程布局(0x08=code)。若 IDT gate selector 指向无效/非64位
@@ -664,8 +701,8 @@ void idt_handler(isr_frame *frame) {
         sym[8] = (char)(hi < 10 ? '0' + hi : 'A' + hi - 10);
         sym[9] = (char)(lo < 10 ? '0' + lo : 'A' + lo - 10);
         sym[10] = 0;
-        panic_full(sym, "cpu exception", &pr);
-        for (;;) { __asm__ volatile ("cli; hlt"); }  /* 兜底（panic_full 不返回） */
+        /* 异常帧上无法安全恢复执行：两种 panic 模式都 halt */
+        panic_halt(sym, "cpu exception", &pr);
     }
 
     /* PIC IRQ: vectors 0x20-0x2F (32-47)

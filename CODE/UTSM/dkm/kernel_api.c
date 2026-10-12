@@ -21,11 +21,9 @@ static void dkm_api_error(const char *msg) {
 }
 
 static void dkm_api_panic(const char *msg) {
-    /* F1: 驱动 panic 统一走莲花崩溃屏（串口 dump + DRR 归档 + 帧缓冲） */
+    /* F1: 驱动 panic 统一走莲花崩溃屏（串口 dump + DRR 归档 + 帧缓冲）。
+     * fallback 模式下返回驱动，由驱动调用点走其备用路径。 */
     panic_full("DKM-PANIC", msg, 0);
-    for (;;) {
-        __asm__ volatile("cli; hlt");
-    }
 }
 
 static const dkm_log_api g_log_api = {
@@ -85,7 +83,8 @@ static dkm_kernel_api g_kernel_api = {
     .mm_unmap_mmio = 0,
     .register_apic_eoi = 0,
     .sched = 0,
-    .kapi = 0
+    .kapi = 0,
+    .bus = 0
 };
 
 const dkm_kernel_api *dkm_get_kernel_api(void) {
@@ -142,6 +141,11 @@ extern volatile struct limine_module_request g_module_request;
 extern volatile struct limine_hhdm_request g_hhdm_request;
 
 void dkm_fill_platform_info(void) {
+    /* D6 万物互联：总线先播种再挂载（必须先于一切驱动加载——
+     * driver_init 里即可 api->bus->register_service）。 */
+    dkm_bus_init();
+    g_kernel_api.bus = dkm_bus_get_api();
+
     g_kernel_api.dma = dma_get_api();
     g_kernel_api.net = net_get_api();
     g_kernel_api.block = block_get_api();

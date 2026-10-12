@@ -24,8 +24,26 @@
 - [x] D5 最小 REPL/shell（shell.elf 25+ 命令）
 - [ ] D1 DKM 热卸载（引用计数 + 资源回收，循环 100 次不崩）
 - [ ] D2 裸机器码加载器
-- [ ] D3 内核 API 按名导出表（kapi()）
+- [ ] D3 内核 API 按名导出表 → 双向服务总线（kapi 只读表 ✅；dkm_bus 注册-消费进行中，见 D6）
 - [x] D4 DKM 彩色日志前缀（驱动名 hash → 8 色 ANSI，init 期着色，BOOTLOG 保持纯文本）
+
+## 🔗 三期扩展：万物互联（D6/D7，P0-P6）
+
+> 设计定稿：[RE/万物互联与服务总线设计.md](./RE/万物互联与服务总线设计.md)——没有主内核，一切皆 DKM 模块，模块间经按名服务总线互联。
+
+- [ ] P0 manifest 依赖图强制（depends 校验 + 不动点排序，DKM-E44/E47；负向测试莲花屏）
+- [ ] P1 dkm_bus 服务总线（kern.*/srv.* 双向注册-消费、BUS-E01..05、provider 上下文、DKM-E45 provides 校验、/dev/services、TST-E25..28）
+- [ ] P2 fat32.drv 实装 + ext4.drv（srv.fs.fat32.* / srv.fs.ext4.*；首次启动全流程不回归）
+- [ ] P3 加载器 FS 化 + stage4 session + ps2mouse.drv（dsm_read_module_fs、DKM-E46、kern.dkm.load_by_name、srv.input.mouse.poll）
+- [ ] P4a netman.drv（srv.net.lease）
+- [ ] P4b shell.drv（probe/lease/dev_mode 走总线）
+- [ ] P4c firstinit.drv（user.conf 写盘收编，reserved[0/1] 删除，srv.user.config）
+- [ ] P4d login.drv（自读 USER.CONF，srv.auth.result）
+- [ ] P4e desktop.drv（~20TU ld -r，host SDL #ifdef 隔离，readobj 重定位核对）
+- [ ] P4f cmd.drv + 收尾（DSK 只剩排序骨架）
+- [ ] P5 DSK 退役 + session.drv（删 deshab.elf/dsk_loader.c/dsk_boot_context；dev/release 双过）
+- [ ] P6 常驻调度 + 真 IRQ 输入（sched_enable 常驻 + bootstrap park、desktop 任务化、IRQ1/12 解屏蔽、kbd 事件环）
+- [ ] D7 收尾（kapi 静态表退役、kern.block.* 消费者切换、STUB 基线复核）
 
 ## ⏪ 四期：落款（DRR/PCQ）
 

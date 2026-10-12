@@ -137,8 +137,15 @@ static u64 lf_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
  *  必须整屏 fatal 显示错误码后停机。"疯但好使" 的反面保障：
  *  错也错得有落款。每个插桩点一个唯一 symbol（LOGIN-E<nn>）。
  * =================================================================== */
+/* DSK_BOOT_FLAG_PANIC_FALLBACK：login_fatal 只留串口坐标后返回，调用点走备用路径 */
+static int g_panic_fallback;
+
 static void login_fatal(const char *sym) {
     logl(sym);
+    if (g_panic_fallback) {
+        logl("[login:FALLBACK] fatal point hit, taking backup path");
+        return;
+    }
     if (fb_a) {
         u32 *fb = (u32 *)(u64)fb_a;
         fill_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h, 0xFF3A0E14u);
@@ -226,6 +233,23 @@ static u32 bg_at_y(i64 y) {
     if (y < 0) y = 0;
     if ((u64)y >= fb_h) y = (i64)fb_h - 1;
     return blend(BG_TOP, BG_BOTTOM, (u32)(((u64)y * 255ULL) / (fb_h - 1)));
+}
+
+static void restore_wallpaper_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
+    for (i64 r = 0; r < h; r++) {
+        i64 yy = y + r;
+        if (yy < 0 || (u64)yy >= fb_h) continue;
+        u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+        u64 sy = (u64)yy * WALLPAPER_BLUR_H / fb_h;
+        const unsigned char *srow = g_wall_blur_rgba + sy * WALLPAPER_BLUR_W * 4;
+        for (i64 c = 0; c < w; c++) {
+            i64 xx = x + c;
+            if (xx < 0 || (u64)xx >= fb_w) continue;
+            u64 sx = (u64)xx * WALLPAPER_BLUR_W / fb_w;
+            const unsigned char *px = srow + sx * 4;
+            line[(u64)xx] = 0xFF000000u | ((u32)px[0] << 16) | ((u32)px[1] << 8) | px[2];
+        }
+    }
 }
 
 static void fill_gradient_rect(u32 *fb, i64 x, i64 y, i64 w, i64 h) {
@@ -609,7 +633,7 @@ static void draw_login_card(u32 *fb, i64 card_x, i64 card_y, const char *pass, i
     u32 sub_fg = 0xFF9098A0;
     /* Background + card */
     cursor_restore_bg(fb);
-    fill_gradient_rect(fb, card_x - 24, card_y - 24, CARD_W + 48, CARD_H + 48);
+    restore_wallpaper_rect(fb, card_x - 24, card_y - 24, CARD_W + 48, CARD_H + 48);
     draw_card(fb, card_x, card_y, CARD_W, CARD_H, card);
     /* Title */
     fb_text(fb, "Deshab Login", card_x + 40, card_y + 40, fg, card);
@@ -805,8 +829,11 @@ __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
     logl("[login] boot");
+    g_panic_fallback = (ctx && ctx->magic == 0x44534B31424F4F54ULL &&
+                        (ctx->flags & DSK_BOOT_FLAG_PANIC_FALLBACK)) ? 1 : 0;
 
-    /* 防篡改：第一时间校验 .text 段完整性。失败 = 系统被篡改，严格 panic。 */
+    /* 防篡改：第一时间校验 .text 段完整性。失败 = 系统被篡改，严格 panic。
+     * fallback：继续登录流程（密码校验仍生效）。 */
     if (!login_verify_integrity()) {
         login_fatal("LOGIN-E01-INTEGRITY-FAIL");
     }
@@ -819,6 +846,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
         login_fatal("LOGIN-E02-BADCONTEXT");
+        return;   /* fallback：无上下文无法登录，返回 DSK（视为未登录） */
     }
 
     fb_a = ctx->framebuffer_address;
@@ -833,6 +861,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
     u32 conf_size = (u32)ctx->reserved[1];
     if (!conf_buf || conf_size == 0) {
         login_fatal("LOGIN-E03-NOUSERCONF");
+        return;   /* fallback：reserved[2] 保持 0，DSK 按未登录处理 */
     }
     logl("[login] conf data received");
 
@@ -852,12 +881,14 @@ void dsk_entry(const dsk_boot_context *ctx) {
             logl("[login] username found");
         } else {
             login_fatal("LOGIN-E04-NO-USERNAME");
+            return;
         }
         if (conf_get_value(conf_buf, conf_size, "passwordSha256", g_password_hash, sizeof(g_password_hash)) == 0) {
             g_has_hash = 1;
             logl("[login] password hash found");
         } else {
             login_fatal("LOGIN-E05-NO-PASSWORD-HASH");
+            return;
         }
     } else {
         logl("[login] conf appears encrypted, will verify by password decryption");

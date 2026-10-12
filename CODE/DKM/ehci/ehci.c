@@ -1098,10 +1098,12 @@ int driver_init(const struct dkm_kernel_api *api,
             dkm_delay_ms(20);
         }
     }
-    dkm_delay_ms(100);  /* 端口稳定 */
+    dkm_delay_ms(1500);  /* 控制器复位后 U 盘重新连接 */
 
-    /* 扫描端口，枚举 MSC */
+    /* 扫描端口，枚举 MSC。第一遍没有就再等一次。 */
     g_msc.ready = 0;
+    for (int pass = 0; pass < 2 && !g_msc.ready; pass++) {
+    if (pass == 1) dkm_delay_ms(1500);
     for (u32 p = 0; p < g_nports; p++) {
         u32 po = g_caplen + EHCI_OP_PORTSC + p * EHCI_PORT_STRIDE;
         u32 ps = mmio_read32(po);
@@ -1137,6 +1139,7 @@ int driver_init(const struct dkm_kernel_api *api,
         log_hex("[ehci] MSC device ready, sectors=", sectors);
         log_hex("[ehci] MSC device block_size=", blk);
         break;
+    }
     }
 
     /* 注册 block provider */

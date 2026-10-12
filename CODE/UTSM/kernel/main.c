@@ -25,6 +25,8 @@ extern volatile struct limine_module_request g_module_request;
 /* dkm/manifest.c: 带 FUCK [drivers] 过滤的 manifest 加载入口 */
 void dsm_load_by_manifest_ex(const ini_config *cfg);
 void dsm_load_named(const ini_config *cfg, const char *name);
+/* P0 顺序豁免版：唯一调用方就是下方 VMM 路径（pci+ahci 必须先于 apic） */
+void dsm_load_named_boot(const ini_config *cfg, const char *name);
 
 /* dsk_loader.c: 按路径读取 FAT32 文件到 g_dsk_fat32_filedata 静态缓冲。
  * Phase 1 已支持 LFN 长文件名 + 子目录遍历。 */
@@ -51,6 +53,17 @@ int  g_sched_enabled_cfg            = 1;                  /* FUCK [sched] enable
 
 /* 将 FUCK [compat] 区的配置应用到兼容层全局变量。
  * 必须在 utsm_apply_config 之后调用。 */
+/* FUCK [panic] mode=strict|fallback（默认 strict）。其余取值按 strict 处理。 */
+static void utsm_apply_panic_config(const ini_config *cfg) {
+    const char *mode = ini_get(cfg, "panic", "mode");
+    const char *want = "fallback";
+    int fallback = mode ? 1 : 0;
+    for (int i = 0; fallback && (mode[i] || want[i]); i++) {
+        if (mode[i] != want[i]) fallback = 0;
+    }
+    panic_set_fallback(fallback);
+}
+
 static void utsm_apply_compat_config(const ini_config *cfg) {
     if (!cfg) return;
     const char *lib_path = ini_get(cfg, "compat", "lib_path");
@@ -128,6 +141,12 @@ static void utsm_apply_config(const ini_config *cfg) {
 /* ---- 全局启动配置（从 FUCK 文件读取） ---- */
 static ini_config g_boot_cfg;
 static int g_boot_cfg_loaded = 0;
+
+/* D6 万物互联：FUCK 启动配置只读访问（kern.config.get 总线服务后端，
+ * bus.c 经前向声明调用；未加载时返回 NULL，消费方自行处理缺席）。 */
+const ini_config *utsm_boot_cfg_get(void) {
+    return g_boot_cfg_loaded ? &g_boot_cfg : 0;
+}
 static int g_vmm_init_ok = 0;   /* attest: vmm_vmx 能力打点 */
 
 /* 从 Limine boot module 读取 FUCK 配置。
@@ -263,9 +282,9 @@ void kernel_main(void) {
             if (cr4 & (1ULL << 12)) {
                 log_error("[UTSM] LA57 is ACTIVE — this kernel requires 4-level paging");
                 log_error("[UTSM] Refusing to boot. Disable LA57 in firmware settings.");
-                panic_full("VMM-E11 LA57 ACTIVE REFUSE BOOT",
+                /* 无备用路径：paging.c/mmio.c 的 4 级 walk 会写坏 5 级页表 */
+                panic_halt("VMM-E11 LA57 ACTIVE REFUSE BOOT",
                            "5-level paging active; kernel requires 4-level paging", 0);
-                arch_halt_forever();
             }
         }
 
@@ -310,6 +329,8 @@ void kernel_main(void) {
     /* D4: DKM 彩色日志总开关（FUCK [debug] color_log，默认开；
      * 颜色只走串口，BOOTLOG.TXT 保持纯文本） */
     log_color_enable(ini_get_bool(cfg, "debug", "color_log", 1));
+
+    utsm_apply_panic_config(cfg);
 
     /* ---- 插桩: FUCK 配置加载完成 ---- */
     INSTR_PROBE(BOOT, (u64)g_boot_cfg_loaded, 0, 0, 0);
@@ -372,9 +393,8 @@ void kernel_main(void) {
     /* === 封缄内存极早期初始化（UTSM-E01..E04） ===
      * .sealed 区为空 / root key 缺失 → 此处极早期 panic，绝不带病前进。 */
     {
-        extern void utsm_sealed_early_init(void);
-        utsm_sealed_early_init();
-        attest_report_ready("sealed_mem", "UTSM-E05");
+        extern int utsm_sealed_early_init(void);
+        attest_report("sealed_mem", "UTSM-E05", utsm_sealed_early_init() == 0);
     }
 
     /* === SAS-R0-PCQ 调度器：bootstrap 任务绑定（Phase 7） ===
@@ -395,8 +415,11 @@ void kernel_main(void) {
              * 调度器没有真正立起来，零降级 panic（SAS-E01） */
             panic_full("SAS-E01 SCHED BOOTSTRAP FAILED",
                        "SAS-R0-PCQ scheduler bootstrap failed (was: non-fatal)", 0);
+            /* fallback：不开 demo 窗口，sched 能力不报就绪 */
+            g_sched_enabled_cfg = 0;
+        } else {
+            attest_report_ready("sched", "SAS-E02");
         }
-        attest_report_ready("sched", "SAS-E02");
     }
 
     INSTR_TS_DECL(ts_dkm);
@@ -430,31 +453,38 @@ void kernel_main(void) {
 
             /* Only pci+ahci before linux_launch. Loading apic/stage0 first
              * left the guest in an IDTR=0 VM-exit storm. Remaining DKM
-             * still loads after the guest parks. */
-            dsm_load_named(cfg, "pci");
-            dsm_load_named(cfg, "ahci");
+             * still loads after the guest parks.
+             * P0 依赖图：此处用顺序豁免版（pci depends irq/apic 未加载），
+             * 豁免登记见 docs/RE/万物互联与服务总线设计.md §6。 */
+            dsm_load_named_boot(cfg, "pci");
+            dsm_load_named_boot(cfg, "ahci");
 
             /* === Linux guest — 可通过 FUCK [boot] linux_guest=0 跳过 ===
              * 严格错误策略：linux_guest=1 即"请求了 guest"——模块缺失、
              * 启动失败、IPC 失败一律 panic（VMM-E/LNX-E），零降级。 */
             int run_linux = ini_get_bool(cfg, "boot", "linux_guest", 1);
-            if (run_linux) {
-                if (linux_loader_init() != 0) {
-                    panic_full("VMM-E01 LINUX BZIMAGE MISSING",
-                               "linux_guest=1 but bzImage boot module not found", 0);
-                }
+            int linux_ready = run_linux;
+            if (run_linux && linux_loader_init() != 0) {
+                panic_full("VMM-E01 LINUX BZIMAGE MISSING",
+                           "linux_guest=1 but bzImage boot module not found", 0);
+                linux_ready = 0;   /* fallback：跳过 Linux guest */
+            }
+            if (linux_ready) {
                 INSTR_TS_DECL(ts_linux);
                 INSTR_TS_BEGIN(ts_linux);
                 log_info("[UTSM] Linux loader init ok");
 
+                int lin_st = -1;
+                int launched = 0;
                 if (ipc_shm_init() == 0) {
                     log_info("[UTSM] IPC shm init ok");
+                    lin_st = linux_launch();
+                    launched = 1;
                 } else {
                     panic_full("LNX-E03 IPC SHM INIT FAILED",
                                "IPC shared memory init failed (was: non-fatal)", 0);
+                    log_warn("[UTSM] fallback: Linux guest launch skipped (no IPC)");
                 }
-
-                int lin_st = linux_launch();
                 INSTR_TS_END(ts_linux, "linux_launch");
                 if (lin_st == 0) {
                     log_info("[UTSM] Linux guest parked (daemon ready)");
@@ -480,14 +510,14 @@ void kernel_main(void) {
                                        "vscode tarball install into guest failed", 0);
                         }
                     }
-                } else {
+                } else if (launched) {
                     /* 严格错误策略插桩：guest 启动失败零降级（VMM-E02） */
                     log_error("[UTSM] Linux launch failed");
                     log_hex64("[UTSM] Linux st=", (u64)(i64)lin_st);
                     panic_full("VMM-E02 LINUX LAUNCH FAILED",
                                "linux_guest=1 requested but VMX launch failed", 0);
                 }
-            } else {
+            } else if (!run_linux) {
                 log_warn("[UTSM] Linux guest disabled by FUCK (linux_guest=0)");
             }
         } else {
@@ -503,11 +533,11 @@ void kernel_main(void) {
          * 严格错误策略：xj380_guest=1 即"请求了 guest"——模块缺失或
          * 启动失败一律 panic（VMM-E03/E04），零降级。 */
         int run_xj380 = ini_get_bool(cfg, "boot", "xj380_guest", 1);
-        if (run_xj380) {
-            if (xj380_loader_init() != 0) {
-                panic_full("VMM-E03 XJ380 KERNEL.KRL MISSING",
-                           "xj380_guest=1 but kernel.krl boot module not found", 0);
-            }
+        if (run_xj380 && xj380_loader_init() != 0) {
+            panic_full("VMM-E03 XJ380 KERNEL.KRL MISSING",
+                       "xj380_guest=1 but kernel.krl boot module not found", 0);
+            log_warn("[UTSM] fallback: XJ380 guest skipped");
+        } else if (run_xj380) {
             INSTR_TS_DECL(ts_xj380);
             INSTR_TS_BEGIN(ts_xj380);
             log_info("[UTSM] XJ380 loader init ok");
@@ -554,7 +584,9 @@ void kernel_main(void) {
         attest_report("pkg", "PKG-E10", 0);
         attest_report("brand_anim", "BRAND-E10", 0);
         attest_report("dkm_hot_unload", "DKM-E60", 0);
-        attest_report("dkm_api_export", "DKM-E61", 0);
+        /* D6 万物互联：dkm_bus 落地，按名服务导出能力翻绿
+         * （kapi 只读表 + bus 双向注册-消费）。 */
+        attest_report("dkm_api_export", "DKM-E61", 1);
         attest_report("nvme_rw", "NVME-E30", 0);
         attest_report("virtio_net", "VNET-E30", 0);
     }
@@ -578,7 +610,6 @@ void kernel_main(void) {
                 log_error("[UTSM] SELFTEST FAIL");
                 panic_full("VMM-E14 SELFTEST FAIL",
                            "utsm_selftest_run returned non-zero", 0);
-                arch_halt_forever();
             }
         }
     }
@@ -620,7 +651,8 @@ void kernel_main(void) {
 
     if (dsk_load_and_jump() != 0) {
         log_error("[UTSM] DSK jump failed");
-        panic_full("VMM-E15 DSK JUMP FAILED",
+        /* 启动链终点，无可继续的路径：两种模式都上莲花屏 */
+        panic_halt("VMM-E15 DSK JUMP FAILED",
                    "dsk_load_and_jump returned non-zero", 0);
     }
 

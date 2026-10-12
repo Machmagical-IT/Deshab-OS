@@ -10,6 +10,9 @@
 #define DSK_BOOT_FLAG_DKM_READY       (1ULL << 1)
 #define DSK_BOOT_FLAG_FAT32_PATH      (1ULL << 2)
 #define DSK_BOOT_FLAG_PROBE_INFO      (1ULL << 3)
+/* FUCK [panic] mode=fallback：DSK/desktop/login/FirstInit 的 *_fatal 记录后返回，
+ * 调用点走备用路径（见 utsm/panic.h）。未置位 = strict。 */
+#define DSK_BOOT_FLAG_PANIC_FALLBACK  (1ULL << 4)
 
 /* ---- Probe 信息结构（通过 reserved[6] 传递给 shell/desktop） ---- */
 #define PROBE_INFO_MAGIC 0x50524F42u  /* "PRFB" — Probe inFo Buffer */

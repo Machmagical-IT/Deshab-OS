@@ -62,7 +62,18 @@ efi_bytes="$(bytes_of "$SYSTEM/EFI")"
 limine_bytes="$(bytes_of "$SYSTEM/limine")"
 driver_bytes="$(bytes_of "$SYSTEM/driver")"
 sys_bytes="$(bytes_of "$SYSTEM/system")"
-esp_content=$((boot_bytes + efi_bytes + limine_bytes + driver_bytes + sys_bytes))
+# M3: 桌面/开始菜单经 DSK FAT32 只读 ESP —— PE 应用目录与配置必须落 ESP。
+bin_bytes="$(bytes_of "$SYSTEM/bin")"
+program_bytes="$(bytes_of "$SYSTEM/program")"
+lib_bytes="$(bytes_of "$SYSTEM/lib")"
+esp_cnf_bytes=0
+for cnf in PEAPPS.CNF LINUXAPP.CNF STARTMENU.CNF; do
+    if [[ -f "$SYSTEM/$cnf" ]]; then
+        esp_cnf_bytes=$((esp_cnf_bytes + $(bytes_of "$SYSTEM/$cnf")))
+    fi
+done
+esp_content=$((boot_bytes + efi_bytes + limine_bytes + driver_bytes + sys_bytes \
+              + bin_bytes + program_bytes + lib_bytes + esp_cnf_bytes))
 
 rest_bytes=0
 shopt -s dotglob nullglob
@@ -257,6 +268,29 @@ if [[ -d "$SYSTEM/user" ]]; then
     echo "[pack] copying user/ onto FAT32 ESP for native desktop icons"
     rsync -rltD --info=progress2 "$SYSTEM/user/" "$MNT_ESP/user/"
 fi
+# M3: PE 应用/系统工具与注册表配置 —— DSK FAT32 路径只看得见 ESP：
+#   bin/      CLI exe（cmd.elf PATH 二级）+ ELF 工具（开始菜单 bin/xxx.elf）
+#   program/  GUI exe（开始菜单 program/xxx.exe，run_windowed 嵌入）
+#   lib/      PE 真实 DLL（pe_dll_manager 经 fat32_read_path "lib/..." 加载）
+#   *.CNF     桌面注册表（PEAPPS/LINUXAPP/STARTMENU）
+# 没有这几份拷贝，开始菜单/PE 应用在 GPT 镜像里全部静默失效。
+if [[ -d "$SYSTEM/bin" ]]; then
+    echo "[pack] copying bin/ onto FAT32 ESP (CLI exes + ELF tools)"
+    rsync -rltD --info=progress2 "$SYSTEM/bin/" "$MNT_ESP/bin/"
+fi
+if [[ -d "$SYSTEM/program" ]]; then
+    echo "[pack] copying program/ onto FAT32 ESP (GUI PE apps)"
+    rsync -rltD --info=progress2 "$SYSTEM/program/" "$MNT_ESP/program/"
+fi
+if [[ -d "$SYSTEM/lib" ]]; then
+    echo "[pack] copying lib/ onto FAT32 ESP (PE DLLs)"
+    rsync -rltD --info=progress2 "$SYSTEM/lib/" "$MNT_ESP/lib/"
+fi
+for cnf in PEAPPS.CNF LINUXAPP.CNF STARTMENU.CNF; do
+    if [[ -f "$SYSTEM/$cnf" ]]; then
+        cp -f "$SYSTEM/$cnf" "$MNT_ESP/$cnf"
+    fi
+done
 
 echo "[pack] copying p2 ext4 data partition"
 shopt -s dotglob nullglob

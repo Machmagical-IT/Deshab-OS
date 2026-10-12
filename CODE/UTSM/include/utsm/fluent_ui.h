@@ -7,7 +7,8 @@
  *   L1  wf_theme   主题令牌（色板 + 圆角），g_wf_light / g_wf_dark 预设
  *   L2  原语       du_wf_acrylic（读背景 alpha 混合圆角面板）、du_wf_shadow、
  *                  du_wf_line（Bresenham 带宽线）、du_wf_ring（圆环/半弧）
- *   L3  组件       按钮/图标钮/开关/滑块/列表项/卡片/文本框/滚动条/提示
+ *   L3  组件       按钮/图标钮/开关/滑块/列表项/卡片/文本框/滚动条/提示 +
+ *                  复选框/进度条/标签页/分隔线/应用瓦片/菜单行/徽标（M3 开始菜单批次）
  *   L4  图标       du_wf_icon 矢量线性图标（24 网格设计，2px 笔触）
  *
  * 约定（与 deshab_ui.h 相同）：包含本头前，编译单元须已定义 g_ascii
@@ -315,6 +316,92 @@ static inline void du_wf_tooltip(du_context *ctx, du_i64 x, du_i64 y,
                    t->text_primary, t->acrylic_solid, DU_ASCII_STEP);
 }
 
+/* ============ M3 新增组件（开始菜单/快速设置批次）============ */
+
+/* 复选框：20×20 圆角 4 方框，选中画 accent 对勾 + accent 底 */
+static inline void du_wf_checkbox(du_context *ctx, du_i64 x, du_i64 y,
+                                  int checked, const wf_theme *t) {
+    du_fill_rounded_rect(ctx, x, y, 20, 20,
+                         checked ? t->accent : t->acrylic_solid, 4);
+    du_rect_outline(ctx, x, y, 20, 20,
+                    checked ? t->accent : t->control_stroke, 4);
+    if (checked) {
+        du_wf_line(ctx, x + 4, y + 10, x + 8, y + 15, 2, t->on_accent);
+        du_wf_line(ctx, x + 8, y + 15, x + 16, y + 4, 2, t->on_accent);
+    }
+}
+
+/* 进度条：6px 圆角轨道 + accent 填充（val 0..100） */
+static inline void du_wf_progress(du_context *ctx, du_i64 x, du_i64 y,
+                                  du_i64 w, int val, const wf_theme *t) {
+    if (val < 0) val = 0;
+    if (val > 100) val = 100;
+    du_fill_rounded_rect(ctx, x, y, w, 6, t->control_stroke, 3);
+    du_i64 fw = w * val / 100;
+    if (fw < 4) fw = 4;
+    if (fw > w) fw = w;
+    du_fill_rounded_rect(ctx, x, y, fw, 6, t->accent, 3);
+}
+
+/* 标签页（pill）：圆角 full，active 填 accent_secondary 底 */
+static inline void du_wf_pill(du_context *ctx, du_i64 x, du_i64 y,
+                              const char *label, const wf_theme *t, int active) {
+    du_i64 len = 0;
+    while (label[len]) len++;
+    du_i64 w = len * (du_i64)DU_ASCII_STEP + 20;
+    du_fill_rounded_rect(ctx, x, y, w, 26,
+                         active ? t->accent : t->acrylic_solid, 13);
+    du_draw_string(ctx, label, x + 10, y + (26 - (du_i64)DU_ASCII_CELL_H) / 2,
+                   active ? t->on_accent : t->text_secondary,
+                   active ? t->accent : t->acrylic_solid, DU_ASCII_STEP);
+}
+
+/* 分隔线：1px divider */
+static inline void du_wf_separator(du_context *ctx, du_i64 x, du_i64 y,
+                                   du_i64 w, const wf_theme *t) {
+    du_fill_rect(ctx, x, y, w, 1, t->divider);
+}
+
+/* 应用瓦片：圆角 8 悬浮底 + 居中图标 + 底部标签区（中文标签由调用方
+ * zh_draw_string 绘制，ASCII 图标由本组件画）。hover/selected 蒙层。 */
+static inline void du_wf_app_tile(du_context *ctx, du_i64 x, du_i64 y,
+                                  du_i64 w, du_i64 h, wf_icon_id icon,
+                                  const wf_theme *t, wf_btn_state st,
+                                  int selected) {
+    if (st == WF_BTN_HOVER)
+        du_wf_overlay(ctx, x, y, w, h, 0x14000000u);
+    if (selected)
+        du_wf_overlay(ctx, x, y, w, h, 0x1E000000u);
+    du_i64 isz = h / 3;
+    if (isz < 24) isz = 24;
+    if (isz > 36) isz = 36;
+    du_wf_icon(ctx, icon, x + (w - isz) / 2, y + (h - isz) / 2 - 8, isz,
+               selected ? t->accent : t->text_primary);
+    /* 选中态：底部 3px accent 指示条 */
+    if (selected)
+        du_fill_rounded_rect(ctx, x + w / 2 - 8, y + h - 6, 16, 3, t->accent, 1);
+}
+
+/* 菜单行：36px 行高 + 左侧图标 + ASCII 标签（右箭头区由调用方补充） */
+static inline void du_wf_menu_item(du_context *ctx, du_i64 x, du_i64 y,
+                                   du_i64 w, wf_icon_id icon, const char *label,
+                                   const wf_theme *t, wf_btn_state st) {
+    if (st == WF_BTN_HOVER)
+        du_wf_overlay(ctx, x, y, w, 36, 0x14000000u);
+    du_wf_icon(ctx, icon, x + 10, y + 6, 22, t->text_primary);
+    du_draw_string(ctx, label, x + 44, y + (36 - (du_i64)DU_ASCII_CELL_H) / 2,
+                   t->text_primary, 0, DU_ASCII_STEP);
+}
+
+/* 徽标：8px 圆点（通知/在线状态角标） */
+static inline void du_wf_badge(du_context *ctx, du_i64 cx, du_i64 cy,
+                               du_u32 color) {
+    for (du_i64 dy = -4; dy <= 4; dy++)
+        for (du_i64 dx = -4; dx <= 4; dx++)
+            if (dx * dx + dy * dy <= 16)
+                du_pixel(ctx, cx + dx, cy + dy, color);
+}
+
 /* ===================================================================
  *  L4 — 矢量图标（24 网格设计，线性 2px 笔触，Win11 Segoe 风格）
  *
@@ -343,6 +430,18 @@ typedef enum {
     WF_ICON_MAX,           /* □ */
     WF_ICON_RESTORE,       /* 双层 □ */
     WF_ICON_USER,          /* 人形 */
+    /* M3 开始菜单/系统工具批次 */
+    WF_ICON_APPS,          /* 3×3 点阵（应用列表） */
+    WF_ICON_CLOCK,         /* 圆 + 指针 */
+    WF_ICON_INFO,          /* 圆 + i */
+    WF_ICON_DISK,          /* 圆柱（磁盘） */
+    WF_ICON_PICTURE,       /* 山 + 太阳（画板/图片） */
+    WF_ICON_MUSIC,         /* 音符 */
+    WF_ICON_GAME,          /* 手柄 */
+    WF_ICON_CHIP,          /* CPU 芯片 */
+    WF_ICON_REFRESH,       /* 环形箭头 */
+    WF_ICON_LOCK,          /* 挂锁 */
+    WF_ICON_TRASH,         /* 垃圾桶 */
 } wf_icon_id;
 
 static inline void du_wf_icon(du_context *ctx, wf_icon_id id,
@@ -465,6 +564,80 @@ static inline void du_wf_icon(du_context *ctx, wf_icon_id id,
     case WF_ICON_USER:
         du_wf_ring(ctx, x + 12 * u, y + 8 * u, 4 * u, s, 0, color);
         du_wf_ring(ctx, x + 12 * u, y + 26 * u, 9 * u, s, 1, color);
+        break;
+    case WF_ICON_APPS:
+        for (int gy = 0; gy < 3; gy++)
+            for (int gx = 0; gx < 3; gx++)
+                du_fill_rounded_rect(ctx, x + (3 + gx * 7) * u,
+                                     y + (3 + gy * 7) * u, 4 * u, 4 * u,
+                                     color, (du_u32)u);
+        break;
+    case WF_ICON_CLOCK:
+        du_wf_ring(ctx, x + 12 * u, y + 12 * u, 9 * u, s, 0, color);
+        du_wf_line(ctx, x + 12 * u, y + 12 * u, x + 12 * u, y + 6 * u, u + 1, color);
+        du_wf_line(ctx, x + 12 * u, y + 12 * u, x + 17 * u, y + 14 * u, u + 1, color);
+        break;
+    case WF_ICON_INFO:
+        du_wf_ring(ctx, x + 12 * u, y + 12 * u, 9 * u, s, 0, color);
+        du_fill_rect(ctx, x + 11 * u, y + 7 * u, s, 5 * u, color);
+        du_fill_rect(ctx, x + 11 * u, y + 14 * u, s, 4 * u, color);
+        break;
+    case WF_ICON_DISK:
+        /* 圆柱：顶椭圆 + 两侧竖线 + 底弧 */
+        du_wf_ring(ctx, x + 12 * u, y + 7 * u, 8 * u, s, -1, color);
+        du_fill_rect(ctx, x + 4 * u, y + 7 * u, s, 10 * u, color);
+        du_fill_rect(ctx, x + 18 * u, y + 7 * u, s, 10 * u, color);
+        du_wf_ring(ctx, x + 12 * u, y + 17 * u, 8 * u, s, -1, color);
+        break;
+    case WF_ICON_PICTURE:
+        du_rect_outline(ctx, x + 3 * u, y + 5 * u, 18 * u, 14 * u, color, (du_u32)u);
+        du_wf_ring(ctx, x + 8 * u, y + 9 * u, u + 1, u + 1, 0, color);
+        du_wf_line(ctx, x + 5 * u, y + 17 * u, x + 11 * u, y + 11 * u, u + 1, color);
+        du_wf_line(ctx, x + 11 * u, y + 11 * u, x + 15 * u, y + 15 * u, u + 1, color);
+        du_wf_line(ctx, x + 15 * u, y + 15 * u, x + 19 * u, y + 9 * u, u + 1, color);
+        break;
+    case WF_ICON_MUSIC:
+        /* 八分音符：符头椭圆 + 符干 + 旗 */
+        du_fill_rounded_rect(ctx, x + 5 * u, y + 15 * u, 6 * u, 4 * u, color, (du_u32)u);
+        du_fill_rect(ctx, x + 10 * u, y + 4 * u, s, 12 * u, color);
+        du_wf_line(ctx, x + 11 * u, y + 4 * u, x + 18 * u, y + 8 * u, s, color);
+        break;
+    case WF_ICON_GAME:
+        du_rect_outline(ctx, x + 2 * u, y + 7 * u, 20 * u, 10 * u, color, (du_u32)(4 * u));
+        /* 十字键 */
+        du_fill_rect(ctx, x + 7 * u, y + 9 * u, 2 * u, 6 * u, color);
+        du_fill_rect(ctx, x + 5 * u, y + 11 * u, 6 * u, 2 * u, color);
+        /* AB 钮 */
+        du_wf_ring(ctx, x + 16 * u, y + 12 * u, u + 1, u + 1, 0, color);
+        du_wf_ring(ctx, x + 19 * u, y + 12 * u, u + 1, u + 1, 0, color);
+        break;
+    case WF_ICON_CHIP:
+        du_rect_outline(ctx, x + 6 * u, y + 6 * u, 12 * u, 12 * u, color, (du_u32)u);
+        du_rect_outline(ctx, x + 10 * u, y + 10 * u, 4 * u, 4 * u, color, (du_u32)u);
+        for (int i = 0; i < 3; i++) {
+            du_fill_rect(ctx, x + (8 + i * 4) * u, y + 2 * u, s, 4 * u, color);
+            du_fill_rect(ctx, x + (8 + i * 4) * u, y + 18 * u, s, 4 * u, color);
+            du_fill_rect(ctx, x + 2 * u, y + (8 + i * 4) * u, 4 * u, s, color);
+            du_fill_rect(ctx, x + 18 * u, y + (8 + i * 4) * u, 4 * u, s, color);
+        }
+        break;
+    case WF_ICON_REFRESH:
+        du_wf_ring(ctx, x + 12 * u, y + 12 * u, 8 * u, s, 1, color);
+        /* 箭头（右上端点） */
+        du_wf_line(ctx, x + 16 * u, y + 2 * u, x + 20 * u, y + 7 * u, s, color);
+        du_wf_line(ctx, x + 20 * u, y + 7 * u, x + 14 * u, y + 8 * u, s, color);
+        break;
+    case WF_ICON_LOCK:
+        du_rect_outline(ctx, x + 5 * u, y + 10 * u, 14 * u, 10 * u, color, (du_u32)u);
+        du_wf_ring(ctx, x + 12 * u, y + 10 * u, 5 * u, s, 1, color);
+        du_fill_rect(ctx, x + 11 * u, y + 14 * u, s, 3 * u, color);
+        break;
+    case WF_ICON_TRASH:
+        du_fill_rect(ctx, x + 9 * u, y + 3 * u, 6 * u, s, color);
+        du_rect_outline(ctx, x + 5 * u, y + 6 * u, 14 * u, 15 * u, color, (du_u32)u);
+        du_fill_rect(ctx, x + 8 * u, y + 9 * u, s, 9 * u, color);
+        du_fill_rect(ctx, x + 12 * u, y + 9 * u, s, 9 * u, color);
+        du_fill_rect(ctx, x + 16 * u, y + 9 * u, s, 9 * u, color);
         break;
     default:
         du_rect_outline(ctx, x + 4 * u, y + 4 * u, 16 * u, 16 * u, color, (du_u32)u);

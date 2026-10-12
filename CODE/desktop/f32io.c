@@ -36,6 +36,10 @@ int f32_read_path_lfn_w(const char *path, u8 **out_data, u32 *out_size) {
     return f32_read_path_lfn(path, out_data, out_size);
 }
 
+int f32_read_file_by_clus_w(u32 clus, u32 size, u8 *out_buf, u32 buf_cap) {
+    return f32_read_file_by_clus(clus, size, out_buf, buf_cap);
+}
+
 int f32_read_path_lfn_to_w(const char *path, u8 *dst, u32 cap, u32 *out_size) {
     int rc = f32_read_path_lfn_to(path, dst, cap, out_size);
     if (rc != 0) slog_num("[f32io] read_to rc=", rc);   /* M1 调试：定位失败步骤 */

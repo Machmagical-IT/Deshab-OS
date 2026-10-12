@@ -33,6 +33,7 @@ devfs=1
 e1000=1
 virtio_net=1
 ath9k=0
+mt7920=1
 ps2kbd=1
 ioapic_init=1
 lapic_enable=1
@@ -60,6 +61,15 @@ demo_fault=0
 
 [drr]
 watchdog_enabled=1
+
+# === panic 策略 ===
+# mode=strict   ：未实现/异常一律 panic（莲花屏停机），STUB 规约默认行为。
+# mode=fallback ：panic 点只记串口坐标 [PANIC:FALLBACK] 后走备用路径继续启动
+#                 （跳过该能力/驱动/页面）；CPU 异常、LA57、DSK 跳转失败仍停机。
+# 非 fallback 的任何值均按 strict 处理。
+[panic]
+# dev：启用 panic（strict），零降级
+mode=strict
 
 # === SAS-R0 启动期能力证明（attest） ===
 # require_<name>=1（默认）而能力未就绪 → 启动即莲花屏 panic。
@@ -95,6 +105,30 @@ skip_firstinit=0
 mouse_init=1
 netman=1
 session=native
+
+# === "极差用户体验" 整蛊系统 ===
+# enable=1 打开总开关；下列各项 =0 可单独关闭。
+# 触发：开机进桌面后 boot_demo_sec 秒串烧演示 + 使用中每 interval_sec 秒随机一个。
+[prank]
+enable=1
+# 进桌面后串烧演示秒数（用于验证效果），0=关
+boot_demo_sec=5
+# 使用中自动整蛊间隔（秒），0=关
+interval_sec=60
+# 屏幕压暗 + 特大 FUCK 跟随鼠标后消失
+fuck_cursor=1
+# 假蓝屏（Win 风格）
+fake_bsod=1
+# 全屏反色闪烁
+invert_flash=1
+# 假"程序未响应"对话框
+fake_hang=1
+# 打字乱码（按键被随机重映射）
+garble_typing=1
+# 任务栏图标乱飞
+taskbar_fly=1
+# 假"系统即将关机"倒计时
+fake_shutdown=1
 
 [debug]
 enabled=1

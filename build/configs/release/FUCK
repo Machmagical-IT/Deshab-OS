@@ -34,6 +34,7 @@ virtio_net=1
 # 无匹配设备时 driver_init 返回非零 → DKM-E39 开机 panic。普通网卡走
 # linuxguest 后端（guest 内 mt76/iwlwifi/rtw88 + wpa_supplicant，状态回传）。
 ath9k=0
+mt7920=1
 # wlan=0：框架骨架，在有无线控制器的机器上会注册设备，其 scan/connect
 # 调用即 NETWL-E10/E11 panic。等 linuxguest 后端落地前先关闭。
 wlan=0
@@ -64,6 +65,15 @@ demo_fault=0
 
 [drr]
 watchdog_enabled=1
+
+# === panic 策略 ===
+# mode=strict   ：未实现/异常一律 panic（莲花屏停机），STUB 规约默认行为。
+# mode=fallback ：panic 点只记串口坐标 [PANIC:FALLBACK] 后走备用路径继续启动
+#                 （跳过该能力/驱动/页面）；CPU 异常、LA57、DSK 跳转失败仍停机。
+# 非 fallback 的任何值均按 strict 处理。
+[panic]
+# release：关闭 panic（fallback），真机/演示带病看全貌
+mode=fallback
 
 # === SAS-R0 启动期能力证明（attest） ===
 # require_<name>=1（默认）而能力未就绪 → 启动即莲花屏 panic。
@@ -114,8 +124,8 @@ session=native
 # 触发：开机进桌面后 boot_demo_sec 秒串烧演示 + 使用中每 interval_sec 秒随机一个。
 [prank]
 enable=1
-# 发布版不做开机演示（真机不受验证串烧打扰）；使用中仍随机整蛊
-boot_demo_sec=0
+# 进桌面后串烧演示秒数，0=关
+boot_demo_sec=5
 # 使用中自动整蛊间隔（秒），0=关
 interval_sec=120
 # 屏幕压暗 + 特大 FUCK 跟随鼠标后消失

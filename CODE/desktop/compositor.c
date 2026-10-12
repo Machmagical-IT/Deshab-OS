@@ -171,6 +171,9 @@ void redraw_all(void) {
     /* 亮度调整 */
     apply_brightness();
 
+    /* 整蛊叠加层（在光标之前，覆盖页面与任务栏） */
+    prank_draw(&g_fb);
+
     /* 鼠标光标 */
     cursor_save_bg(g_mouse_x, g_mouse_y);
     cursor_draw(g_mouse_x, g_mouse_y);
@@ -215,6 +218,9 @@ static void redraw_all_fluent(void) {
 
     /* 亮度调整 */
     apply_brightness();
+
+    /* 整蛊叠加层（在光标之前，覆盖页面与任务栏） */
+    prank_draw(&g_fb);
 
     /* 鼠标光标 */
     cursor_save_bg(g_mouse_x, g_mouse_y);

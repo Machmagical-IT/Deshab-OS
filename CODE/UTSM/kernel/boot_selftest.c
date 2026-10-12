@@ -131,6 +131,6 @@ void boot_panic_test(const ini_config *cfg) {
     extern int ini_get_bool(const ini_config *cfg, const char *section, const char *key, int defval);
     if (ini_get_bool(cfg, "boot", "panic_test", 0)) {
         log_warn("[boot] panic_test=1 -> triggering lotus panic screen");
-        panic_full("UTSM-E42", "lotus panic selftest", 0);
+        panic_halt("UTSM-E42", "lotus panic selftest", 0);
     }
 }

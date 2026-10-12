@@ -609,6 +609,45 @@ quiesce -> UTSM rollback -> device reset -> driver reinit -> resume
 
 ---
 
+## 8.5 服务总线 ABI（万物互联 · D6/D7，2026-10-10 追加）
+
+> 完整设计见 [万物互联与服务总线设计.md](./万物互联与服务总线设计.md)。本节只定 ABI 契约。
+
+### 8.5.1 总线访问
+
+`dkm_kernel_api` **尾部追加**（ABI 兼容，既有槽位偏移不变）：
+
+```c
+const dkm_bus_api *bus;   /* kapi 之后 */
+```
+
+总线结构（`dkm.h`）：`dkm_bus_api { magic, version, register_service, unregister_service, lookup, probe, count, at }`，服务项 `dkm_bus_service { name[48], version, flags, fn, provider }`。
+
+### 8.5.2 命名空间与注册规则
+
+- `kern.*`：仅内核可注册（模块注册即 BUS-E01）。
+- `srv.*`：任何 .drv 在 driver_init 里注册。**"运行"也是服务**：长期模块把原入口主体改为 `static void <mod>_run(void)` 并注册 `srv.<mod>.run`。
+- 消费：硬依赖用 `lookup`（miss → BUS-E04 panic）；能力缺席（设计内双路径）用 `probe`（miss 返回 -1，回退须登记 CLAUDE.md 白名单）。
+
+### 8.5.3 生命周期契约
+
+```text
+driver_init(handle, api) = 初始化 + 注册 srv.*（+ 长期模块 task_create，此时抢占未启用）
+运行 = 排序者（session.drv）bus 调 srv.*.run；一次性模块 call-and-return
+DKM_F_NO_UNLOAD 模块的服务带 F_NO_UNLOAD，注销即 panic
+loader 在 driver_init 前后设/清 current provider（provider 归属判定）
+```
+
+### 8.5.4 provides 校验（stage≥4）
+
+stage≥4 模块的每个 manifest provides token `T`，driver_init 成功返回后必须已有 `srv.T` 或 `srv.T.*` 注册，否则 `DKM-E45` panic。stage0-3 老驱动豁免（provides 由内核注册表兑现，如 ahci→block registry）。同时 depends 自 P0 起被 loader 强制（miss → DKM-E44；依赖环 → DKM-E47）。
+
+### 8.5.5 新错误码
+
+`BUS-E01..E05`（名字非法/重名/表满/lookup 未命中/注销违规）、`DKM-E44..E47`（依赖未满足/未注册 provides/双源皆无/依赖环）——全部零降级 panic。
+
+---
+
 ## 9. 第一版定稿
 
 第一版驱动系统确定：

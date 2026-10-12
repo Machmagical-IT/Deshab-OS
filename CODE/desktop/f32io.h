@@ -26,10 +26,11 @@ int  f32_read_root_file_w(const char *name11, u8 **out_data, u32 *out_size);
 int  f32_write_root_file_w(const char *name11, const u8 *data, u32 size);
 int  f32_list_root_w(f32_list_cb_fn emit, void *user_data);
 
-/* 目录列举 / 路径定位 / 长路径读取 */
+/* 目录列举 / 路径定位 / 长路径读取 / 按簇读文件 */
 int  f32_list_dir_w(u32 dir_clus, f32_list_entry_fn emit, void *user_data);
 int  f32_find_path_dir_lfn_w(const char *path, u32 *out_clus);
 int  f32_read_path_lfn_w(const char *path, u8 **out_data, u32 *out_size);
+int  f32_read_file_by_clus_w(u32 clus, u32 size, u8 *out_buf, u32 buf_cap);
 
 /* 流式直读到指定缓冲（绕过 f32_data 4MB 上限，zhfont 字库加载用） */
 int  f32_read_path_lfn_to_w(const char *path, u8 *dst, u32 cap, u32 *out_size);

@@ -21,6 +21,23 @@ typedef struct { u64 offset; u64 info; i64 addend; } dt_elf64_rela;
 
 static u8 g_elf_image[1048576];   /* 1 MiB：settings.elf 内存映像 ~493KB（中文字体位图 BSS），256KB 不够 */
 
+/* ELF 数据 → 加载执行 → 收尾（launch_external_elf / _path 共用） */
+static void launch_elf_data(u8 *data, u32 size) {
+    void *entry = 0;
+    if (dt_load_elf(data, size, &entry) != 0) {
+        slog("elf load failed");
+        return;
+    }
+    slog("launching external elf");
+    void (*elf_entry)(const dsk_boot_context *) = (void (*)(const dsk_boot_context *))entry;
+    elf_entry(g_boot_ctx);
+    g_cursor_saved = 0;
+    g_cursor_old_x = -1; g_cursor_old_y = -1;
+    files_refresh();          /* 外部应用可能改动了磁盘 */
+    redraw_all();
+    slog("external elf returned");
+}
+
 static int dt_load_elf(u8 *data, u32 data_size, void **entry_out) {
     const dt_elf64_ehdr *eh = (const dt_elf64_ehdr *)data;
     if (data_size < sizeof(dt_elf64_ehdr)) return -1;
@@ -85,19 +102,18 @@ void launch_external_elf(const char *name11) {
         slog("elf not found");
         return;
     }
-    void *entry = 0;
-    if (dt_load_elf(data, size, &entry) != 0) {
-        slog("elf load failed");
+    launch_elf_data(data, size);
+}
+
+/* M3: 按路径启动外部 ELF（STARTMENU.CNF 的 bin/xxx.elf 条目） */
+void launch_external_elf_path(const char *path) {
+    u8 *data = 0; u32 size = 0;
+    if (f32_read_path_lfn_w(path, &data, &size) != 0) {
+        slog("elf path not found");
+        slog(path);
         return;
     }
-    slog("launching external elf");
-    void (*elf_entry)(const dsk_boot_context *) = (void (*)(const dsk_boot_context *))entry;
-    elf_entry(g_boot_ctx);
-    g_cursor_saved = 0;
-    g_cursor_old_x = -1; g_cursor_old_y = -1;
-    files_refresh();          /* 外部应用可能改动了磁盘 */
-    redraw_all();
-    slog("external elf returned");
+    launch_elf_data(data, size);
 }
 
 /* ============================================================
@@ -134,6 +150,11 @@ void launch_app(int app_id) {
         return;
     }
 
+    /* M3: STARTMENU.CNF 的 bin/xxx.elf → 按路径全屏加载 */
+    if (app->elf_path) {
+        launch_external_elf_path(app->elf_path);
+        return;
+    }
     if (app->elf_name) {
         launch_external_elf(app->elf_name);
         return;

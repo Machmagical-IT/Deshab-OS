@@ -741,6 +741,9 @@ int driver_init(const struct dkm_kernel_api *api,
         (mac[0] & 1)) {
         raw_log("[e1000] MAC read failed (zero/multicast)\n");
         g_log->panic("E1K-E01 MAC READ FAILED");
+        /* fallback：本地管理单播地址（bit1=LAA，bit0=0），"DESHB" */
+        mac[0]=0x02; mac[1]=0x44; mac[2]=0x45; mac[3]=0x53; mac[4]=0x48; mac[5]=0x42;
+        raw_log("[e1000] fallback: using locally administered MAC\n");
     }
 
     raw_mac("[e1000] MAC=", mac);

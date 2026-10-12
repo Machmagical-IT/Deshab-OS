@@ -1,0 +1,29 @@
+# Deshab 开始菜单注册表（desktop 启动时解析，FAT32 根目录）
+# 格式: NAME|显示名|path|args   ('args' 可省略)
+#
+# path 四种：
+#   builtin:<name>   → 已注册内置应用（editor/calc/fileman/settings/shell/cmd/browser/proedit）
+#   program/xxx.exe  → GUI PE 应用（SYSTEM/program/，g++ 编译，桌面窗口嵌入运行）
+#   bin/xxx.exe      → PE 应用（同上；纯控制台 exe 请从 CMD 运行，不入菜单）
+#   bin/xxx.elf      → ELF 工具（SYSTEM/bin/，全屏加载，Esc/退出返回桌面）
+#   /guest/path      → Linux guest 应用（需 Linux 兼容层在线）
+#
+# 显示名允许 UTF-8 中文（开始菜单瓦片标签）；NAME 须 ASCII（窗口标题用）。
+# 文件缺失/为空时回退：全部已注册应用进开始菜单。
+# CLI 工具（bin/sysinfo.exe、bin/portio.exe）不入菜单——在 CMD 里敲名字运行。
+
+SHELL|终端|builtin:shell
+CMD|CMD|builtin:cmd
+EDITOR|编辑器|builtin:editor
+FILEMAN|文件管理|builtin:fileman
+CALC|计算器|builtin:calc
+SETTINGS|设置|builtin:settings
+BROWSER|浏览器|builtin:browser
+PROEDIT|ProEdit|builtin:proedit
+SYSINFO|系统信息|program/sysinfo.exe
+CLOCK|时钟|program/clock.exe
+PAINT|画板|program/paint.exe
+NOTES|记事本|program/notes.exe
+DISKINFO|磁盘工具|bin/diskinfo.elf
+DEAICUP|Deaicup|program/Deaicup-Software.exe
+VSCODE|VSCode|/opt/vscode/bin/code|--no-sandbox --disable-gpu

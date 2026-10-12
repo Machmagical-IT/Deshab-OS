@@ -1026,6 +1026,7 @@ static void dsk_fill_boot_context(dsk_boot_context *ctx) {
     ctx->abi_version = DSK_BOOT_ABI_VERSION;
     ctx->size = sizeof(*ctx);
     ctx->flags = DSK_BOOT_FLAG_FROM_UTSM | DSK_BOOT_FLAG_DKM_READY | DSK_BOOT_FLAG_FAT32_PATH;
+    if (panic_fallback_enabled()) ctx->flags |= DSK_BOOT_FLAG_PANIC_FALLBACK;
 
     if (g_hhdm_request.response) {
         ctx->hhdm_offset = g_hhdm_request.response->offset;

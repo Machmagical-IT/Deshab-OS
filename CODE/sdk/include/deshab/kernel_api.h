@@ -133,6 +133,71 @@ typedef struct dkm_mmio_api {
     u64  (*cr3)(void);               /* 当前 CR3 物理地址（诊断用） */
 } dkm_mmio_api;
 
+/* ---- SAS-R0-PCQ 调度器服务表（M4/Phase7） ---- */
+typedef struct utsm_sched_api {
+    u64  (*uptime_ns)(void);
+    void (*yield)(void);
+    u32  (*current_task_slot)(void);
+    int  (*task_create)(u32 process_slot, u32 priority, void (*entry)(void *), void *arg);
+    void (*sleep_ms)(u32 ms);
+} utsm_sched_api;
+
+/* ---- D3: 内核按名导出表（kapi，只读） ---- */
+typedef struct {
+    const char *name;   /* 如 "log.info"、"dma.alloc_pages" */
+    void *fn;
+} dkm_kapi_entry;
+
+typedef struct {
+    u32 magic;          /* DKM_KAPI_MAGIC */
+    u32 version;        /* DKM_KAPI_VERSION */
+    u32 count;
+    const dkm_kapi_entry *entries;
+    int (*lookup)(const char *name, void **out_fn);   /* miss 返回 -1 */
+} dkm_kapi_table;
+
+#define DKM_KAPI_MAGIC   0x4b415049u  /* "KAPI" */
+#define DKM_KAPI_VERSION 1u
+
+/* ---- D6 万物互联: 双向服务总线（dkm_bus） ----
+ * kapi 是内核→模块单向只读；bus 双向：模块在 driver_init 里注册
+ * srv.* 服务，任何模块按名消费。失败策略：
+ *   lookup miss = BUS-E04 panic（硬依赖=编程错误）
+ *   probe  miss = 返回 -1（能力缺席=设计内双路径）
+ * 设计文档: docs/RE/万物互联与服务总线设计.md */
+struct dkm_driver_desc;
+
+#define DKM_BUS_MAGIC    0x53425553u  /* "SBUS" */
+#define DKM_BUS_VERSION  1u
+#define DKM_BUS_MAX_SERVICES 128
+#define DKM_BUS_MAX_NAME 48
+
+#define DKM_BUS_F_KERNEL    1u  /* 内核注册，不可注销 */
+#define DKM_BUS_F_NO_UNLOAD 2u  /* provider 声明 NO_UNLOAD，注销即 BUS-E05 */
+
+typedef struct dkm_bus_service {
+    char name[DKM_BUS_MAX_NAME];   /* NUL 终止；kern.* / srv. 前缀 */
+    u32 version;                   /* 服务契约版本 */
+    u32 flags;                     /* DKM_BUS_F_* */
+    void *fn;                      /* 服务入口，签名由服务契约定义 */
+    const struct dkm_driver_desc *provider;  /* NULL = 内核 */
+} dkm_bus_service;
+
+typedef struct dkm_bus_api {
+    u32 magic;
+    u32 version;
+    /* 注册：模块只能 srv.*（kern.* 仅内核）；BUS-E01/E02/E03 全 panic，成功 0 */
+    int (*register_service)(const char *name, u32 version, void *fn);
+    /* 注销：仅 provider 本人；违规 BUS-E05 panic */
+    int (*unregister_service)(const char *name);
+    /* 必存在查找：miss → BUS-E04 panic */
+    int (*lookup)(const char *name, void **out_fn, u32 *out_version);
+    /* 可选探测：miss 返回 -1（调用方显式处理缺席） */
+    int (*probe)(const char *name, void **out_fn, u32 *out_version);
+    u32 (*count)(void);
+    const dkm_bus_service *(*at)(u32 index);
+} dkm_bus_api;
+
 /* ---- kernel_api 主结构 ----
  * 字段顺序/类型不可调整 - UTSM 端按固定偏移填充。
  * DSK 以 api+0xA8 硬偏移读取 block，net_stack 以 api+0x48 读取 net。 */
@@ -171,6 +236,12 @@ typedef struct dkm_kernel_api {
     /* B7 阶段3: 动态 IDT 向量分配器（MSI/MSI-X 用），池 0x40-0xDF。 */
     int  (*irq_vector_alloc)(void);
     void (*irq_vector_free)(int vector);
+    /* M4/Phase7-8: 调度器服务（task_create/uptime/sleep/yield）。 */
+    const utsm_sched_api *sched;
+    /* D3: 内核按名导出表（只读）。 */
+    const dkm_kapi_table *kapi;
+    /* D6 万物互联: 双向服务总线（kern.* 与 srv.* 按名注册-消费）。 */
+    const dkm_bus_api *bus;
 } dkm_kernel_api;
 
 /* ---- kernel_api 字段偏移常量（消除散落的硬编码偏移） ----

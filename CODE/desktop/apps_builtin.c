@@ -390,6 +390,68 @@ void editor_on_draw(void *state, app_ctx *ctx) {
 }
 void editor_on_destroy(void *state) { (void)state; }
 
+/* 文件资源管理器把文本文件送进窗口编辑器（单实例 ADDR_EDWIN）。 */
+void editor_open_text(const char *disp, const u8 *data, u32 size) {
+    int id = -1;
+    int found = 0;
+    int ascii = 1;
+    editor_state *s;
+    u32 cap = EDITOR_BUF_SIZE - 1;
+    if (!disp) disp = "";
+    if (!data) { data = (const u8 *)""; size = 0; }
+    for (int i = 0; i < g_app_count; i++) {
+        const char *n = g_apps[i].name;
+        if (!n || !g_apps[i].on_create) continue;
+        if (n[0]=='e' && n[1]=='d' && n[2]=='i' && n[3]=='t' &&
+            n[4]=='o' && n[5]=='r' && n[6]==0) { id = i; break; }
+    }
+    if (id < 0) {
+        slog("fileman: editor missing");
+        return;
+    }
+    launch_app(id);
+    for (int i = 0; i < g_win_count; i++) {
+        if (g_windows[i].app_id == id && g_windows[i].visible) { found = 1; break; }
+    }
+    if (!found) return;
+
+    s = (editor_state *)ADDR_EDWIN;
+    if (size > cap) size = cap;
+    s->text_len = 0;
+    for (u32 k = 0; k < size && s->text_len < (int)cap; k++) {
+        char c = (char)data[k];
+        if (c == '\r') continue;
+        if ((unsigned char)c >= 32 || c == '\n' || c == '\t')
+            s->text[s->text_len++] = c;
+    }
+    s->text[s->text_len] = 0;
+    s->cursor_pos = 0;
+    s->cursor_line = 0;
+    s->cursor_col = 0;
+    s->scroll_y = 0;
+    s->modified = 0;
+    s->has_file = 0;
+    s->disp[0] = 0;
+
+    for (int k = 0; disp[k]; k++) {
+        if ((unsigned char)disp[k] < 32 || (unsigned char)disp[k] > 126) ascii = 0;
+    }
+    for (int i = 0; i < g_win_count; i++) {
+        desktop_window *w = &g_windows[i];
+        int p = 0;
+        const char *prefix = "Editor";
+        if (w->app_id != id || !w->visible) continue;
+        while (prefix[p] && p < 46) { w->title[p] = prefix[p]; p++; }
+        if (ascii && disp[0]) {
+            const char *sep = " - ";
+            while (*sep && p < 46) w->title[p++] = *sep++;
+            for (int k = 0; disp[k] && p < 47; k++) w->title[p++] = disp[k];
+        }
+        w->title[p] = 0;
+        w->dirty = 1;
+    }
+}
+
 /* ============================================================
  *  计算器 (Calculator)
  * ============================================================ */

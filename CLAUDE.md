@@ -85,8 +85,21 @@ SYSTEM/
 SYSTEM/driver/manifest.json
     内核启动驱动模块清单，控制 ELF .drv 驱动的分阶段加载。
 
+SYSTEM/STARTMENU.CNF
+    M3 开始菜单注册表（FAT32 根目录，desktop 启动时解析）。
+    格式 NAME|显示名|path|args；path 支持 builtin:<name> / program/xxx.exe（GUI PE，
+    g++ 编译，run_windowed 嵌入桌面）/ bin/xxx.elf（ELF 工具，全屏加载）/
+    /guest/path（Linux guest 应用）。显示名可 UTF-8 中文；文件缺失时回退全部已注册应用。
+    纯 CLI exe（bin/pciscan.exe、bin/portio.exe）不入菜单——在 CMD 里敲名字运行，
+    输出走串口。源码在 CODE/tools/pe-tools/（build.ps1 用 mingw-w64 g++ 编译），
+    ELF 工具源码在 CODE/tools/diskinfo/（→ SYSTEM/bin/diskinfo.elf）。
+
+SYSTEM/program/ + SYSTEM/bin/ + SYSTEM/lib/ + PEAPPS.CNF + LINUXAPP.CNF + STARTMENU.CNF
+    桌面 PE/工具链全部经 DSK FAT32 只读 ESP——pack_system_image.sh 会把这几项
+    额外拷到 FAT32 ESP（p1）。漏拷则开始菜单/PE 应用在 GPT 镜像里静默失效。
+
 SYSTEM/system/deshab64/FUCK
-    内核启动配置文件（INI 分区格式），控制启动行为开关、驱动加载开关、UTSM 算法参数、DSK 桌面行为。
+    内核启动配置文件（INI 分区格式），控制启动行为开关、驱动加载开关、UTSM 算法参数、DSK 桌面行为、panic 策略（[panic] mode=strict|fallback）。
     UTSM 通过 Limine boot module 预加载读取（cmdline="fuck:config")。
     DSK 通过 FAT32 子目录遍历读取（路径 "SYSTEM  /DESHAB64 /FUCK    ")。
     缺失或为空时使用硬编码默认值，行为与无配置文件时一致。
@@ -100,14 +113,18 @@ CODE/DKM/README.md
 CODE/UTSM/README.md
     UTSM 模块设计说明。
 
-RE/UTSM_算法记录.md
+docs/RE/UTSM_算法记录.md
     UTSM 核心算法记录。
 
-RE/UTSM_设计架构.md
+docs/RE/UTSM_设计架构.md
     UTSM 架构记录。
 
-RE/驱动模块ABI设计.md
-    DKM 驱动模块 ABI、kernel_api、ELF relocation、manifest、状态机和 boot module 方案。
+docs/RE/驱动模块ABI设计.md
+    DKM 驱动模块 ABI、kernel_api、ELF relocation、manifest、状态机、boot module 方案和服务总线 ABI（§8.5）。
+
+docs/RE/万物互联与服务总线设计.md
+    万物互联架构定稿：dkm_bus 按名服务总线（kern.*/srv.*）、dsk_boot_context 逐槽迁移表、
+    DSK 溶解地图、P0-P6 落地路线与错误码登记（BUS-E/DKM-E44..47/SESSION-E）。
 
 ISO/deshab.img
     build.ps1 将 SYSTEM 打包生成的 GPT 磁盘镜像，包含一个 FAT32 EFI System Partition。
@@ -136,11 +153,13 @@ SYSTEM/driver/ 存放 ELF .drv 驱动模块和 manifest.json。
 CODE/UTSM/README.md: 编译到 SYSTEM/boot/utsm.elf
 build.bat: 调用 build.ps1，透传参数（如 -Variant dev）。
 build.ps1: 编译 UTSM/DSK/工具/驱动，把整个 SYSTEM/ 打成 GPT(FAT32 ESP + ext4) 镜像：
-  - ISO/deshab-dev.img     开发者模式（dev_mode=1，自动跑 shell.elf 测试，调试全开，QEMU 验证选项）
-  - ISO/deshab-release.img 发布版（dev_mode=0，进桌面+登录，调试零开销，真机安全选项）
-  参数 -Variant dev|release|both（默认 both）。both 模式构建后恢复 SYSTEM 为 dev 配置。
-  配置模板在 build/configs/{dev,release}/（FUCK + firstInit.txt），打包前注入到 SYSTEM。
-ISO/run_qemu.bat: 用 QEMU + UEFI 固件启动 ISO/deshab-dev.img，串口输出到 stdio。
+  - ISO/deshab-dev.img      开发者模式（dev_mode=1，自动跑 shell.elf 测试，调试全开，QEMU 验证选项，panic=strict）
+  - ISO/deshab-release.img  发布版（dev_mode=0，进桌面+登录，调试零开销，真机安全选项，panic=fallback 即关闭 panic）
+  - ISO/deshab-realtest.img 真机测试版（release 同款真机选项 + 登录路径，panic=strict 即启用 panic）
+  参数 -Variant dev|release|realtest|both|all（默认 all = 三者；both = dev+release）。both/all 构建后恢复 SYSTEM 为 dev 配置。
+  配置模板在 build/configs/{dev,release,realtest}/（FUCK + firstInit.txt），打包前注入到 SYSTEM。
+  realtest/FUCK 由 release/FUCK 复制而来，仅头注释与 [panic] mode 不同；改 release 真机选项须同步 realtest。
+ISO/run_qemu.bat [dev|release|realtest]: 用 QEMU + UEFI 固件启动对应镜像（默认 dev），串口输出到 stdio。
 ISO/run_qemu_kvm.sh: 默认 12G 内存（Limine 会把 SYSTEM/boot 里的 rootfs 模块装进内存）。
 build.ps1 自动把 Git usr/bin 加入 PATH（sh.exe + mkdir），解决 make `mkdir -p` 在 cmd.exe 下失败的问题。
 ```
@@ -176,11 +195,12 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 
 当前 manifest 中 14 个外部 `.drv` 均已替换为真实 DKM 驱动并可加载执行。
 
-下一阶段优先路线（活跃路线 = `docs/ROADMAP_INSANE.md` 五期填补计划，任务编号 F/U/D/R/E；状态唯一来源 = `docs/STATUS.md`）：
+下一阶段优先路线（活跃路线 = **万物互联 P0-P6**（D6/D7，设计定稿 `docs/RE/万物互联与服务总线设计.md`）+ `docs/ROADMAP_INSANE.md` 五期填补计划，任务编号 F/U/D/R/E；状态唯一来源 = `docs/STATUS.md`）：
+0. **万物互联（D6/D7，当前最高优先）**: P0 manifest 依赖图强制 → P1 dkm_bus 双向服务总线（kern.*/srv.*）→ P2 fat32/ext4.drv 归位 → P3 加载器 FS 化 + stage4 + ps2mouse.drv → P4 六 app 模块 DKM 化（netman/shell/firstInit/login/desktop/cmd）→ P5 DSK 退役 + session.drv → P6 常驻调度 + 真 IRQ 输入。每 phase QEMU 验证后提交，进度见 STATUS.md 万物互联表。
 1. **一期 F 系列收尾**: F2 统一控制台后端（fbcon.h 抽象已落，panic 已用）。（F1 莲花 panic / F3 跨平台 Makefile / F4 boot 分级自检 / F5 skip_firstinit 已完成）
 2. **二期 U 系列**: ✅ 已完成（U1 UUID 表 / U2 Slow Path 真分支 / U3 @sealed 可选标记+linker .sealed section / U4 密文 dump / U5 RFC 8439 KAT）。chacha20 KAT 三方对拍通过（pycryptodome+官方向量+C），"间歇 FAIL" 确认为从未合并的幽灵缺陷。
-3. **三期 D 系列**: DKM 热卸载（引用计数）、裸机器码加载器、按名 API 导出表。（~~彩色日志~~ D4 已完成：驱动名 hash → 8 色 ANSI，FUCK color_log 开关，BOOTLOG 保持纯文本）
-4. **四期 R 系列收尾**: segment/system 级回滚验证、PCQ per-cpu 多核。（~~drr_emergency_pool_kb/drr_recovery_log_size 接线~~ R3b 已完成，运行期钳位验证 PASS）
+3. **三期 D 系列**: DKM 热卸载（引用计数）、裸机器码加载器、按名 API 导出表升级为服务总线（并入万物互联 P1）。（~~彩色日志~~ D4 已完成：驱动名 hash → 8 色 ANSI，FUCK color_log 开关，BOOTLOG 保持纯文本）
+4. **四期 R 系列收尾**: segment/system 级回滚验证、PCQ per-cpu 多核（多核在 P6 常驻调度之后排队）。（~~drr_emergency_pool_kb/drr_recovery_log_size 接线~~ R3b 已完成，运行期钳位验证 PASS）
 5. **五期 E 系列**: 启动莲花动画、假想时光键彩蛋、提交信息规范、风味 ISO。
 6. **工程债（Phase 存档遗留）**: vector allocator/MSI-X、NVMe 高位 BAR、virtio-net virtqueue、DKM 零 warning。
 
@@ -304,6 +324,11 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 - 每次只处理 **一个文件** 的 STUB→panic，改完输出：改动行号 + 剩余 STUB 计数。
 - 骨架允许"不接线"（无人调用的 skeleton 函数），但接线后行为必须是 panic。
 - 例外白名单（设计内双路径回退，允许非 panic）：APIC 自验失败回 PIC、块设备缺失回 boot module、KDE 回落 native、VMX/bzImage/kernel.krl 未配置跳过。新增白名单项必须改本文件并说明理由。
+- **panic 双模式（FUCK `[panic] mode=strict|fallback`，默认 strict）**：strict = 本规约原样执行。fallback = 全局白名单开关，用于真机/演示"带病看全貌"：
+  - UTSM `panic_full(sym,msg,NULL)` 只打 `[PANIC:FALLBACK]` + 错误码 + 命中计数后返回，调用点走紧随其后的备用路径（跳过该能力/驱动/段/页面）；DKM `kernel_api.panic` / `kern.log.panic` 同样返回驱动，驱动 init 返回非零。
+  - 模式经 `DSK_BOOT_FLAG_PANIC_FALLBACK (1<<4)` 下传，DSK/FirstInit/login/desktop 的 `*_fatal` 同样只留串口后返回；DSK ext4 内部 fatal 经 `__builtin_setjmp/longjmp` 中止本次操作 → 只用 FAT32 ESP。
+  - **永远停机（`panic_halt`，两种模式都不返回）**：CPU 异常（带 regs）、LA57 已启用（VMM-E11，4 级页表遍历会写坏内存）、DSK 跳转失败（VMM-E15）、panic 测试钩子（UTSM-E42）。
+  - 新增 panic 点必须保证 panic 调用后存在安全的继续路径（return 错误码 / continue / 置能力未就绪），否则改用 `panic_halt` 并登记到上一条。
 - 启动期能力证明（attest，CODE/UTSM/kernel/attest.c）：FUCK `[attest]` `require_<name>=1`（默认）而能力未就绪 → 交接 DSK 前 panic（莲花屏，错误码=该能力登记码）。`require_<name>=0` 豁免行是设计内白名单，仅限两类：① 该构建环境不可能具备（QEMU 无 wlan/嵌套 VMX）；② STATUS.md ⬜/🔶 未落地项（实现后逐项删除豁免行）。当前豁免清单见 build/configs/*/FUCK [attest]。
 
 ### 4. 自检命令（验收只认这个输出，不认自然语言保证）

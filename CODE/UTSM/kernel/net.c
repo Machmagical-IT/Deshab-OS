@@ -106,18 +106,22 @@ static int net_connect_impl(u32 index, const char *ssid, const char *password) {
     if (index >= g_net_device_count) return -2;
     const dkm_net_device_desc *dev = &g_net_devices[index];
     /* 严格错误策略：无线设备未提供关联回调 = 驱动后端未实现，零降级 panic */
-    if (!dev->connect)
+    if (!dev->connect) {
         panic_full("NET-E20 WLAN CONNECT NOT SUPPORTED",
                    "wireless netdev has no connect backend (native chip driver pending)", 0);
+        return -3;
+    }
     return dev->connect(dev->ctx, ssid, password);
 }
 
 static int net_disconnect_impl(u32 index) {
     if (index >= g_net_device_count) return -2;
     const dkm_net_device_desc *dev = &g_net_devices[index];
-    if (!dev->disconnect)
+    if (!dev->disconnect) {
         panic_full("NET-E21 WLAN DISCONNECT NOT SUPPORTED",
                    "wireless netdev has no disconnect backend (native chip driver pending)", 0);
+        return -3;
+    }
     return dev->disconnect(dev->ctx);
 }
 

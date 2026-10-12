@@ -16,6 +16,7 @@
 | DMA 物理页分配器 | ✅ | bitmap，低 4G 钳位 | e1000 DMA 根治记录 |
 | 页表映射接口（map/unmap） | ✅ | `kernel_api.mm_map_mmio` / `mm_unmap_mmio`（PCD\|PWT 独立窗口）；apic / ehci / xhci / nvme 四个驱动在用，含 BAR>4G 高位映射 | 串口 `BAR mapped via mm_map_mmio window` |
 | panic 统一兜底（F1） | ✅ | DEAICUP 莲花崩溃屏（ohMyLogo.png 内嵌，背景=图片背景色）+ panic_symbol + DRR 归档；CPU 异常/驱动 panic 统一入口 | `.build_tmp/panic_screen.png` + qemu_serial_f1logo2.log |
+| panic 双模式（FUCK `[panic] mode`） | ✅ | strict（默认，零降级）/ fallback（panic 点记 `[PANIC:FALLBACK]`+错误码+计数后走备用路径；经 `DSK_BOOT_FLAG_PANIC_FALLBACK` 下传 DSK/FirstInit/login/desktop/DKM）；CPU 异常/VMM-E11/VMM-E15/UTSM-E42 两模式均停机（`panic_halt`） | `.build_tmp/qemu_panic_strict.log`、`.build_tmp/qemu_panic_fallback.log`（attest 全 require=1：DRR-E31 hits=1 → DSK 收到 fallback → FirstInit） |
 | boot 分级自检（F4） | ✅ | `[boot] selftest=0\|1\|2`，5 项全过 BOOT-OK | `.build_tmp/qemu_serial_f1f4f5.log` |
 | 帧缓冲控制台抽象 fbcon（F2） | 🔶 | `include/utsm/fbcon.h`：像素/混合/填充/RGBA 图像/文本（panic 路径已用）；统一控制台后端 ⬜ | `CODE/UTSM/include/utsm/fbcon.h` |
 | 构建系统 | ✅ | Windows build.ps1 + 跨平台根 Makefile（Linux/macOS `make dev/release/realtest`，打包走 pack_system_image.sh）；macOS 缺 mkfs.ext4 时打包不可用 | `Makefile` |
@@ -73,6 +74,23 @@
 | DRR 回滚（R4） | 🔶 | page 级 + BLAKE2b keyed 页 MAC ✅；segment/system 级待验证 | M4 QEMU 日志 |
 | DRR 看门狗（R2） | ✅ | timeout 检出→回滚/复位；负向测试 PASS | M4 QEMU 日志 |
 | Emergency Pool（R3） | ✅ | 64KB 编译期独立池；`drr_emergency_pool_kb`/`drr_recovery_log_size` FUCK 接线 ✅（运行期钳位） | `.build_tmp/qemu_serial_r3b.log` |
+
+## 万物互联（DKM-BUS / D6-D7，2026-10-10 立项）
+
+> 设计定稿：[RE/万物互联与服务总线设计.md](./RE/万物互联与服务总线设计.md)。目标形态：没有主内核，一切皆 DKM 模块，模块间经按名服务总线（kern.\*/srv.\*）互联；DSK 退役；调度器常驻 + 真 IRQ 输入。
+
+| 项 | 状态 | 说明 | 证据 |
+|----|------|------|------|
+| P0 manifest 依赖图强制 | ⬜ | depends 校验 + 同 stage 不动点排序（DKM-E44/E47） | 设计文档 §4 |
+| P1 服务总线 dkm_bus | ⬜ | 双向注册-消费（BUS-E01..E05）、kern.* 播种、provider 上下文、provides 校验（DKM-E45）、/dev/services | 设计文档 §1 |
+| P2 fat32.drv 实装 + ext4.drv | ⬜ | srv.fs.fat32.* / srv.fs.ext4.*，DSK 文件系统能力归位 | 设计文档 §3 |
+| P3 加载器 FS 化 + stage4 + ps2mouse.drv | ⬜ | 模块可从 FS 加载（DKM-E46）、kern.dkm.load_by_name | 设计文档 §4 |
+| P4 应用模块 DKM 化（4a-4f） | ⬜ | netman/shell/firstInit/login/desktop/cmd 全部 .drv 化，reserved[] 消灭 | 设计文档 §2 |
+| P5 DSK 退役 + session.drv | ⬜ | 删 deshab.elf/dsk_loader.c/dsk_boot_context，会话排序变普通模块 | 设计文档 §3 |
+| P6 常驻调度 + 事件循环 + 真 IRQ | ⬜ | sched_enable 常驻、desktop 任务化、IRQ1/12 解屏蔽、kbd/mouse poll 服务 | 设计文档 §1.6 |
+
+**错误码登记**：BUS-E01..E05（总线注册/查找/注销违规）、DKM-E44..E48（依赖图/加载源/容量）、SESSION-E01..E03（会话排序模块）、TST-E34..E38（总线 selftest；TST-E01..E33 已被既有用例占用）——全部零降级 panic，详见设计文档 §5。
+**probe 型缺席白名单**（登记于 CLAUDE.md §3）：无块设备时 srv.fs.fat32.* 缺席 warn 跳过；FUCK `[drivers]` 关闭模块的服务缺席由消费方 probe 显式处理。
 
 ## 文档体系
 

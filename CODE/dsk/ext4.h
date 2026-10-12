@@ -2,6 +2,8 @@
  *
  * 严格错误策略：任何错误（挂载失败/feature 不支持/IO 失败/校验不符）
  * 一律经 fatal(sym) 整屏 panic 停机，错误码体系 FS-E1x / FS-E2x。
+ * panic fallback 模式（fatal 返回）：当前公开调用中止并返回 -1，ext4 置为
+ * 不可用，后续只走 FAT32 ESP。
  *
  * 支持范围（mkfs.ext4 由 pack_system_image.sh 以 -O
  * ^has_journal,^metadata_csum,^64bit,^resize_inode -b 4096 -I 256 创建）：
@@ -28,6 +30,11 @@ typedef int (*ext4_block_write_fn)(unsigned int index, ext4_u64 lba,
 int ext4_mount(ext4_block_read_fn rd, ext4_block_write_fn wr,
                void (*fatal)(const char *sym), void (*logl)(const char *s),
                void (*logh)(const char *p, ext4_u64 v));
+
+/* ext4_mount 选中的块设备号。FAT 必须读写同一块盘。 */
+unsigned int ext4_device_index(void);
+/* 已注册块设备个数。探测不会把“没有这块盘”记成读失败。 */
+void ext4_set_device_count(unsigned int count);
 
 /* 按路径读文件（"/system/deshab64/FUCK"），返回内部静态缓冲。
  * 任何失败 fatal。成功返回 0 并填充 out/size。 */

@@ -12,6 +12,7 @@ void dsm_load_by_manifest_ex(const ini_config *cfg);
 #define DSM_MAX_STAGES 4
 #define DSM_MAX_DEPENDS 4
 #define DSM_MAX_PROVIDES 4
+#define DSM_MAX_CAPS 128
 
 typedef struct dsm_driver_entry {
     char name[32];
@@ -24,6 +25,9 @@ typedef struct dsm_driver_entry {
     u32 provide_count;
     struct limine_file *boot_module;
     int loaded;
+    /* P0（万物互联）：终态标志——已加载/被 FUCK 关闭/模块缺失/加载失败，
+     * 不再是本轮不动点迭代的候选。resolved 但 !loaded 的驱动不登记 provides。 */
+    int resolved;
 } dsm_driver_entry;
 
 typedef struct dsm_stage_entry {
@@ -36,6 +40,119 @@ typedef struct dsm_stage_entry {
 
 static dsm_stage_entry g_stages[DSM_MAX_STAGES];
 static u32 g_stage_count;
+
+static int streq_static(const char *a, const char *b);
+
+/* ===================================================================
+ *  P0（万物互联）：DSM 依赖图强制
+ *
+ *  capability 集合 = 已成功加载驱动的 provides token 并集。
+ *  加载前校验 depends 全满足（miss → DKM-E44）；
+ *  同 stage 内按依赖不动点迭代（环 → DKM-E47）。
+ *  性能不是目标（多趟扫描），正确性第一——设计定稿见
+ *  docs/RE/万物互联与服务总线设计.md §1.5。
+ * =================================================================== */
+static char g_caps[DSM_MAX_CAPS][32];
+static u32 g_cap_count;
+
+static int dsm_capability_satisfied(const char *token) {
+    for (u32 i = 0; i < g_cap_count; i++) {
+        if (streq_static(g_caps[i], token)) return 1;
+    }
+    return 0;
+}
+
+static void dsm_capability_add(const char *token) {
+    if (dsm_capability_satisfied(token)) return;
+    if (g_cap_count >= DSM_MAX_CAPS) {
+        panic_full("DKM-E48 CAPABILITY TABLE FULL",
+                   "P0 dependency graph: g_caps overflow (DSM_MAX_CAPS)", 0);
+        return;
+    }
+    for (u32 i = 0; i + 1 < 32 && token[i]; i++) {
+        g_caps[g_cap_count][i] = token[i];
+    }
+    g_caps[g_cap_count][31] = 0;
+    g_cap_count++;
+}
+
+static void dsm_register_provides(const dsm_driver_entry *drv) {
+    for (u32 i = 0; i < drv->provide_count; i++) {
+        dsm_capability_add(drv->provides[i]);
+    }
+}
+
+/* P1（万物互联）：stage>=4 的 provides 总线契约校验——driver_init 成功后，
+ * 每个 provides token T 必须已有 "srv.T" 或 "srv.T.*" 服务注册到总线，
+ * 否则 DKM-E45（零降级：provides 是对消费者/排序者的承诺，注册不到即违约）。
+ * stage0-3 老 14 驱动豁免：其 provides 由内核注册表兑现（ahci→block
+ * registry 等），不经总线。豁免清单 = manifest.json 现有 stage0-3 全部条目。 */
+static void dsm_verify_provides(const dsm_stage_entry *stage, const dsm_driver_entry *drv) {
+    if (stage->id < 4) return;
+    for (u32 i = 0; i < drv->provide_count; i++) {
+        char srv_name[40];
+        const char *token = drv->provides[i];
+        srv_name[0] = 's'; srv_name[1] = 'r'; srv_name[2] = 'v'; srv_name[3] = '.';
+        u32 p = 4;
+        while (token[p - 4] && p + 1 < sizeof(srv_name)) {
+            srv_name[p] = token[p - 4];
+            p++;
+        }
+        srv_name[p] = 0;
+        if (!dkm_bus_prefix_registered(srv_name)) {
+            log_error("[DSM] provides token not registered on bus: ");
+            log_info(drv->name);
+            log_info(token);
+            panic_full("DKM-E45 PROVIDES NOT REGISTERED",
+                       "stage>=4 driver provides token has no matching srv.* bus service", 0);
+        }
+    }
+}
+
+/* depends 全满足返回 1；否则返回 0 并（可选）写出第一个未满足 token 的下标 */
+static int dsm_deps_satisfied(const dsm_driver_entry *drv, u32 *missing_idx) {
+    for (u32 i = 0; i < drv->depend_count; i++) {
+        if (!dsm_capability_satisfied(drv->depends[i])) {
+            if (missing_idx) *missing_idx = i;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* token 是否由本 stage 尚未 resolved 的候选提供（用于区分缺依赖 vs 成环） */
+static int dsm_dep_pending_in_stage(const dsm_stage_entry *stage, const char *token) {
+    for (u32 di = 0; di < stage->driver_count; di++) {
+        const dsm_driver_entry *drv = &stage->drivers[di];
+        if (drv->resolved) continue;
+        for (u32 i = 0; i < drv->provide_count; i++) {
+            if (streq_static(drv->provides[i], token)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* 不动点停滞：先判真缺依赖（DKM-E44），全在剩余候选里则判环（DKM-E47）。
+ * 零降级：两者都是编程/manifest 错误，莲花屏。 */
+static void dsm_report_dependency_stall(const dsm_stage_entry *stage) {
+    for (u32 di = 0; di < stage->driver_count; di++) {
+        const dsm_driver_entry *drv = &stage->drivers[di];
+        if (drv->resolved) continue;
+        for (u32 i = 0; i < drv->depend_count; i++) {
+            const char *dep = drv->depends[i];
+            if (!dsm_capability_satisfied(dep) && !dsm_dep_pending_in_stage(stage, dep)) {
+                log_error("[DSM] dependency not satisfied: ");
+                log_info(drv->name);
+                log_info(dep);
+                panic_full("DKM-E44 DEPENDENCY NOT SATISFIED",
+                           "manifest depends token not provided by any loaded/pending driver", 0);
+                return;
+            }
+        }
+    }
+    panic_full("DKM-E47 DEPENDENCY CYCLE",
+               "manifest stage dependency graph has a cycle (no progress)", 0);
+}
 
 extern volatile struct limine_module_request g_module_request;
 
@@ -136,6 +253,7 @@ static void dsm_parse_driver(const char **p, dsm_driver_entry *drv) {
     drv->required = 1;
     drv->boot_module = 0;
     drv->loaded = 0;
+    drv->resolved = 0;
     drv->class_id = 0;
 
     if (dsm_expect(p, '{') != 0) return;
@@ -345,70 +463,115 @@ static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max
         log_info(stage->name);
         log_hex64("[DSM] driver count=", stage->driver_count);
 
+        /* P0：同 stage 内按依赖不动点迭代——每趟加载 deps 已满足的候选，
+         * 直到全部 resolved；停滞即 DKM-E44/E47（见 dsm_report_dependency_stall）。
+         * 多趟扫描 O(n²·趟数)，性能刻意不管，正确性第一。 */
+        u32 pending = 0;
         for (u32 di = 0; di < stage->driver_count; di++) {
-            dsm_driver_entry *drv = &stage->drivers[di];
-            struct limine_file *f;
-            struct dkm_symbol_scan symbols;
-            int result;
+            if (!stage->drivers[di].resolved) pending++;
+        }
 
-            if (drv->loaded) continue;
+        while (pending > 0) {
+            u32 pending_before = pending;
 
-            /* === FUCK [drivers] 驱动开关检查 === */
-            if (cfg) {
-                int enabled = ini_get_bool(cfg, "drivers", drv->name, 1);
-                if (!enabled) {
-                    log_info("[DSM] driver disabled by FUCK: ");
+            for (u32 di = 0; di < stage->driver_count; di++) {
+                dsm_driver_entry *drv = &stage->drivers[di];
+                struct limine_file *f;
+                struct dkm_symbol_scan symbols;
+                int result;
+
+                if (drv->resolved) continue;
+
+                /* === FUCK [drivers] 驱动开关检查 ===
+                 * 关闭即退出候选（provides 不登记，依赖它的模块将 DKM-E44）。 */
+                if (cfg) {
+                    int enabled = ini_get_bool(cfg, "drivers", drv->name, 1);
+                    if (!enabled) {
+                        log_info("[DSM] driver disabled by FUCK: ");
+                        log_info(drv->name);
+                        drv->resolved = 1;
+                        pending--;
+                        continue;
+                    }
+                }
+
+                /* P0：depends 校验——暂不满足先跳过，等本 stage 后续候选登记
+                 * provides 后下一趟重试；整体停滞时统一判罚（零降级）。 */
+                if (!dsm_deps_satisfied(drv, 0)) continue;
+
+                drv->boot_module = dsm_find_boot_module(drv->path);
+                if (!drv->boot_module) {
+                    log_info("[DSM] module not found");
                     log_info(drv->name);
+                    drv->resolved = 1;
+                    pending--;
+                    if (drv->required && stage->required) {
+                        /* 严格错误策略插桩：required 驱动缺模块零降级（DKM-E04） */
+                        panic_full("DKM-E04 REQUIRED DRIVER MODULE MISSING",
+                                   "required driver boot module not found in manifest stage", 0);
+                        break;
+                    }
                     continue;
                 }
-            }
 
-            drv->boot_module = dsm_find_boot_module(drv->path);
-            if (!drv->boot_module) {
-                log_info("[DSM] module not found");
+                f = drv->boot_module;
+                log_info("[DSM] loading driver");
                 log_info(drv->name);
-                if (drv->required && stage->required) {
-                    /* 严格错误策略插桩：required 驱动缺模块零降级（DKM-E04） */
-                    panic_full("DKM-E04 REQUIRED DRIVER MODULE MISSING",
-                               "required driver boot module not found in manifest stage", 0);
-                    break;
+
+                if (dkm_check_elf64(f->address, f->size) != 0) {
+                    log_error("[DSM] ELF check failed");
+                    if (drv->required && stage->required) {
+                        panic_full("DKM-E05 REQUIRED DRIVER ELF INVALID",
+                                   "required driver boot module failed ELF64 check", 0);
+                    }
+                    drv->resolved = 1;
+                    pending--;
+                    continue;
                 }
-                continue;
+
+                if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
+                    log_error("[DSM] symbol scan failed");
+                    if (drv->required && stage->required) {
+                        panic_full("DKM-E06 REQUIRED DRIVER SYMBOL SCAN FAILED",
+                                   "required driver symbol scan failed", 0);
+                    }
+                    drv->resolved = 1;
+                    pending--;
+                    continue;
+                }
+
+                result = dkm_load_elf_rel(f->address, f->size, &symbols);
+                if (result != 0) {
+                    log_error("[DSM] load failed");
+                    if (drv->required && stage->required) {
+                        /* 严格错误策略插桩：required 驱动加载失败零降级（DKM-E07） */
+                        panic_full("DKM-E07 REQUIRED DRIVER LOAD FAILED",
+                                   "required driver relocation/load failed", 0);
+                    }
+                    drv->resolved = 1;
+                    pending--;
+                } else {
+                    drv->loaded = 1;
+                    drv->resolved = 1;
+                    pending--;
+                    /* P0：加载成功才登记 provides（disabled/missing/failed 一律不登记） */
+                    dsm_register_provides(drv);
+                    /* P1：stage>=4 provides 总线契约校验（DKM-E45） */
+                    dsm_verify_provides(stage, drv);
+                }
             }
 
-            f = drv->boot_module;
-            log_info("[DSM] loading driver");
-            log_info(drv->name);
-
-            if (dkm_check_elf64(f->address, f->size) != 0) {
-                log_error("[DSM] ELF check failed");
-                if (drv->required && stage->required) {
-                    panic_full("DKM-E05 REQUIRED DRIVER ELF INVALID",
-                               "required driver boot module failed ELF64 check", 0);
+            if (pending > 0 && pending == pending_before) {
+                /* 一整趟零进展：真缺依赖（DKM-E44）或依赖环（DKM-E47） */
+                dsm_report_dependency_stall(stage);
+                /* fallback：停滞的候选全部放弃（不登记 provides），结束本 stage */
+                for (u32 di = 0; di < stage->driver_count; di++) {
+                    if (stage->drivers[di].resolved) continue;
+                    log_warn("[DSM] fallback: driver skipped (unresolved deps): ");
+                    log_info(stage->drivers[di].name);
+                    stage->drivers[di].resolved = 1;
                 }
-                continue;
-            }
-
-            if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
-                log_error("[DSM] symbol scan failed");
-                if (drv->required && stage->required) {
-                    panic_full("DKM-E06 REQUIRED DRIVER SYMBOL SCAN FAILED",
-                               "required driver symbol scan failed", 0);
-                }
-                continue;
-            }
-
-            result = dkm_load_elf_rel(f->address, f->size, &symbols);
-            if (result != 0) {
-                log_error("[DSM] load failed");
-                if (drv->required && stage->required) {
-                    /* 严格错误策略插桩：required 驱动加载失败零降级（DKM-E07） */
-                    panic_full("DKM-E07 REQUIRED DRIVER LOAD FAILED",
-                               "required driver relocation/load failed", 0);
-                    break;
-                }
-            } else {
-                drv->loaded = 1;
+                pending = 0;
             }
         }
         log_info("[DSM] stage end");
@@ -419,7 +582,12 @@ void dsm_load_by_manifest_upto(const ini_config *cfg, u32 max_stage_id) {
     dsm_load_stage_range(cfg, 1, max_stage_id);
 }
 
-void dsm_load_named(const ini_config *cfg, const char *name) {
+/* 按名加载公共实现。strict_deps=1：depends 校验强制（DKM-E44）——供
+ * kern.dkm.load_by_name（万物互联 P3）等常规路径使用；
+ * strict_deps=0：顺序豁免版——唯一调用方是 kernel/main.c VMM 路径的
+ * pci+ahci 预加载（必须先于 apic/stage0，否则 guest 陷入 IDTR=0
+ * VM-exit 风暴，见 main.c 注释）。设计内顺序豁免，登记于设计文档 §6。 */
+static void dsm_load_named_impl(const ini_config *cfg, const char *name, int strict_deps) {
     if (!name || dsm_ensure_manifest() != 0) {
         /* 严格错误策略插桩：按名加载 manifest 缺失零降级（DKM-E11） */
         panic_full("DKM-E11 NAMED LOAD MANIFEST MISSING",
@@ -440,6 +608,14 @@ void dsm_load_named(const ini_config *cfg, const char *name) {
             if (cfg && !ini_get_bool(cfg, "drivers", drv->name, 1)) {
                 log_info("[DSM] driver disabled by FUCK: ");
                 log_info(drv->name);
+                return;
+            }
+            /* P0：按名加载同样强制依赖（此时无同 stage 重试机会，miss 即判罚） */
+            if (strict_deps && !dsm_deps_satisfied(drv, 0)) {
+                log_error("[DSM] named driver dependency not satisfied: ");
+                log_info(drv->name);
+                panic_full("DKM-E44 DEPENDENCY NOT SATISFIED",
+                           "dsm_load_named: depends token not provided by any loaded driver", 0);
                 return;
             }
             drv->boot_module = dsm_find_boot_module(drv->path);
@@ -477,6 +653,11 @@ void dsm_load_named(const ini_config *cfg, const char *name) {
                 return;
             }
             drv->loaded = 1;
+            drv->resolved = 1;
+            /* P0：按名加载成功同样登记 provides */
+            dsm_register_provides(drv);
+            /* P1：stage>=4 provides 总线契约校验（DKM-E45） */
+            dsm_verify_provides(stage, drv);
             return;
         }
     }
@@ -485,6 +666,14 @@ void dsm_load_named(const ini_config *cfg, const char *name) {
     /* 严格错误策略插桩：named 驱动不在 manifest 零降级（DKM-E16） */
     panic_full("DKM-E16 NAMED DRIVER NOT IN MANIFEST",
                "dsm_load_named: named driver not found in manifest", 0);
+}
+
+void dsm_load_named(const ini_config *cfg, const char *name) {
+    dsm_load_named_impl(cfg, name, 1);
+}
+
+void dsm_load_named_boot(const ini_config *cfg, const char *name) {
+    dsm_load_named_impl(cfg, name, 0);
 }
 
 void dsm_load_by_manifest_ex(const ini_config *cfg) {

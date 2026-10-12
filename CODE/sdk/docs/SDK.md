@@ -381,6 +381,47 @@ int driver_exit(dkm_driver_handle *handle) {
 
 如需 bootloader 预加载（stage0/stage1），还需在 `SYSTEM/boot/limine.conf` 添加 `module_path`。
 
+### 4.6 服务总线（dkm_bus · D6 万物互联）
+
+模块间通信不再走 `dsk_boot_context.reserved[]` 硬偏移，统一经 `api->bus` 按名注册-消费。**driver_init 里注册服务是模块的立身之本**：
+
+```c
+/* ---- 提供方：在 driver_init 里注册 ---- */
+static const mouse_state_t *mouse_poll_fn(void) { return &g_mouse_state; }
+
+int driver_init(const dkm_kernel_api *api, dkm_driver_handle *handle) {
+    /* ... 硬件初始化 ... */
+    /* 注册服务：名字必须 srv. 前缀，version 是你的契约版本 */
+    api->bus->register_service("srv.input.mouse.poll", 1, (void *)mouse_poll_fn);
+    return 0;
+}
+
+/* ---- 消费方：lookup（硬依赖，缺席即 panic 莲花屏） ---- */
+void *fn; u32 ver;
+api->bus->lookup("srv.input.mouse.poll", &fn, &ver);
+const mouse_state_t *(*poll)(void) = (const mouse_state_t *(*)(void))fn;
+
+/* ---- 消费方：probe（可选能力，缺席返回 -1 自己处理） ---- */
+if (api->bus->probe("srv.fs.ext4.read", &fn, &ver) != 0) {
+    /* 无 ext4 服务——走设计内回退路径 */
+}
+```
+
+**命名空间**：`kern.*` 仅内核可注册（log/dma/irq/mm/apic/drr/block/pe/lxc/config/load_by_name 等 22 条起步）；`srv.*` 仅模块可注册。
+
+**失败策略（零降级铁律）**：
+
+| 操作 | 失败时 | 语义 |
+|------|--------|------|
+| `register_service` 名字非法/重名/表满 | BUS-E01/E02/E03 panic | 编程错误 |
+| `lookup` 未命中 | BUS-E04 panic | 硬依赖未满足=编程错误 |
+| `probe` 未命中 | 返回 -1 | 能力缺席=设计内双路径 |
+| `unregister_service` 违规 | BUS-E05 panic | 生命周期违规 |
+
+**"运行"也是服务**：长期模块把主循环入口注册为 `srv.<mod>.run`，由会话排序者（session.drv）按总线调用拉起。
+
+完整设计见 [docs/RE/万物互联与服务总线设计.md](../../../docs/RE/万物互联与服务总线设计.md)。
+
 ---
 
 ## 5. 头文件索引

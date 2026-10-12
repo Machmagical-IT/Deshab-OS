@@ -50,8 +50,8 @@ static void load_fuck_config(void) {
         slog("[cfg] FUCK not found, defaults");
         return;
     }
-    /* 逐行找 [desktop] 段的 fluent= 键 */
-    int in_dsk = 0;
+    /* 逐行找 [desktop] 段的 fluent= 键；[prank] 段交给 prank_config_line */
+    int in_dsk = 0, in_prank = 0;
     u32 pos = 0;
     while (pos < size) {
         u32 eol = pos;
@@ -62,6 +62,11 @@ static void load_fuck_config(void) {
             if (len > 1 && line[0] == '[') {
                 in_dsk = (len >= 9 && line[1] == 'd' && line[2] == 's' &&
                           line[3] == 'k' && line[4] == ']');
+                in_prank = (len >= 7 && line[1] == 'p' && line[2] == 'r' &&
+                            line[3] == 'a' && line[4] == 'n' && line[5] == 'k' &&
+                            line[6] == ']');
+            } else if (in_prank) {
+                prank_config_line(line, (int)len);
             } else if (in_dsk && len >= 7 &&
                        line[0]=='f' && line[1]=='l' && line[2]=='u' &&
                        line[3]=='e' && line[4]=='n' && line[5]=='t' && line[6]=='=') {
@@ -134,9 +139,16 @@ static void crossfade_login_to_desktop(void) {
  *  每个插桩点唯一 symbol（DESK-E<nn>）。
  * ============================================================ */
 
+/* DSK_BOOT_FLAG_PANIC_FALLBACK：desktop_fatal 只留串口坐标后返回，调用点走备用路径 */
+static int g_panic_fallback;
+
 static void desktop_fatal(const char *sym) {
     /* 严格错误策略：串口留档 + 深红 fatal 屏（ASCII 18px 直写真实 fb）+ 停机 */
     slog(sym);
+    if (g_panic_fallback) {
+        slog("[FALLBACK] fatal point hit, taking backup path");
+        return;
+    }
     if (g_real_fb && g_fb_w && g_fb_h) {
         u32 *fb = (u32 *)g_real_fb;
         u64 pitch_u32 = g_fb_pitch / 4;
@@ -176,8 +188,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
         desktop_fatal("DSK-E01-BADCONTEXT");
+        return;   /* fallback 不可达（无上下文 = 标志位读不到，按 strict 停机） */
     }
     g_boot_ctx = ctx;
+    g_panic_fallback = (ctx->flags & DSK_BOOT_FLAG_PANIC_FALLBACK) ? 1 : 0;
 
     g_fb_addr = ctx->framebuffer_address;
     g_fb_w = ctx->framebuffer_width;
@@ -227,11 +241,16 @@ void dsk_entry(const dsk_boot_context *ctx) {
         } else {
             slog_num("[zhfont] dbf load failed rc=", zrc);
             desktop_fatal("DESK-E04 FONT PACK MISSING");
+            /* fallback：中文字形缺失时 zhfont 画空框占位，ASCII 正常 */
         }
     }
 
     /* M2: FUCK 配置（[desktop] fluent=）→ 壁纸初始化（Fluent 路径需要） */
     load_fuck_config();
+    if (g_prank_enabled) {
+        slog(g_prank_boot_demo > 0 ? "[cfg] prank enabled (boot demo on)"
+                                   : "[cfg] prank enabled");
+    }
     if (g_fluent) {
         int wrc = wallpaper_init(f32_read_path_lfn_to_w, (int)g_fb_w, (int)g_fb_h);
         if (wrc == 0) {
@@ -240,15 +259,17 @@ void dsk_entry(const dsk_boot_context *ctx) {
             slog_num("[wallpaper] load failed rc=", wrc);
             /* 严格错误策略：材质包（壁纸）缺失不降级，fatal 屏 + 错误码 */
             desktop_fatal("DESK-E02 TEXTURE PACK MISSING");
+            g_fluent = 0;   /* fallback：回落经典（非 Fluent）桌面 */
         }
         /* M2: 开始菜单 logo（textures/startMenuLogo.rgba → 0x8700000） */
-        if (taskbar_init(f32_read_path_lfn_to_w) == 0)
+        if (g_fluent && taskbar_init(f32_read_path_lfn_to_w) == 0)
             slog("[taskbar] startMenu logo loaded");
-        else {
+        else if (g_fluent) {
             /* 严格错误策略：材质包（开始菜单 logo）缺失不降级 */
             desktop_fatal("DESK-E03 STARTMENU LOGO MISSING");
+            g_fluent = 0;   /* fallback：回落经典（非 Fluent）桌面 */
         }
-        g_page = 3;   /* Fluent 默认进 DESKTOP 页 */
+        if (g_fluent) g_page = 3;   /* Fluent 默认进 DESKTOP 页 */
     }
 
     tsc_calibrate();
@@ -292,6 +313,8 @@ void dsk_entry(const dsk_boot_context *ctx) {
     g_booted = 1;
 
     slog("desktop ready");
+    /* 整蛊系统：开机进桌面后按 FUCK [prank] boot_demo_sec 串烧演示一遍 */
+    prank_boot_demo_start();
     desktop_launch_pending_native();
 
     /* 主事件循环 */
@@ -302,6 +325,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
     while (!g_quit) {
         int need_redraw = 0;
         int moved = 0;
+
+        /* 整蛊系统：推进调度；可视类整蛊播放期间强制全屏重绘 */
+        prank_tick();
+        if (prank_wants_redraw()) need_redraw = 1;
 
         /* P8.1: 自动启动测试（先 ping guest，不可用直接报告，不浪费 3s 等待） */
         if (g_tsc_per_sec && g_autotest_state == 0) {
@@ -403,7 +430,8 @@ void dsk_entry(const dsk_boot_context *ctx) {
             u8 st = inb(0x64);
             if (!(st & 1) || (st & 0x20)) break;
             u8 sc = inb(0x60);
-            if (handle_key(sc)) need_redraw = 1;
+            /* 整蛊"打字乱码"：按键可打印码被随机重映射（特殊键/释放码放行） */
+            if (handle_key(prank_filter_key(sc))) need_redraw = 1;
         }
 
         /* RTC 秒 tick：DASHBOARD 状态栏时钟/UP 计时刷新 */

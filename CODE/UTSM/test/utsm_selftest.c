@@ -284,6 +284,52 @@ int utsm_selftest_run(void) {
         log_info("[UTSM] selftest kapi ok");
     }
 
+    /* ==== D6 万物互联：dkm_bus 双向服务总线 ====
+     * 覆盖：表存在/magic、kern.* lookup 命中、probe 命中与缺席、
+     * 内核侧非法注册（BUS-E01/E02 走 panic——selftest 只能验证合法路径，
+     * 违规路径由负向测试专用构建验证）。 */
+    {
+        const dkm_kernel_api *api = dkm_get_kernel_api();
+        if (!api->bus || api->bus->magic != DKM_BUS_MAGIC) {
+            log_error("[UTSM] selftest bus table missing");
+            panic_full("TST-E34 BUS TABLE MISSING",
+                       "utsm_selftest: bus api missing or bad magic", 0);
+            return UTSM_ERR_INVALID;
+        }
+        /* kern.* 播种命中：lookup（必存在语义） */
+        void *fn = 0;
+        u32 ver = 0;
+        if (api->bus->lookup("kern.log.info", &fn, &ver) != 0 || !fn) {
+            log_error("[UTSM] selftest bus kern.log.info lookup failed");
+            panic_full("TST-E35 BUS KERN LOOKUP FAILED",
+                       "utsm_selftest: bus lookup kern.log.info failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        /* probe 命中（可选语义正例） */
+        if (api->bus->probe("kern.block.read", &fn, &ver) != 0 || !fn) {
+            log_error("[UTSM] selftest bus kern.block.read probe failed");
+            panic_full("TST-E36 BUS KERN PROBE FAILED",
+                       "utsm_selftest: bus probe kern.block.read failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        /* probe 缺席（可选语义负例：返回 -1，不 panic） */
+        if (api->bus->probe("srv.no.such.thing", &fn, &ver) == 0) {
+            log_error("[UTSM] selftest bus probe negative failed");
+            panic_full("TST-E37 BUS PROBE NEGATIVE FAILED",
+                       "utsm_selftest: probe of absent service unexpectedly hit", 0);
+            return UTSM_ERR_INVALID;
+        }
+        /* 服务数合理（P1 播种 22 条；后续 phase 只增不减） */
+        if (api->bus->count() < 22) {
+            log_error("[UTSM] selftest bus seed count too low");
+            panic_full("TST-E38 BUS SEED COUNT LOW",
+                       "utsm_selftest: bus seeded service count below minimum", 0);
+            return UTSM_ERR_INVALID;
+        }
+        log_hex64("[UTSM] selftest bus services=", api->bus->count());
+        log_info("[UTSM] selftest bus ok");
+    }
+
     /* ==== SCHED-1: O(1) runqueue 语义（合成 TCB，协作式，无 tick） ==== */
     /* ==== SCHED-1 + SCHED-2: runqueue / block-wake（tick 竞态保护） ==== */
     {

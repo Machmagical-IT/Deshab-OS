@@ -378,6 +378,7 @@ void drr_driver_recovery_dispatch(const dkm_driver_recovery_ops *ops, void *drv)
     if (!ops) {
         panic_full("DRR-E06 DRIVER RECOVERY OPS MISSING",
                    "driver did not provide dkm_driver_recovery_ops", 0);
+        return;
     }
     panic_full("DRR-E07 DRIVER RECOVERY NOT IMPLEMENTED",
                "quiesce/reset/reinit dispatch: designed (DKM README), not implemented", 0);

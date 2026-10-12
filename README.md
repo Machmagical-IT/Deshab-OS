@@ -1,10 +1,12 @@
 # Deshab-OS
-
+# 致力于打造极差的用户体验
 > 实验内核 · QEMU 可启动演示 · 非生产系统
 
 Deshab-OS 是一个从零编写的独立 64 位操作系统，基于 x86_64 long mode，采用单地址空间 Ring0（SAS-R0）内核架构，配套封缄内存（UTSM）、专用恢复根（DRR）与可加载驱动模块系统（DKM）。
 
-当前已完成可启动的实验内核闭环：Limine 引导 → UTSM 首阶段内核 → 14 个 DKM 驱动加载 → DSK 主内核 → 桌面/登录/向导。
+当前已完成可启动的实验内核闭环：Limine 引导 → UTSM 首阶段内核 → DKM 驱动加载 → DSK 主内核 → 桌面/登录/向导。
+
+**进行中的大改造（万物互联 / D6-D7）**：正在把系统从"UTSM→DSK→app"层级结构改造成**没有主内核**的形态——一切（文件系统、向导、登录、桌面、shell）皆平等 DKM 内核模块，模块间只经**按名服务总线**（`kern.*` / `srv.*` 注册-消费）互联，DSK 将退役，调度器转常驻。设计定稿见 [万物互联与服务总线设计](docs/RE/万物互联与服务总线设计.md)，P0-P6 六阶段逐步落地（进度见 [TASKBOARD.md](docs/TASKBOARD.md)）。
 
 ## 项目特质
 
@@ -25,7 +27,9 @@ SAS-R0-PCQ  单地址空间 Ring0 + Per-CPU O(1) 位图调度器（当前 BSP-on
 UTSM        UUID 调谐封缄内存（明文须经 UTRW 读写器）
 UTRW        带标记读写器（Fast/Slow Path ✅，RFC 8439 KAT 对拍）
 DRR         专用恢复根（看门狗 / checkpoint / A-B 回滚 / 独立 Emergency Pool）
-DKM         驱动模块系统（ELF64 .drv ABI，4 stage 分阶段加载）
+DKM         驱动模块系统（ELF64 .drv ABI，分 stage 加载，manifest depends 依赖图强制）
+DKM-BUS     按名服务总线（kern.* / srv.* 双向注册-消费）——万物互联的神经，
+            目标形态：没有主内核，一切皆内核模块（进行中，见设计文档）
 ```
 
 ## 项目状态
@@ -39,6 +43,7 @@ DKM         驱动模块系统（ELF64 .drv ABI，4 stage 分阶段加载）
 | AHCI / e1000 / FAT32 写盘 | ✅ |
 | NVMe / virtio-net / FAT32 完整路径 | 🔶 |
 | PCQ 调度器 / DRR 恢复根 | ✅（BSP-only / 演示级） |
+| 万物互联改造（服务总线 / 应用 DKM 化 / DSK 退役） | 🔶 P0-P6 进行中，见 [设计文档](docs/RE/万物互联与服务总线设计.md) |
 | 五期填补计划进度 | 一期二期全勾，见 [docs/TASKBOARD.md](docs/TASKBOARD.md) |
 
 ### 已知边界（Non-Goals）
@@ -52,6 +57,7 @@ DKM         驱动模块系统（ELF64 .drv ABI，4 stage 分阶段加载）
 | 文档 | 内容 |
 |------|------|
 | [STATUS.md](docs/STATUS.md) | **单一状态源**（全子系统三色表 + 证据） |
+| [万物互联与服务总线设计.md](docs/RE/万物互联与服务总线设计.md) | 万物互联架构：服务总线 / DSK 溶解 / P0-P6 路线 |
 | [ROADMAP_INSANE.md](docs/ROADMAP_INSANE.md) | 五期填补计划（F/U/D/R/E 唯一任务编号） |
 | [TASKBOARD.md](docs/TASKBOARD.md) | 可勾选任务表 |
 | [PHILOSOPHY.md](docs/PHILOSOPHY.md) | 疯圣典：矛盾美学与「疯但好使」物理学 |
