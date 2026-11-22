@@ -2,10 +2,10 @@
 # Inject KDE X11 session + shared Desktop icons into extra-rootfs (and rootfs).
 set -Eeuo pipefail
 ROOT="${1:-/mnt/d/Code/DEAICUP/Deshab}"
-EXTRA="${2:-$ROOT/SYSTEM/boot/linux-extra-rootfs.img}"
-ROOTFS="${3:-$ROOT/SYSTEM/boot/linux-rootfs.img}"
+EXTRA="${2:-$ROOT/SYSTEM/ESP/boot/linux-extra-rootfs.img}"
+ROOTFS="${3:-$ROOT/SYSTEM/ESP/boot/linux-rootfs.img}"
 GUEST="$ROOT/CODE/linux/guest"
-DESK="$ROOT/SYSTEM/user/desktop"
+DESK="$ROOT/SYSTEM/ESP/user/desktop"
 
 inject() {
     local img="$1"

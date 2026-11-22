@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 IMG="${1:-/mnt/d/Code/DEAICUP/Deshab/ISO/deshab-dev.img}"
 ROOT="${2:-/mnt/d/Code/DEAICUP/Deshab}"
-DSK="${ROOT}/SYSTEM/system/deshab64/deshab.elf"
-FUCK="${ROOT}/SYSTEM/system/deshab64/FUCK"
+DSK="${ROOT}/SYSTEM/ESP/system/deshab64/deshab.elf"
+FUCK="${ROOT}/SYSTEM/ESP/system/deshab64/FUCK"
 LOOP=$(losetup --find --show --partscan "$IMG")
 sleep 0.3
 M=$(mktemp -d)

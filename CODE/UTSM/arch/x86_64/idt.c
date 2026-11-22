@@ -409,12 +409,21 @@ static void pic_remap(void) {
 /* P1（万物互联）: kern.irq.unmask/mask 总线服务后端 —— PIC IMR 位操作。
  * 仅 ISA IRQ 0-15（越界 = 编程错误，IRQ-E01 零降级）。
  * unmask IRQ8-15 时自动放开主片 IRQ2 级联。
- * 注意 apic_route=1 时 PIC 已全屏蔽、由 IOAPIC 接管（B7）；该路径下
- * 的解屏蔽随 P6 真 IRQ 输入走 IOAPIC 重定向表接线。 */
+ * apic_route=1 时 PIC 已全屏蔽、由 IOAPIC 接管（B7）：此时再写 PIC IMR
+ * 会让同一根线经 LINT0/PIC 与 IOAPIC 双投递（P6b 实测：每次按键收到
+ * 两个扫描码）。EOI 钩子非空 = IOAPIC 路由已接管 → 保持 PIC 屏蔽，
+ * legacy 线由 apic_route_legacy 的重定向表条目负责放开。 */
+static void (*g_apic_eoi_hook)(void);   /* 定义在下方（B7 阶段2） */
+
 void pic_irq_unmask(u8 irq) {
     if (irq > 15) {
         panic_full("IRQ-E01 IRQ OUT OF RANGE",
                    "pic_irq_unmask: ISA IRQ range is 0-15", 0);
+        return;
+    }
+    if (g_apic_eoi_hook) {
+        log_info("[IDT] irq unmask delegated to IOAPIC routing (PIC stays masked)");
+        log_hex64("[IDT]   irq=", irq);
         return;
     }
     if (irq < 8) {
@@ -537,10 +546,27 @@ void idt_install_dsk_diag(void) {
 }
 
 void idt_install_pe_diag(void) {
-    /* 语义与 idt_install_dsk_diag 相同：BUG-20260801-005 起 DSK 交接
-     * 默认装备诊断 IDT，PE 原生执行前重装一次保持幂等（防御 PE 运行
-     * 期间 IDT 被第三方改写的场景）。 */
-    idt_install_dsk_diag();
+    /* PE 原生执行前恢复异常可见性（BUG-20260801-005 语义），但**只碰异常
+     * 向量 0-31，绝不覆盖 32-255 的 IRQ 向量**。
+     *
+     * 历史 bug（PE-E16）：本函数曾等价 idt_install_dsk_diag，把 32-255 全部
+     * 换成 isr_halt_stub。DSK 时代该不变式成立（DSK 交接后 IF=0、PIC 全
+     * mask，IRQ 不可能到达）。但 P6b 之后桌面是调度器任务、IF=1，LAPIC 调度
+     * tick 走动态向量 0x40 —— PE 一运行，第一个 tick 就落进 halt 桩执行
+     * cli;hlt，整机静默冻死（表现为"点 PE 应用后桌面无响应"）。
+     *
+     * 现在 0-31 仍走 isr_stub（异常完整日志 + 停机的既有路径）；32-255 保持
+     * 原位不动（调度 tick / IRQ1 键盘 / IRQ12 鼠标 / MSI 等继续正常投递）。
+     * PE 执行期间若能收到致命异常且需要 IDT 之外的手段，由 panic 原语负责；
+     * 这里不再制造"以冻死换诊断"的假保护。 */
+    for (u16 i = 0; i < 32; i++) {
+        idt_set_entry((u8)i, g_isr_table[i], 0, 0x8E);
+    }
+    idt_ptr idtr;
+    idtr.limit = (u16)(sizeof(g_idt) - 1);
+    idtr.base  = (u64)&g_idt;
+    __asm__ volatile("lidt %0" :: "m"(idtr));
+    log_info("[IDT] PE diag IDT installed (exc 0-31 logged, IRQ vectors kept live)");
 }
 
 /* IRQ handler table — 扩展到 256 个 vector (真机 APIC/IOAPIC/MSI 需要) */

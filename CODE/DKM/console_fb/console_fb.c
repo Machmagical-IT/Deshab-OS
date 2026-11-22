@@ -63,7 +63,8 @@ const struct dkm_driver_desc driver_desc = {
 /* ---------------------------------------------------------------
  * Colors
  * --------------------------------------------------------------- */
-static const u32 BG = 0xFFC8E0F0; /* light blue background — cleared before DSK Logo */
+/* 与引导器 splash 收尾、session Logo 底色相同，避免开机中途闪成浅蓝。 */
+static const u32 BG = 0xFF02002F;
 
 /* ---------------------------------------------------------------
  * Drawing helpers – all integer arithmetic, no soft-float
@@ -94,7 +95,14 @@ int driver_init(const struct dkm_kernel_api *api,
      * avoids firmware/UEFI leftover garbage being visible during the
      * UTSM→DSK handoff. */
     u32 *fb = (u32 *)api->fb_address;
-    fb_fill(fb, api->fb_pitch, api->fb_width, api->fb_height, BG);
+    /* 引导器收尾和内核 boot_status 已经把这屏涂成 #02002F 并写上
+     * 「我们正在初始化你的系统」。角点已是该颜色时不再整屏重填，
+     * 否则会把提示和转圈擦掉。角点不是这个颜色（固件残画面）才清屏。 */
+    {
+        u32 corner = fb[0] & 0x00FFFFFFu;
+        if (corner != 0x0002002Fu && corner != 0x002F0002u)
+            fb_fill(fb, api->fb_pitch, api->fb_width, api->fb_height, BG);
+    }
 
     api->log->info("[console_fb] ready");
     return 0;

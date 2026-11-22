@@ -181,4 +181,28 @@ void drr_set_reboot_enabled(int enabled);
  * DRR 独立性：对调度器只依赖这一个函数指针。 */
 void drr_set_sched_fault_cb(void (*cb)(u32 task_slot));
 
+/* ===================================================================
+ *  R4 扩展：segment / system 级 A/B 回滚闭环
+ *  （尾部追加，不动既有结构与语义）
+ * =================================================================== */
+
+/* segment 级回滚：从最近稳定 checkpoint（A/B recover，双槽皆坏按 §8.2
+ * 升级 drr_system_rollback）恢复指定段的全部快照页。逐页 CRC64 +
+ * keyed BLAKE2b 页 MAC 双校验，失败页所在段 POISONED（不 panic）。
+ * 无该段快照条目 → 段 POISONED，返回 -3。
+ * 返回恢复页数（>=0）；任一页校验失败返回 -2。 */
+int drr_rollback_segment(u32 seg_slot);
+
+/* system 级回滚（内存内全量恢复，可返回）：恢复快照区全部段的快照页。
+ * 双槽皆坏 / 任一页校验失败 → 升级 drr_system_rollback（8042 复位，
+ * 不返回）。成功返回恢复页数。与 drr_system_rollback()（最后手段复位）
+ * 是两级：先试内存恢复，恢复不了才真重启。 */
+int drr_rollback_system(void);
+
+/* selftest 专用钩子（非生产路径）：破坏指定 slot（0=A,1=B）的 metadata
+ * CRC，验证 drr_checkpoint_recover 的 fallback 路径。 */
+void drr_test_corrupt_slot(u32 slot);
+/* selftest 专用钩子（非生产路径）：读当前 active slot（0=A,1=B）。 */
+u32 drr_test_active_slot(void);
+
 #endif /* UTSM_DRR_H */

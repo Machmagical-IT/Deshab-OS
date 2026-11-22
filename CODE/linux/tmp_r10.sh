@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Symbolize 0xffffffff800669f0 (r10 in the GP fault dumps) + dump bytes there.
-E=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/boot/utsm.elf
+E=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/ESP/boot/utsm.elf
 nm -n "$E" > /tmp/syms2.txt
 python3 - <<'PY'
 t = 0xffffffff800669f0

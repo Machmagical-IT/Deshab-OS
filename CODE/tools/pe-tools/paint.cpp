@@ -122,7 +122,7 @@ static void frame(PT_Canvas *cv) {
 }
 
 int main(void) {
-    static u32 layer_mem[900 * 700];   /* 静态层：msvcrt malloc shim 可用，但静态最稳 */
+    static u32 layer_mem[704 * 512];   /* 静态层：700×(560-52)=700×508，留少量余量 */
     g_layer = layer_mem;
     PT_Desc d;
     d.w = 700; d.h = 560;

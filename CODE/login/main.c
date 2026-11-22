@@ -13,6 +13,11 @@
  */
 
 #include "../UTSM/include/utsm/dsk.h"
+#include "../DKM/dkm_shared.h"   /* P6b: dkm_kernel_api/dkm_bus_api 布局 */
+#include "../DKM/dkm_input.h"     /* P6b: srv.input.kbd/mouse.poll 客户端 */
+
+static dkm_input g_input;
+static int g_input_logged;
 
 /* 防篡改：linker 导出的 .text 段范围与预期哈希存储位置。
  * hidden 可见性强制 PIE 下用 lea rip 取址（基址无关），禁止走 GOT——
@@ -83,12 +88,13 @@ static void logl(const char *s) { swrite(s); swrite("\n"); }
 /* ---- Colors (dark theme matching FirstInit) ---- */
 #define BG_TOP    0xFF2D2D30u
 #define BG_BOTTOM 0xFF1A1A1Eu
-#define CARD_BG   0xFF353539u
-#define INPUT_BG  0xFF2A2A2Eu
-#define TEXT_FG   0xFFE0E0E0u
-#define ACCENT    0xFF5A8AC8u
-#define ERROR_FG  0xFFE05050u
-#define DIM_FG    0xFF808088u
+/* 浅色卡片风：卡片纯白 + 深色文字 + 浅灰输入框（登录卡片） */
+#define CARD_BG   0xFFFFFFFFu
+#define INPUT_BG  0xFFF0F0F0u
+#define TEXT_FG   0xFF1A1A1Au
+#define ACCENT    0xFF0067C0u
+#define ERROR_FG  0xFFC42B1Cu
+#define DIM_FG    0xFF6A6A6Au
 
 static u64 fb_a, fb_w, fb_h, fb_p;
 
@@ -137,15 +143,8 @@ static u64 lf_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
  *  必须整屏 fatal 显示错误码后停机。"疯但好使" 的反面保障：
  *  错也错得有落款。每个插桩点一个唯一 symbol（LOGIN-E<nn>）。
  * =================================================================== */
-/* DSK_BOOT_FLAG_PANIC_FALLBACK：login_fatal 只留串口坐标后返回，调用点走备用路径 */
-static int g_panic_fallback;
-
 static void login_fatal(const char *sym) {
     logl(sym);
-    if (g_panic_fallback) {
-        logl("[login:FALLBACK] fatal point hit, taking backup path");
-        return;
-    }
     if (fb_a) {
         u32 *fb = (u32 *)(u64)fb_a;
         fill_rect(fb, 0, 0, (i64)fb_w, (i64)fb_h, 0xFF3A0E14u);
@@ -320,9 +319,9 @@ static void draw_card(u32 *fb, i64 x, i64 y, i64 w, i64 h, u32 card) {
 
 static void draw_rounded_input(u32 *fb, i64 x, i64 y, i64 w, i64 h, const char *value, int mask, u32 fg, u32 card_bg, int active) {
     (void)card_bg;
-    u32 fill = active ? 0xFF45454Au : INPUT_BG;
+    u32 fill = active ? 0xFFDCE9F7u : INPUT_BG;
     fill_rounded_rect(fb, x, y, w, h, 2, fill);
-    stroke_rounded_rect(fb, x, y, w, h, 2, 1, active ? 0xFF6C6C72 : 0xFF404044);
+    stroke_rounded_rect(fb, x, y, w, h, 2, 1, active ? 0xFF0067C0u : 0xFFCFCFCFu);
     char out[80]; int i=0;
     while(value[i] && i<76) { out[i] = mask ? '*' : value[i]; i++; }
     out[i]=0;
@@ -340,8 +339,6 @@ static int g_mouse_btn = 0;
 static u32 g_cursor_bg[CURSZ * CURSZ];
 static int g_cursor_saved = 0;
 static int g_cursor_old_x = -1, g_cursor_old_y = -1;
-static u8 g_mouse_buf[3];
-static int g_mouse_idx = 0;
 
 /* 16×16 箭头光标（与 desktop 一致） */
 static const u8 cursor_shape[16][16] = {
@@ -429,17 +426,11 @@ static void cursor_draw(u32 *fb, int mx, int my) {
     }
 }
 
+/* P6b：鼠标状态经 srv.input.mouse.poll 取快照，绝对坐标转增量。 */
 static int ps2_mouse_poll(void) {
-    u8 st = inb(0x64);
-    if (!(st & 1)) return 0;
-    if (!(st & 0x20)) return 0;
-    u8 data = inb(0x60);
-    g_mouse_buf[g_mouse_idx++] = data;
-    if (g_mouse_idx < 3) return 0;
-    g_mouse_idx = 0;
-    if (!(g_mouse_buf[0] & 0x08)) return 0;
-    int dx = (int)(i8)g_mouse_buf[1];
-    int dy = -(int)(i8)g_mouse_buf[2];
+    int dx = 0, dy = 0;
+    u32 btns = 0;
+    if (!dkm_input_mouse_step(&g_input, &dx, &dy, &btns)) return 0;
     g_mouse_x += dx;
     g_mouse_y += dy;
     if (g_mouse_x < 0) g_mouse_x = 0;
@@ -447,7 +438,7 @@ static int ps2_mouse_poll(void) {
     if (g_mouse_x >= (int)fb_w - CURSZ) g_mouse_x = (int)fb_w - CURSZ;
     if (g_mouse_y >= (int)fb_h - CURSZ) g_mouse_y = (int)fb_h - CURSZ;
     int old_btn = g_mouse_btn;
-    g_mouse_btn = g_mouse_buf[0] & 0x03;
+    g_mouse_btn = (int)(btns & 0x03u);
     if (dx == 0 && dy == 0 && g_mouse_btn == old_btn) return 0;
     return 1;
 }
@@ -630,7 +621,7 @@ static int  g_is_encrypted;        /* 1 if conf buffer is XOR-encrypted */
 static void draw_login_card(u32 *fb, i64 card_x, i64 card_y, const char *pass, int active,
                             const char *msg, u32 msg_color, u32 fg) {
     u32 card = CARD_BG;
-    u32 sub_fg = 0xFF9098A0;
+    u32 sub_fg = 0xFF6A6A6Au;
     /* Background + card */
     cursor_restore_bg(fb);
     restore_wallpaper_rect(fb, card_x - 24, card_y - 24, CARD_W + 48, CARD_H + 48);
@@ -705,121 +696,19 @@ static int verify_password(const u8 *conf_buf, u32 conf_size, const char *passwo
     return 0;
 }
 
-/* ---- P8.2 Fix: PS/2 鼠标初始化（login 进入前 mouseInit 可能未运行） ----
- * release 版 is_first=0 路径中 DSK 不加载 mouseInit，login 需自行初始化鼠标
- * 端口轮询方能工作。与 mouseInit 同样的命令序列，但去掉 IRQ12 注册
- * （login 全程 cli，无需中断驱动）。单步失败只记日志，不阻塞登录。 */
-#define PS2_DATA    0x60
-#define PS2_STATUS  0x64
-#define PS2_CMD     0x64
-#define PS2_ST_OBF  0x01
-#define PS2_ST_IBF  0x02
-#define PS2_CMD_READ_CFG   0x20
-#define PS2_CMD_WRITE_CFG  0x60
-#define PS2_CMD_ENABLE_AUX 0xA8
-#define PS2_CMD_TO_MOUSE   0xD4
-#define MOUSE_CMD_RESET    0xFF
-#define MOUSE_CMD_DEFAULTS 0xF6
-#define MOUSE_CMD_RATE     0xF3
-#define MOUSE_CMD_RESOL    0xE8
-#define MOUSE_CMD_ENABLE   0xF4
-#define MOUSE_ACK          0xFA
-#define PS2_TIMEOUT 100000u
-
-static int ps2_wait_write(void) {
-    for (u32 t = 0; t < PS2_TIMEOUT; t++) {
-        if (!(inb(PS2_STATUS) & PS2_ST_IBF)) return 0;
-        __asm__ volatile("pause");
+/* ---- P6b：输入经服务总线（PS/2 初始化归 ps2mouse.drv）。
+ * kbd 缺席 = 无法登录 → INPUT-E01 零降级 panic（fallback 下返回 -1）。 ---- */
+static int input_open(const dsk_boot_context *ctx) {
+    const struct dkm_kernel_api *api =
+        (const struct dkm_kernel_api *)(u64)(ctx ? ctx->dkm_kernel_api : 0);
+    if (dkm_input_open(&g_input, api) != 0) {
+        logl("[login] srv.input.kbd.poll missing");
+        if (api && api->log) api->log->panic("INPUT-E01 KBD POLL SERVICE MISSING");
+        return -1;
     }
-    return -1;
-}
-static int ps2_wait_read(void) {
-    for (u32 t = 0; t < PS2_TIMEOUT; t++) {
-        if (inb(PS2_STATUS) & PS2_ST_OBF) return 0;
-        __asm__ volatile("pause");
-    }
-    return -1;
-}
-static void ps2_drain(void) {
-    for (int i = 0; i < 16; i++) {
-        if (!(inb(PS2_STATUS) & PS2_ST_OBF)) break;
-        inb(PS2_DATA);
-    }
-}
-static int ps2_cmd(u8 cmd) {
-    if (ps2_wait_write() != 0) return -1;
-    outb(PS2_CMD, cmd);
+    if (!g_input.mouse_poll)
+        logl("[login] srv.input.mouse.poll missing; mouse disabled");
     return 0;
-}
-static int mouse_cmd(u8 cmd) {
-    if (ps2_cmd(PS2_CMD_TO_MOUSE) != 0) return -1;
-    if (ps2_wait_write() != 0) return -2;
-    outb(PS2_DATA, cmd);
-    if (ps2_wait_read() != 0) return -3;
-    return inb(PS2_DATA) == MOUSE_ACK ? 0 : -4;
-}
-static int mouse_cmd_param(u8 cmd, u8 param) {
-    int rc = mouse_cmd(cmd);
-    if (rc != 0) return rc;
-    if (ps2_cmd(PS2_CMD_TO_MOUSE) != 0) return -5;
-    if (ps2_wait_write() != 0) return -6;
-    outb(PS2_DATA, param);
-    if (ps2_wait_read() != 0) return -7;
-    return inb(PS2_DATA) == MOUSE_ACK ? 0 : -8;
-}
-static void login_mouse_init(void) {
-    logl("[login] mouse init begin");
-
-    /* 1. 冲刷残留 */
-    ps2_drain();
-
-    /* 2. 启用 AUX 端口 */
-    {
-        u8 cfg = 0;
-        if (ps2_cmd(PS2_CMD_READ_CFG) == 0 && ps2_wait_read() == 0) {
-            cfg = inb(PS2_DATA);
-            cfg &= (u8)~0x20u;                 /* bit5=0: 启用 AUX 时钟 */
-            cfg |= 0x02u | 0x40u;              /* bit1=AUX IRQ, bit6=翻译 */
-            if (ps2_cmd(PS2_CMD_WRITE_CFG) == 0 && ps2_wait_write() == 0) {
-                outb(PS2_DATA, cfg);
-                logl("[login] cfg byte written");
-            } else {
-                logl("[login] cfg write failed, continue");
-            }
-        } else {
-            logl("[login] cfg read failed, continue");
-        }
-    }
-
-    /* 3. 启用 AUX 端口 */
-    if (ps2_cmd(PS2_CMD_ENABLE_AUX) != 0)
-        logl("[login] enable AUX timeout, continue");
-
-    /* 4. 复位鼠标 + drain 应答 */
-    {
-        int rc = mouse_cmd(MOUSE_CMD_RESET);
-        if (rc != 0) logl("[login] reset failed, continue");
-        for (int i = 0; i < 8; i++) {
-            if (ps2_wait_read() != 0) break;
-            inb(PS2_DATA);
-        }
-    }
-
-    /* 5-8. Set Defaults -> 采样率 100 -> 分辨率 2 -> 启用数据报告 */
-    {
-        int rc;
-        rc = mouse_cmd(MOUSE_CMD_DEFAULTS);
-        if (rc != 0) logl("[login] set defaults failed, continue");
-        rc = mouse_cmd_param(MOUSE_CMD_RATE, 100);
-        if (rc != 0) logl("[login] sample rate failed, continue");
-        rc = mouse_cmd_param(MOUSE_CMD_RESOL, 2);
-        if (rc != 0) logl("[login] resolution failed, continue");
-        rc = mouse_cmd(MOUSE_CMD_ENABLE);
-        if (rc != 0) logl("[login] enable reporting failed, continue");
-        else logl("[login] mouse data reporting enabled");
-    }
-
-    logl("[login] mouse init complete");
 }
 
 __attribute__((visibility("default")))
@@ -827,10 +716,7 @@ __attribute__((visibility("default")))
  * （image+0x1EAE10 附近）整体吸收进壁纸像素区，写零不再可见/有害。 */
 
 void dsk_entry(const dsk_boot_context *ctx) {
-    __asm__ volatile("cli");  /* prevent IRQ1 (ps2kbd) from racing with our polling */
     logl("[login] boot");
-    g_panic_fallback = (ctx && ctx->magic == 0x44534B31424F4F54ULL &&
-                        (ctx->flags & DSK_BOOT_FLAG_PANIC_FALLBACK)) ? 1 : 0;
 
     /* 防篡改：第一时间校验 .text 段完整性。失败 = 系统被篡改，严格 panic。
      * fallback：继续登录流程（密码校验仍生效）。 */
@@ -841,9 +727,6 @@ void dsk_entry(const dsk_boot_context *ctx) {
     logl("[login] calibrating TSC");
     tsc_calibrate_fi();
 
-    /* P8.2 Fix: 确保 PS/2 鼠标已初始化（非首次启动时 DSK 不加载 mouseInit） */
-    login_mouse_init();
-
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
         login_fatal("LOGIN-E02-BADCONTEXT");
         return;   /* fallback：无上下文无法登录，返回 DSK（视为未登录） */
@@ -853,6 +736,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
     fb_w = ctx->framebuffer_width;
     fb_h = ctx->framebuffer_height;
     fb_p = ctx->framebuffer_pitch;
+
+    /* P6b：输入经服务总线；IRQ1/IRQ12 已由 session.drv 解屏蔽。 */
+    if (input_open(ctx) != 0) return;
+    __asm__ volatile("sti" ::: "memory");
+    logl("[login] input: kbd+mouse via bus");
 
     logl("[login] framebuffer ready");
 
@@ -930,13 +818,12 @@ void dsk_entry(const dsk_boot_context *ctx) {
             cursor_draw(fb, g_mouse_x, g_mouse_y);
         }
 
-        u8 st = inb(0x64);
-        if (!(st & 1)) { __asm__("pause"); continue; }
-        /* 鼠标数据留给 ps2_mouse_poll 读取，不消费不丢弃 */
-        if (st & 0x20) { __asm__("pause"); continue; }
-        u8 data = inb(0x60);
-
-        u8 sc = data;
+        u8 sc;
+        if (!dkm_input_kbd(&g_input, &sc)) { __asm__("pause"); continue; }
+        if (!g_input_logged) {
+            g_input_logged = 1;
+            logl("[login] kbd event via srv.input.kbd.poll");
+        }
         /* Handle extended (E0) sequences — ignore (no arrow keys needed for login) */
         if (sc == 0xE0) { continue; }
         /* Handle release (F0 in Set 2, or high bit in Set 1) */
@@ -970,6 +857,38 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 continue;
             }
             logl("[login] verifying password");
+            /* 先给用户反馈再算：verify_password 是 SHA256 派生 + 解密比对，
+             * 慢环境下要几百毫秒，不提示会像卡死。
+             * 浮在登录卡片正中的独立提示层（不占用卡片本身的文案区）。
+             * 关键：先作废光标背景备份，否则光标下次 cursor_restore_bg()
+             * 会把浮层画上去之前的旧背景贴回来，在浮层上挖出一个洞。 */
+            {
+                g_cursor_saved = 0;
+                const char *tip = "Logging in...";
+                i64 tw = (i64)(sizeof("Logging in...") - 1) * ASCII_STEP;  /* 12 字符 */
+                i64 bw = tw + 56, bh = 56;
+                i64 bx = card_x + (CARD_W - bw) / 2;
+                i64 by = card_y + (CARD_H - bh) / 2;               /* 卡片正中 */
+                /* 半透明遮罩压暗底下的卡片（含阴影外扩 24px），再画提示框 */
+                for (i64 r = -24; r < CARD_H + 24; r++) {
+                    i64 yy = card_y + r;
+                    if (yy < 0 || (u64)yy >= fb_h) continue;
+                    u32 *line = (u32 *)((u8 *)fb + (u64)yy * fb_p);
+                    for (i64 c = -24; c < CARD_W + 24; c++) {
+                        i64 xx = card_x + c;
+                        if (xx < 0 || (u64)xx >= fb_w) continue;
+                        u32 px = line[(u64)xx];
+                        /* 压暗到 25%：每通道取高 6 位后右移 2 位 */
+                        u32 dim = ((px >> 2) & 0x3F3F3Fu) | 0xFF000000u;
+                        line[(u64)xx] = dim;
+                    }
+                }
+                fill_rounded_rect(fb, bx, by, bw, bh, 10, 0xFF30303Au);
+                stroke_rounded_rect(fb, bx, by, bw, bh, 10, 1, 0xFF6A6A78u);
+                fb_text(fb, tip, bx + 28, by + (bh - ASCII_H) / 2, 0xFFE8E8F0, 0xFF30303Au);
+                g_cursor_old_x = -100;   /* 让下次光标重画到当前位置 */
+                g_cursor_old_y = -100;
+            }
             int ok = verify_password(conf_buf, conf_size, pass);
             if (ok) {
                 logl("[login] password correct");

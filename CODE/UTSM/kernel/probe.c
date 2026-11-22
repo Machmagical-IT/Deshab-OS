@@ -112,3 +112,22 @@ u32 probe_head_value(void) {
 u32 probe_dropped_count(void) {
     return g_probe_dropped;
 }
+
+/* P5（万物互联）：kern.probe.info 总线服务后端——返回 probe 缓冲描述
+ * （instr 关闭时返回 NULL）。原在 dsk_loader.c，DSK 退役后移入此处。
+ * 返回 void* 以免调用方依赖 probe_info 类型。 */
+#include <utsm/dsk.h>
+static probe_info g_probe_info_desc;
+const void *utsm_probe_info_get(void) {
+    if (!g_instr_enabled) return 0;
+    g_probe_info_desc.magic = PROBE_INFO_MAGIC;
+    g_probe_info_desc.version = 1;
+    g_probe_info_desc.probe_buf_addr = (u64)probe_buf_address();
+    g_probe_info_desc.probe_cap = probe_capacity();
+    g_probe_info_desc.probe_head = probe_head_value();
+    g_probe_info_desc.probe_count = probe_count();
+    g_probe_info_desc.probe_dropped = probe_dropped_count();
+    g_probe_info_desc.instr_enabled = g_instr_enabled;
+    g_probe_info_desc.instr_probe_enable = g_instr_probe_enable;
+    return &g_probe_info_desc;
+}

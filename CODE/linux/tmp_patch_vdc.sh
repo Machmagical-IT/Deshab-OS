@@ -5,7 +5,7 @@ ROOT=/mnt/d/Code/DEAICUP/Deshab
 OUT="$ROOT/.build_tmp/wsl_patch_vdc.out"
 exec > >(stdbuf -oL tee "$OUT") 2>&1
 sed -i 's/\r$//' "$ROOT/CODE/linux/patch_boot_on_img.sh"
-ls -lh "$ROOT/SYSTEM/boot/utsm.elf" "$ROOT/SYSTEM/limine/limine.conf"
+ls -lh "$ROOT/SYSTEM/ESP/boot/utsm.elf" "$ROOT/SYSTEM/ESP/limine/limine.conf"
 bash "$ROOT/CODE/linux/patch_boot_on_img.sh" "$ROOT/ISO/deshab-dev.img"
 echo "[patch] iso_exit=$?"
 if [[ -f /home/deshab/deshab-dev.img ]]; then

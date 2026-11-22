@@ -9,7 +9,7 @@
 # native desktop and the guest console available as emergency fallbacks.
 #
 # Output:
-#   SYSTEM/boot/linux-extra-rootfs.img
+#   SYSTEM/ESP/boot/linux-extra-rootfs.img
 #
 # Usage:
 #   sudo bash CODE/linux/build_extra_rootfs.sh
@@ -25,7 +25,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUTPUT_DIR="${EXTRA_ROOTFS_OUTPUT_DIR:-$PROJECT_ROOT/SYSTEM/boot}"
+OUTPUT_DIR="${EXTRA_ROOTFS_OUTPUT_DIR:-$PROJECT_ROOT/SYSTEM/ESP/boot}"
 OUTPUT_IMG="${EXTRA_ROOTFS_OUTPUT:-$OUTPUT_DIR/linux-extra-rootfs.img}"
 
 KDE_FULL="${KDE_FULL:-0}"
@@ -39,7 +39,7 @@ esac
 
 if [ -z "${IMG_SIZE_MB+x}" ]; then
     if [ "$KDE_FULL" -eq 1 ]; then
-        # FAT32 ESP cannot store a file >= 4GiB. SYSTEM/boot is the only
+        # FAT32 ESP cannot store a file >= 4GiB. SYSTEM/ESP/boot is the only
         # pack input, so the extra-rootfs image must stay under that limit.
         IMG_SIZE_MB=3900
     else
@@ -241,7 +241,7 @@ kde_pacman_wave() {
 }
 
 kde_install_full_suite() {
-    local hello_src="$PROJECT_ROOT/SYSTEM/user/python/hello.py"
+    local hello_src="$PROJECT_ROOT/SYSTEM/ESP/user/python/hello.py"
     if [ "$KDE_USE_BOOTSTRAP" -eq 0 ]; then
         echo "[extra-rootfs] Installing full Arch/KDE suite with pacstrap..."
         PACSTRAP_ARGS=(-K -c)
@@ -342,7 +342,7 @@ touch "$MNT_DIR/vscode/.keep"
 if [ "$KDE_FULL" -eq 1 ]; then
     if [ "${KDE_FINALIZE_ONLY:-0}" = "1" ]; then
         echo "[extra-rootfs] finalize-only: keeping installed Plasma/Wayland/Python"
-        hello_src="$PROJECT_ROOT/SYSTEM/user/python/hello.py"
+        hello_src="$PROJECT_ROOT/SYSTEM/ESP/user/python/hello.py"
         if [ -f "$hello_src" ]; then
             mkdir -p "$MNT_DIR/usr/local/share/deshab/python"
             install -m 0644 "$hello_src" "$MNT_DIR/usr/local/share/deshab/python/hello.py"

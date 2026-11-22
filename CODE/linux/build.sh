@@ -12,15 +12,15 @@
 #   ./build.sh
 #
 # Output:
-#   - SYSTEM/boot/linux-bzImage  (kernel image)
-#   - SYSTEM/boot/linux-initrd.img (minimal initramfs, if initramfs/ exists)
+#   - SYSTEM/ESP/boot/linux-bzImage  (kernel image)
+#   - SYSTEM/ESP/boot/linux-initrd.img (minimal initramfs, if initramfs/ exists)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LINUX_SRC="${LINUX_SRC:-$SCRIPT_DIR/src}"
-OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/boot"
+OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/ESP/boot"
 CONFIG_FILE="$SCRIPT_DIR/configs/utsm_x86_64_defconfig"
 INITRAMFS_DIR="$SCRIPT_DIR/initramfs"
 
@@ -99,7 +99,7 @@ make olddefconfig
 echo "[build] Building bzImage (this may take 10-30 minutes)..."
 make -j"$(nproc)" bzImage
 
-# 5. Copy bzImage to SYSTEM/boot/
+# 5. Copy bzImage to SYSTEM/ESP/boot/
 mkdir -p "$OUTPUT_DIR"
 cp arch/x86/boot/bzImage "$OUTPUT_DIR/linux-bzImage"
 echo "[build] bzImage: $OUTPUT_DIR/linux-bzImage ($(du -h $OUTPUT_DIR/linux-bzImage | cut -f1))"
@@ -192,7 +192,7 @@ echo "[build] Done. Copy linux-bzImage (and linux-initrd.img) to your FAT32 imag
 echo "[build] Limine will load them as boot modules for UTSM."
 
 # 7. Enable Linux modules in limine.conf (uncomment the 4 commented lines)
-LIMINE_CONF="$PROJECT_ROOT/SYSTEM/limine/limine.conf"
+LIMINE_CONF="$PROJECT_ROOT/SYSTEM/ESP/limine/limine.conf"
 if [ -f "$LIMINE_CONF" ]; then
     if grep -q "^    # module_path: boot():/boot/linux-bzImage" "$LIMINE_CONF"; then
         echo "[build] Enabling Linux modules in limine.conf..."

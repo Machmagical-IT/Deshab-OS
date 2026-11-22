@@ -2,6 +2,7 @@
 #define UTSM_VMM_H
 
 #include <utsm/types.h>
+#include <utsm/vm_machine.h>
 
 /* VMM 顶层 API：协调 VMX/EPT/VMCS/VMEXIT，启动 guest。
  *
@@ -20,62 +21,33 @@
  * C handlers (e.g. hypercall.c) can read guest arguments from this structure
  * and write return values (e.g. g_guest_regs.rax = retval) which will be
  * loaded into the CPU before vmresume resumes the guest. */
-struct vmexit_guest_regs {
-    u64 rax;
-    u64 rbx;
-    u64 rcx;
-    u64 rdx;
-    u64 rsi;
-    u64 rdi;
-    u64 rbp;
-    u64 r8;
-    u64 r9;
-    u64 r10;
-    u64 r11;
-    u64 r12;
-    u64 r13;
-    u64 r14;
-    u64 r15;
-};
+/* Active vCPU guest register save area. vmexit_asm.S dereferences this pointer;
+ * C call sites retain the historical g_guest_regs.field spelling. */
+extern volatile struct vmexit_guest_regs *g_active_guest_regs;
+#define g_guest_regs (*g_active_guest_regs)
 
-/* Global guest register save area (referenced by vmexit_asm.S).
- * Non-static: shared between vmm.c, vmexit.c, hypercall.c, and vmexit_asm.S. */
-extern volatile struct vmexit_guest_regs g_guest_regs;
-
-/* ===== Linux guest park-and-resume 状态 =====
+/* ===== Active-vCPU VM-Exit state =====
  *
- * g_linux_guest_active: 1 = 当前运行的 guest 是 Linux guest。
- *   handle_hlt 检查此标志：Linux guest HLT 时 park（推进 RIP，exit-to-host），
- *   self-test guest HLT 时 terminate。
- * g_guest_parked: 1 = Linux guest 已 HLT 驻留，可被 linux_resume() 唤醒。
- *   linux_compat_service 通过此标志判断 guest 是否就绪。
- *
- * g_xj380_guest_active: 1 = 当前运行的 guest 是 OpenXJ380 guest。
- *   handle_hlt 检查此标志：XJ380 guest HLT 时推进 RIP 并立即 vmresume
- *   （继续执行，不 park 不 terminate）。同一时刻只有一个 guest active。 */
-extern volatile int g_linux_guest_active;
-extern volatile int g_guest_parked;
-extern volatile int g_xj380_guest_active;
-
-/* ===== VM-Exit host 恢复点（vmm.c 定义，vmm.c / linux_boot.c / linux_resume.c 共用） =====
- *
- * g_saved_host_rsp:   vmlaunch/vmresume 前保存的 host RSP。VM-Exit 处理器
- *                     终止 guest 时恢复此 RSP 并 jmp 到 g_saved_return_rip。
- * g_saved_return_rip: vmlaunch/vmresume 后的返回地址（post_guest / post_resume 标签）。
- * g_guest_terminated: 1 = guest 已终止（不再 vmresume）。dispatch 返回 0 时置位。
- * g_last_exit_reason: 最近一次 VM-Exit 的 reason（vmexit_asm.S 路径写入）。
- *
- * 这些符号必须是非 static 全局变量，因为 vmexit_asm.S 通过 RIP 相对寻址引用。 */
-extern volatile u64 g_saved_host_rsp;
-extern volatile u64 g_saved_return_rip;
-extern volatile int g_guest_terminated;
-extern volatile u64 g_last_exit_reason;
+ * Assembly dereferences these active-slot pointers. C keeps the historical
+ * spelling as lvalue macros while the storage lives in struct vm_vcpu. */
+extern volatile u64 *g_active_saved_host_rsp;
+extern volatile u64 *g_active_saved_return_rip;
+extern volatile int *g_active_guest_terminated;
+extern volatile int *g_active_launch_pending;
+extern volatile u64 *g_active_last_exit_reason;
+#define g_saved_host_rsp    (*g_active_saved_host_rsp)
+#define g_saved_return_rip  (*g_active_saved_return_rip)
+#define g_guest_terminated  (*g_active_guest_terminated)
+#define g_last_exit_reason  (*g_active_last_exit_reason)
 
 /* ===== VMM API ===== */
 
 /* 初始化 VMM：VMX root 模式 + EPT 表 + 分配 VMCS。
  * 返回 0 成功，负值失败。 */
 int vmm_init(void);
+int vmm_machine_prepare(struct vm_machine *machine);
+int vmm_machine_activate(struct vm_machine *machine, u32 vcpu_id);
+void vmm_set_active_profile(enum vm_profile profile);
 
 /* 关闭 VMM：vmxoff。 */
 void vmm_shutdown(void);
@@ -90,6 +62,9 @@ int vmm_is_ready(void);
 u64 vmm_get_eptp(void);
 /* P8.5: VMCS 物理地址（linux_launch 前 VMCLEAR+VMPTRLD 用） */
 u64 vmm_get_vmcs_phys(void);
+/* Active vCPU host stack; VMCS HOST_RSP must use this instead of a singleton. */
+u8 *vmm_get_host_stack(void);
+u64 vmm_get_host_stack_top(void);
 
 /* Walk the current guest CR3 to translate GVA→GPA. Returns 0 if unmapped. */
 u64 vmx_guest_gva_to_gpa(u64 gva);

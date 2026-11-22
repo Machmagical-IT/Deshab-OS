@@ -10,10 +10,10 @@ sed -i 's/\r$//' \
   "$ROOT/CODE/linux/patch_boot_on_img.sh" \
   "$ROOT/CODE/linux/guest/deshab-kde-session"
 echo "[fsck] copy rootfs to native disk"
-cp -f "$ROOT/SYSTEM/boot/linux-rootfs.img" /home/deshab/linux-rootfs-fsck.img
+cp -f "$ROOT/SYSTEM/ESP/boot/linux-rootfs.img" /home/deshab/linux-rootfs-fsck.img
 ls -lh /home/deshab/linux-rootfs-fsck.img
 e2fsck -fy /home/deshab/linux-rootfs-fsck.img || true
-cp -f /home/deshab/linux-rootfs-fsck.img "$ROOT/SYSTEM/boot/linux-rootfs.img"
+cp -f /home/deshab/linux-rootfs-fsck.img "$ROOT/SYSTEM/ESP/boot/linux-rootfs.img"
 echo "[fsck] copied back"
 bash "$ROOT/CODE/linux/tmp_patch_persist.sh"
 echo "[fsck] ALL_DONE $(date -Iseconds)"

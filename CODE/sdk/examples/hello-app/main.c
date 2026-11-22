@@ -30,13 +30,21 @@ void dsk_entry(const dsk_boot_context *ctx) {
     i64 y = ((i64)g_ac.fb_h) / 2;
     dsb_draw_string(&g_ac, msg, x, y, DSB_TEXT_PRIMARY, DSB_BG_PRIMARY, 12);
 
-    /* 6. 等待 Esc 键退出 */
+    /* 6. 等待 Esc 键退出
+     *
+     * P6b 之后 ps2kbd.drv 常驻，IRQ1 handler 会把端口 0x60 的字节读走；
+     * 这里若还直接轮询 0x60 就会饿死（按 Esc 没反应）。改走服务总线
+     * srv.input.kbd.poll，与 diskinfo/sysinfo 等工具同款。 */
+    static dsb_input g_in;
+    if (dsb_input_open(&g_in, g_ac.api) != 0) {
+        /* kbd 服务缺席 = 无法交互；画提示后退出（零降级：不碰端口）。 */
+        dsb_draw_string(&g_ac, "srv.input.kbd.poll missing", 12, 60,
+                        DSB_ERROR, DSB_BG_PRIMARY, 12);
+        return;
+    }
     for (;;) {
-        u8 st = dsb_inb(0x64);
-        if (st & 1) {
-            u8 sc = dsb_inb(0x60);
-            if (sc == 1) break;  /* Esc make code */
-        }
+        u8 sc;
+        if (dsb_input_kbd(&g_in, &sc) && sc == 1) break;  /* Esc make code */
         __asm__ volatile("pause");
     }
 }

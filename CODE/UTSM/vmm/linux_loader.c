@@ -707,27 +707,55 @@ int linux_loader_init(void) {
     }
 
     /* General RAM: VSCode integration Phase 1 expansion.
-     * 1.4GB (LINUX_GUEST_RAM_SIZE) accommodates VSCode + Electron + GUI stack
-     * (Xorg/modesetting + GTK + mesa softpipe). Falls back to 1GB / 512MB if
-     * the host cannot allocate the full amount; 512MB is the floor for the
-     * Xfbdev + xterm MVP (Phase 3). Original allocation was 64MB. */
-    u64 ram_size = LINUX_GUEST_RAM_SIZE;  /* 1.4GB */
+     * 3GB (LINUX_GUEST_RAM_SIZE) accommodates VSCode + Electron + GUI stack
+     * plus the VSCode install (tarball staged in /tmp + ~969MB extracted into
+     * the /opt tmpfs overlay). Falls back to 1GB / 512MB if the host cannot
+     * allocate the full amount. Original allocation was 64MB. */
+    u64 ram_size = LINUX_GUEST_RAM_SIZE;  /* 3GB */
     dkm_dma_buffer ram_buf;
-    if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
+    /* guest RAM 经 EPT 整段映射，HPA 可位于 4G 以上——用高内存分配器（低 4G
+     * 池在 q35 上仅 ~1.1GB，装不下 1.4GB）。该分配器不 panic，使下面
+     * 1.4G→1G→512M 的设计内回退链真正生效。 */
+    if (dma_alloc_high_pages(ram_size / 4096, 2 * 1024 * 1024, &ram_buf) != 0) {
         log_warn("[LINUX] failed to alloc guest RAM (1.4GB), trying 1GB");
         ram_size = 1ULL * 1024 * 1024 * 1024;  /* 1GB */
-        if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
+        if (dma_alloc_high_pages(ram_size / 4096, 2 * 1024 * 1024, &ram_buf) != 0) {
             log_warn("[LINUX] failed to alloc guest RAM (1GB), trying 512MB");
             ram_size = 512 * 1024 * 1024;  /* 512MB floor for Phase 3 MVP */
-            if (dma_alloc_pages(ram_size / 4096, 2 * 1024 * 1024, 0, &ram_buf) != 0) {
+            if (dma_alloc_high_pages(ram_size / 4096, 2 * 1024 * 1024, &ram_buf) != 0) {
                 log_error("[LINUX] failed to alloc guest RAM (512MB minimum)");
-                panic_full("LIN-E13 ALLOC GUEST RAM MINIMUM FAILED", "dma_alloc_pages failed even for the 512mb guest ram floor", 0);
+                panic_full("LIN-E13 ALLOC GUEST RAM MINIMUM FAILED", "dma_alloc_high_pages failed even for the 512mb guest ram floor", 0);
                 return -9;
             }
         }
     }
     log_hex64("[LINUX] guest RAM HPA=", ram_buf.phys);
     log_hex64("[LINUX] guest RAM size=", ram_size);
+
+    /* 3b. 低内存（GPA 0..80MB）整段映射到一块真实 RAM。
+     * 过去这一段不在 guest RAM 映射里，靠 EPT violation 逐页从低 4G DMA 池
+     * 现分（ept_map_guest_ram_page）。guest 的页表/内核数据就放在这里，而低 4G
+     * 池与 virtio DMA/EPT 页表共用，实测出现页表页被覆写（PTE 变成
+     * 0xff7da0cf 垃圾 → guest #PF reserved-bit → PID1 oops → guest panic）。
+     * 改为整段映射独立高内存后，这些页有稳定归属，不再按页现分。
+     * 注意：随后的固定映射（bootparams/cmdline/GDT/PGT/stack/kernel/initrd）
+     * 会覆盖本段中的对应页，顺序上必须放在它们之前。 */
+    {
+        dkm_dma_buffer low_buf;
+        /* 0..0x04000000 = 64MB，与 e820 可用段 [0x400000,0x3ffffff] 一致；
+         * 不越过 0x4000000（IPC SHM 及 surface pool 占据 0x4000000..0x4fffffff）。 */
+        u64 low_size = 0x04000000ULL;
+        if (dma_alloc_high_pages(low_size / 4096, 2 * 1024 * 1024, &low_buf) == 0) {
+            if (ept_map_range(0, low_buf.phys, low_size, EPT_RWX) == 0) {
+                log_hex64("[LINUX] low RAM mapped GPA=0 size=", low_size);
+                log_hex64("[LINUX] low RAM HPA=", low_buf.phys);
+            } else {
+                log_warn("[LINUX] low RAM EPT map failed; demand mapping remains");
+            }
+        } else {
+            log_warn("[LINUX] low RAM alloc failed; demand mapping remains");
+        }
+    }
 
     /* 4. Load kernel image into allocated memory */
     const u8 *kernel_src = (const u8 *)bzimage + kernel_offset;

@@ -22,7 +22,7 @@ cands = [
     Path('/root/extra_rootfs_work/extra-rootfs.img'),
     Path('/home/deshab/linux-extra-rootfs.img'),
     Path('/home/deshab/extra-check.img'),
-    Path('/mnt/d/Code/DEAICUP/Deshab/SYSTEM/boot/linux-extra-rootfs.img'),
+    Path('/mnt/d/Code/DEAICUP/Deshab/SYSTEM/ESP/boot/linux-extra-rootfs.img'),
 ]
 for p in cands:
     if p.exists():

@@ -14,17 +14,6 @@
 static dsb_app_context g_ac;
 
 /* ---- 简易格式化 ---- */
-static char *fmt_hex(u64 v, char *buf) {
-    static const char hx[] = "0123456789ABCDEF";
-    int n = 0;
-    char tmp[18];
-    if (!v) { buf[0] = '0'; buf[1] = 0; return buf; }
-    while (v && n < 16) { tmp[n++] = hx[v & 0xF]; v >>= 4; }
-    buf[0] = '0'; buf[1] = 'x';
-    for (int i = 0; i < n; i++) buf[2 + i] = tmp[n - 1 - i];
-    buf[2 + n] = 0;
-    return buf;
-}
 static char *fmt_dec(u64 v, char *buf) {
     char tmp[24]; int n = 0;
     if (!v) { buf[0] = '0'; buf[1] = 0; return buf; }
@@ -90,6 +79,21 @@ void dsk_entry(const dsk_boot_context *ctx) {
     if (ctx->magic != DSK_BOOT_MAGIC) return;
     dsb_app_init(&g_ac, ctx);
     char buf[64];
+
+    /* 输入经服务总线（P6b）：ps2kbd.drv/ps2mouse.drv 的 IRQ handler 已读走
+     * 端口 0x60，直接轮询必然饿死（鼠标不动 / Esc 失灵）。改用
+     * srv.input.kbd.poll / srv.input.mouse.poll（与 shell/cmd 同款）。 */
+    static dsb_input g_in;
+    static dsb_cursor g_cur;
+    if (dsb_input_open(&g_in, (const dkm_kernel_api *)ctx->dkm_kernel_api) != 0) {
+        /* kbd 服务缺席 = 无法交互；画提示后归还桌面（零降级：不碰端口）。 */
+        dsb_fill_bg(&g_ac, DSB_BG_PRIMARY);
+        dsb_draw_titlebar(&g_ac, "DiskInfo - input unavailable", (i64)g_ac.fb_w);
+        dsb_draw_string(&g_ac, "srv.input.kbd.poll missing; press any key to exit",
+                        12, 60, DSB_ERROR, DSB_BG_PRIMARY, 12);
+        return;
+    }
+    dsb_cursor_init(&g_cur, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
 
     dsb_fill_bg(&g_ac, DSB_BG_PRIMARY);
     dsb_draw_titlebar(&g_ac, "DiskInfo - diskpart style", (i64)g_ac.fb_w);
@@ -241,12 +245,22 @@ void dsk_entry(const dsk_boot_context *ctx) {
     }
 
 wait_esc:
-    /* 等待 Esc 退出 */
+    /* 光标就位（UI 绘完后保存背景 + 画一次） */
+    dsb_cursor_save(&g_ac, &g_cur);
+    dsb_cursor_draw(&g_ac, &g_cur, DSB_ACCENT);
+
+    /* 输入循环：鼠标经总线快照（驱动已按 fb 钳位、Y 方向正确）；
+     * 键盘 Esc 退出。绝不碰端口 0x60 —— 与 IRQ handler 抢字节会错位。 */
     for (;;) {
-        u8 st = dsb_inb(0x64);
-        if (st & 1) {
-            u8 sc = dsb_inb(0x60);
-            if (sc == 1) break;  /* Esc make code */
+        if (dsb_input_mouse(&g_in, &g_cur, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
+            dsb_cursor_restore(&g_ac, &g_cur);
+            dsb_cursor_save(&g_ac, &g_cur);
+            dsb_cursor_draw(&g_ac, &g_cur, DSB_ACCENT);
+        }
+        u8 sc;
+        if (dsb_input_kbd(&g_in, &sc)) {
+            if (sc == 1) break;           /* Esc make code */
+            continue;
         }
         __asm__ volatile("pause");
     }

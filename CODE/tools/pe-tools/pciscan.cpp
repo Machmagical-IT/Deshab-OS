@@ -8,10 +8,14 @@
  * （bus 0-3，0xCF8/0xCFC 直读，Ring0 原生执行）+ RTC 日期时间。
  */
 #include <windows.h>
+#include <stdio.h>
 
 typedef unsigned int   u32;
 typedef unsigned char  u8;
 typedef unsigned short u16;
+
+/* -nostdlib 下 g++ 在 main 头部插 __main 调用；无 CRT 即空实现 */
+extern "C" void __main(void) {}
 
 static inline void outp(u16 port, u32 v) {
     __asm__ volatile("outl %0,%1" :: "a"(v), "Nd"(port));

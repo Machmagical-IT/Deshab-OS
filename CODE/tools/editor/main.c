@@ -125,7 +125,7 @@ static void redraw_all(void) {
     da_draw_titlebar(&g_ac, title, (i64)g_ac.fb_w);
 
     int margin_x = 8;
-    int top_y = DA_TITLEBAR_H + 4;
+    int top_y = da_chrome_h() + 4;
     int line_num_w = 5 * CHAR_STEP + 8;
     int text_x = margin_x + line_num_w;
     int visible_rows = ((int)g_ac.fb_h - top_y - DA_STATUSBAR_H - 8) / CHAR_H;
@@ -195,7 +195,8 @@ static void redraw_all(void) {
 
 __attribute__((visibility("default")))
 void dsk_entry(const da_boot_context *ctx) {
-    __asm__ volatile("cli");
+    /* P6b：输入走 srv.input.kbd.poll（IRQ1 由 ps2kbd 投递），必须开中断。 */
+    __asm__ volatile("sti");
     da_slog("editor", "boot");
 
     if (!ctx || ctx->magic != DA_BOOT_MAGIC) {
@@ -204,17 +205,19 @@ void dsk_entry(const da_boot_context *ctx) {
     }
 
     da_init(&g_ac, ctx);
+    static da_input g_in;
+    if (da_input_open(&g_in, &g_ac) != 0) {
+        da_slog("editor", "input bus missing (INPUT-E01)");
+        return;
+    }
     f32_init((f32_block_read_fn)g_ac.block_read, (f32_block_write_fn)g_ac.block_write);
     init_default_text();
     redraw_all();
 
     int shift = 0, e0 = 0;
     for (;;) {
-        u8 st = inb(0x64);
-        if (!(st & 1)) { __asm__("pause"); continue; }
-        u8 data = inb(0x60);
-        if (st & 0x20) continue;
-        u8 sc = data;
+        u8 sc;
+        if (!da_input_kbd(&g_in, &sc)) { __asm__("pause"); continue; }
         if (sc == 0xE0) { e0 = 1; continue; }
         if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
         if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }

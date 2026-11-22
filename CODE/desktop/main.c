@@ -8,10 +8,13 @@
  * M2-M4 将按 Win11 Fluent 桌面重构计划逐页替换。
  */
 #include "ascii_font.h"  /* 顺序敏感：先于 desktop.h（g_ascii 导出） */
+#include "../DKM/dkm_shared.h"  /* P4e: DKM 驱动 ABI（driver_init/desc/kernel_api/bus） */
 #include "desktop.h"
 #include "zhfont.h"       /* M1: 中文位图字库（dbf 加载 + 中英混排渲染） */
 #include "wallpaper.h"   /* M2: 壁纸背景层缓存 */
 #include "textures.h"    /* M2: 启动背景/开机 logo/开始菜单 logo 纹理 */
+#include "glass.h"       /* 壁纸毛玻璃缓存 */
+#include "aqua_theme.h"  /* 顶栏高度（拖拽上界） */
 
 /* ---- 全局状态（渲染上下文 / 服务指针，各模块 extern） ---- */
 du_context g_fb;
@@ -22,9 +25,104 @@ desktop_block_read_fn  g_block_read;
 desktop_block_write_fn g_block_write;
 const dsk_boot_context *g_boot_ctx = 0;
 
-/* M2: Win11 Fluent 桌面开关（FUCK [desktop] fluent=，缺省 1）。
- * 1 = 壁纸背景 + Fluent 圆角窗口 + 悬浮任务栏；0 = 旧 KATE 桌面。 */
+/* ---- 实机多盘：fat32_io.h 把块设备索引写死为 0 ----
+ * 实机上块设备 0 常是内置 NVMe/SATA 而非启动 U 盘；fat32.drv 经跨设备
+ * 探测后把实际索引公布在 srv.fs.fat32.volume_info。这里包一层把 index
+ * 重定向过去，否则按路径读取（字库/壁纸）全部失败 → DESK-E04。 */
+static desktop_block_read_fn  g_block_read_raw;
+static desktop_block_write_fn g_block_write_raw;
+static u32 g_fat_dev;
+
+static int dt_block_read(u32 index, u64 lba, u32 count, void *buffer) {
+    (void)index;
+    return g_block_read_raw ? g_block_read_raw(g_fat_dev, lba, count, buffer) : -1;
+}
+static int dt_block_write(u32 index, u64 lba, u32 count, const void *buffer) {
+    (void)index;
+    return g_block_write_raw ? g_block_write_raw(g_fat_dev, lba, count, buffer) : -1;
+}
+
+/* ---- 引导器预载的桌面资产（boot module cmdline "asset:*"） ----
+ * 实机上块设备 0 常是内置盘，且部分 USB 存储在长传输时不稳定；字库/
+ * 壁纸/贴图由引导器直接送入内存，按路径读取时优先命中预载数据。 */
+typedef struct {
+    u64 revision;
+    u64 module_count;
+    void **modules;
+} dt_mod_rsp;
+typedef struct {
+    u64 revision;
+    void *address;
+    u64 size;
+    char *path;
+    char *cmdline;
+    u32 media_type;
+    u32 unused;
+    u32 tftp_ip;
+    u32 tftp_port;
+    u32 partition_index;
+    u32 mbr_disk_id;
+    u8  gpt_disk_uuid[16];
+    u8  gpt_part_uuid[16];
+    u8  part_uuid[16];
+} dt_mod_file;
+
+static int dt_str_eq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == *b;
+}
+static int dt_str_ends(const char *s, const char *suf) {
+    u64 ls = 0, lf = 0;
+    while (s && s[ls]) ls++;
+    while (suf && suf[lf]) lf++;
+    if (lf > ls) return 0;
+    return dt_str_eq(s + (ls - lf), suf);
+}
+
+static const void *dt_boot_asset(const char *tag, u32 *out_size) {
+    const struct dkm_kernel_api *api = (const struct dkm_kernel_api *)g_kernel_api;
+    if (!api) return 0;
+    const dt_mod_rsp *rsp = (const dt_mod_rsp *)api->boot_modules_response;
+    if (!rsp || !rsp->modules) return 0;
+    for (u64 i = 0; i < rsp->module_count; i++) {
+        const dt_mod_file *f = (const dt_mod_file *)rsp->modules[i];
+        if (!f || !f->cmdline || !f->address) continue;
+        if (dt_str_eq(f->cmdline, tag)) {
+            if (out_size) *out_size = (u32)f->size;
+            return f->address;
+        }
+    }
+    return 0;
+}
+
+/* 按路径读取：命中预载资产则内存拷贝，否则回落到 FAT32 服务。 */
+static int dt_read_to(const char *path, u8 *dst, u32 cap, u32 *out_size) {
+    const void *src = 0;
+    u32 sz = 0;
+    if (path) {
+        if (dt_str_eq(path, "system/font/simhei_16.dbf")) src = dt_boot_asset("asset:font16", &sz);
+        else if (dt_str_eq(path, "system/font/simhei_24.dbf")) src = dt_boot_asset("asset:font24", &sz);
+        else if (dt_str_ends(path, "wallpaper.rgba")) src = dt_boot_asset("asset:wallpaper", &sz);
+        else if (dt_str_ends(path, "back.rgba")) src = dt_boot_asset("asset:backrgba", &sz);
+        else if (dt_str_ends(path, "bootlogo.rgba")) src = dt_boot_asset("asset:bootlogo", &sz);
+        else if (dt_str_ends(path, "startMenuLogo.rgba")) src = dt_boot_asset("asset:smlogo", &sz);
+    }
+    if (src) {
+        if (sz > cap) return -4;
+        const u8 *s = (const u8 *)src;
+        for (u32 i = 0; i < sz; i++) dst[i] = s[i];
+        if (out_size) *out_size = sz;
+        return 0;
+    }
+    return f32_read_path_lfn_to_w(path, dst, cap, out_size);
+}
+
+/* 桌面外壳开关（FUCK [desktop] fluent=，缺省 1）。
+ * 1 = macOS Aqua 外壳（壁纸 + 顶栏 + Dock + Launchpad）；0 = 旧 KATE 桌面。 */
 int g_fluent = 1;
+int g_boot_reveal = 256;
+static int g_motion_selftest = 0;
 
 /* VSCode Phase 2: Linux guest 输入转发。
  * g_lxc_svc 由 dsk_entry() 从 boot context reserved[5] 读取；
@@ -37,11 +135,24 @@ int g_input_forward_enabled = 0;
 const pe_service *g_pe_svc = 0;
 
 static int g_booted = 0;
+static int g_serial_test = 0;
 
 /* ============================================================
  *  M2: FUCK 配置解析（[desktop] fluent=）
  *  复用 dsk 的 FAT32 路径读取（f32_read_path_lfn_w），INI 最小解析。
  * ============================================================ */
+
+static int cfg_key(const char *line, u32 len, const char *key,
+                   const char **val, u32 *vlen) {
+    u32 i = 0;
+    while (key[i]) {
+        if (i >= len || line[i] != key[i]) return 0;
+        i++;
+    }
+    *val = line + i;
+    *vlen = len - i;
+    return 1;
+}
 
 static void load_fuck_config(void) {
     u8 *data = 0;
@@ -50,8 +161,9 @@ static void load_fuck_config(void) {
         slog("[cfg] FUCK not found, defaults");
         return;
     }
-    /* 逐行找 [desktop] 段的 fluent= 键；[prank] 段交给 prank_config_line */
-    int in_dsk = 0, in_prank = 0;
+    /* [desktop] 的 fluent=/motion_selftest=；[prank] 交给 prank_config_line。
+     * 旧匹配器只认 [dsk] 且要求行长 >= 9，[desktop] 从未命中。两条都认。 */
+    int in_dsk = 0, in_desktop = 0, in_prank = 0;
     u32 pos = 0;
     while (pos < size) {
         u32 eol = pos;
@@ -62,25 +174,62 @@ static void load_fuck_config(void) {
             if (len > 1 && line[0] == '[') {
                 in_dsk = (len >= 9 && line[1] == 'd' && line[2] == 's' &&
                           line[3] == 'k' && line[4] == ']');
+                in_desktop = (len == 9 && line[1] == 'd' && line[2] == 'e' &&
+                              line[3] == 's' && line[4] == 'k' && line[5] == 't' &&
+                              line[6] == 'o' && line[7] == 'p' && line[8] == ']');
                 in_prank = (len >= 7 && line[1] == 'p' && line[2] == 'r' &&
                             line[3] == 'a' && line[4] == 'n' && line[5] == 'k' &&
                             line[6] == ']');
             } else if (in_prank) {
                 prank_config_line(line, (int)len);
-            } else if (in_dsk && len >= 7 &&
-                       line[0]=='f' && line[1]=='l' && line[2]=='u' &&
-                       line[3]=='e' && line[4]=='n' && line[5]=='t' && line[6]=='=') {
-                int v = (len > 7 && line[7] == '0') ? 0 : 1;
-                if (g_fluent != v) {
-                    g_fluent = v;
-                    slog(v ? "[cfg] fluent=1 (Win11 desktop)" :
-                             "[cfg] fluent=0 (KATE fallback)");
+            } else if (in_dsk || in_desktop) {
+                const char *val = 0;
+                u32 vl = 0;
+                if (cfg_key(line, len, "fluent=", &val, &vl)) {
+                    int v = (vl > 0 && val[0] == '0') ? 0 : 1;
+                    if (g_fluent != v) {
+                        g_fluent = v;
+                        slog(v ? "[cfg] fluent=1 (Aqua desktop)" :
+                                 "[cfg] fluent=0 (KATE fallback)");
+                    }
+                } else if (cfg_key(line, len, "motion_selftest=", &val, &vl)) {
+                    g_motion_selftest = (vl > 0 && val[0] == '1');
                 }
             }
         }
         pos = eol;
         while (pos < size && (data[pos] == '\n' || data[pos] == '\r')) pos++;
     }
+}
+
+/* ============================================================
+ *  动效推进（主循环与 PE pump 每帧调用）
+ *  dt 取真实 TSC 间隔，钳到 1..32ms；Dock / 顶栏先按鼠标更新目标。
+ *  返回 1 = 本帧仍有轨道活动（需要重绘）。
+ * ============================================================ */
+static u64 g_motion_tsc = 0;
+
+int desktop_motion_step(void) {
+    int dt = 16, act = 0;
+    if (g_tsc_per_sec) {
+        u64 now = rdtsc();
+        if (g_motion_tsc) {
+            u64 ms = (now - g_motion_tsc) * 1000u / g_tsc_per_sec;
+            dt = ms < 1 ? 1 : ms > 32 ? 32 : (int)ms;
+        }
+        g_motion_tsc = now;
+    }
+    if (g_fluent) {
+        menubar_pointer(g_mouse_x, g_mouse_y);
+        dock_pointer(g_mouse_x, g_mouse_y);
+    }
+    act |= motion_tick(dt);
+    if (g_fluent) {
+        act |= dock_tick(dt);
+        act |= launchpad_tick(dt);
+    }
+    wm_anim_settle();
+    return act;
 }
 
 /* ============================================================
@@ -91,10 +240,24 @@ static void load_fuck_config(void) {
  * ============================================================ */
 
 #define XFADE_ADDR   WALLPAPER_STAGING_ADDR   /* 8MB 区，init 后空闲 */
-#define XFADE_STEPS  16
+#define XFADE_STEPS  28
 
 static void busy_delay(u32 cycles) {
     for (volatile u32 i = 0; i < cycles; i++) __asm__("pause");
+}
+
+/* t 为 0..256。两端慢、中间快。 */
+static int ease_smooth(int t) {
+    u64 u = (u64)t;
+    if (u > 256) u = 256;
+    return (int)(u * u * (768u - 2u * u) / 65536u);
+}
+
+static void wait_ms(u32 ms) {
+    if (!ms) return;
+    if (!g_tsc_per_sec) { busy_delay(ms * 8000u); return; }
+    u64 end = rdtsc() + (g_tsc_per_sec / 1000u) * (u64)ms;
+    while (rdtsc() < end) __asm__ volatile("pause");
 }
 
 static void crossfade_login_to_desktop(void) {
@@ -119,7 +282,7 @@ static void crossfade_login_to_desktop(void) {
 
     /* 3. alpha 混合直写真实 fb：out = src*(1-a) + dst*a */
     for (int step = 1; step <= XFADE_STEPS; step++) {
-        u32 a = (u32)(step * 256 / XFADE_STEPS);
+        u32 a = (u32)ease_smooth(step * 256 / XFADE_STEPS);
         u32 ia = 256 - a;
         for (u64 i = 0; i < n; i++) {
             u32 s = src[i], d = dst[i];
@@ -130,8 +293,29 @@ static void crossfade_login_to_desktop(void) {
                      (((sg * ia + dg * a) >> 8) << 8) |
                      ((sb * ia + db * a) >> 8);
         }
-        busy_delay(40000);
+        wait_ms(28);
     }
+}
+
+/* 壁纸就位之后：图标淡入，顶栏自上、Dock 自下。 */
+static void desktop_reveal(void) {
+    int step;
+    if (!g_fluent) {
+        g_boot_reveal = 256;
+        redraw_all();
+        flip_buffer();
+        return;
+    }
+    for (step = 1; step <= 22; step++) {
+        g_boot_reveal = ease_smooth(step * 256 / 22);
+        if (g_boot_reveal < 1) g_boot_reveal = 1;
+        redraw_all();
+        flip_buffer();
+        wait_ms(32);
+    }
+    g_boot_reveal = 256;
+    redraw_all();
+    flip_buffer();
 }
 
 /* ============================================================
@@ -139,16 +323,10 @@ static void crossfade_login_to_desktop(void) {
  *  每个插桩点唯一 symbol（DESK-E<nn>）。
  * ============================================================ */
 
-/* DSK_BOOT_FLAG_PANIC_FALLBACK：desktop_fatal 只留串口坐标后返回，调用点走备用路径 */
-static int g_panic_fallback;
-
-static void desktop_fatal(const char *sym) {
-    /* 严格错误策略：串口留档 + 深红 fatal 屏（ASCII 18px 直写真实 fb）+ 停机 */
+void desktop_fatal(const char *sym) {
+    /* 严格错误策略：串口留档 + 深红 fatal 屏（ASCII 18px 直写真实 fb）+ 停机。
+     * dev 与 release 都不走备用路径。 */
     slog(sym);
-    if (g_panic_fallback) {
-        slog("[FALLBACK] fatal point hit, taking backup path");
-        return;
-    }
     if (g_real_fb && g_fb_w && g_fb_h) {
         u32 *fb = (u32 *)g_real_fb;
         u64 pitch_u32 = g_fb_pitch / 4;
@@ -181,49 +359,190 @@ static void desktop_fatal(const char *sym) {
  *  主入口
  * ============================================================ */
 
+/* P4e 万物互联：DKM 驱动入口。driver_init 从 api/bus 解析服务并注册
+ * srv.desktop.run；desktop_run 执行桌面主循环（永不返回，同母本）。 */
+static const struct dkm_kernel_api *g_dsk_api;
+static int g_desktop_kbd_logged;
+static struct dsk_boot_context g_compat_ctx;   /* 供 launcher 加载外部 ELF 应用的兼容上下文 */
+static int desktop_run(void);                   /* 前向声明 */
+static int desktop_spawn(void);                 /* P6b：任务化入口 */
+
 __attribute__((visibility("default")))
-void dsk_entry(const dsk_boot_context *ctx) {
-    __asm__ volatile("cli");
+int driver_init(const struct dkm_kernel_api *api, struct dkm_driver_handle *handle) {
+    (void)handle;
+    if (!api || !api->log) return -1;
+    g_dsk_api = api;
+    g_kernel_api = (const void *)api;
+
+    g_fb_addr = (u64)api->fb_address;
+    g_fb_w = api->fb_width;
+    g_fb_h = api->fb_height;
+    g_fb_pitch = api->fb_pitch;
+
+    /* block API（P4e：api->block 直读，不再 +0xA8 裸偏移）。
+     * 原始指针保存在 *_raw；对外统一暴露重定向到启动卷设备的包装。 */
+    g_block_read_raw  = (api->block && api->block->read)  ? (desktop_block_read_fn)api->block->read  : 0;
+    g_block_write_raw = (api->block && api->block->write) ? (desktop_block_write_fn)api->block->write : 0;
+    g_block_read  = g_block_read_raw ? dt_block_read  : 0;
+    g_block_write = g_block_write_raw ? dt_block_write : 0;
+
+    /* 启动卷设备索引（fat32.drv 已跨设备探测完成；缺席时保持 0）。 */
+    g_fat_dev = 0;
+    {
+        void *fn = 0;
+        if (api->bus && api->bus->probe("srv.fs.fat32.volume_info", &fn, 0) == 0 && fn) {
+            const struct dkm_fat32_volume_info *(*get)(void) =
+                (const struct dkm_fat32_volume_info *(*)(void))fn;
+            const struct dkm_fat32_volume_info *vi = get();
+            if (vi && vi->valid) {
+                g_fat_dev = vi->dev;
+                slog_num("[desktop] fat32 volume dev=", (int)vi->dev);
+            }
+        }
+    }
+
+    /* P4e 过渡：为 launcher 加载外部 ELF 应用构造兼容 boot-context（子应用仍按
+     * dsk_boot_context ABI 读）。从 api 填字段；reserved[] 留空。 */
+    {
+        u64 *r = g_compat_ctx.reserved;
+        for (u32 i = 0; i < 8; i++) r[i] = 0;
+        g_compat_ctx.magic = 0x44534B31424F4F54ULL;
+        g_compat_ctx.framebuffer_address = (u64)api->fb_address;
+        g_compat_ctx.framebuffer_width = api->fb_width;
+        g_compat_ctx.framebuffer_height = api->fb_height;
+        g_compat_ctx.framebuffer_pitch = api->fb_pitch;
+        g_compat_ctx.dkm_kernel_api = (u64)api;
+        g_boot_ctx = &g_compat_ctx;
+    }
+
+    if (api->bus) {
+        api->bus->register_service("srv.desktop.run", 1, (void *)desktop_run);
+        api->bus->register_service("srv.desktop.spawn", 1, (void *)desktop_spawn);
+        api->log->info("[desktop] srv.desktop.run registered");
+    }
+    return 0;
+}
+
+/* ===================================================================
+ *  电源：任务栏/开始菜单的电源钮
+ *
+ *  经总线调用 acpi.drv 注册的 srv.acpi.poweroff / srv.acpi.reboot
+ *  （母本 SYSTEMCOPY/OpenXJ380 driver/power.cpp 的 S5 + reset_reg 路径）。
+ *  服务缺席（无 ACPI 表 / FUCK [drivers] acpi=0）→ 退回 g_quit 退出桌面，
+ *  由 session 收尾（与改造前行为一致）。
+ * =================================================================== */
+int desktop_poweroff(void) {
+    int (*fn)(void) = 0;
+    if (g_dsk_api && g_dsk_api->bus &&
+        g_dsk_api->bus->probe("srv.acpi.poweroff", (void **)&fn, 0) == 0 && fn) {
+        slog("[power] srv.acpi.poweroff");
+        fn();                      /* 成功不返回 */
+        slog("[power] poweroff returned");
+    }
+    slog("[power] ACPI poweroff unavailable; quitting desktop");
+    g_quit = 1;
+    return -1;
+}
+
+int desktop_reboot(void) {
+    int (*fn)(void) = 0;
+    if (g_dsk_api && g_dsk_api->bus &&
+        g_dsk_api->bus->probe("srv.acpi.reboot", (void **)&fn, 0) == 0 && fn) {
+        slog("[power] srv.acpi.reboot");
+        fn();                      /* 成功不返回 */
+        slog("[power] reboot returned");
+    }
+    slog("[power] ACPI reboot unavailable; falling back to 0xCF9");
+    outb(0x64, 0xFE);
+    outb(0xCF9, 0x06);
+    for (;;) __asm__ volatile("hlt");
+    return -1;
+}
+
+/* P6b：把桌面主循环变成调度器任务。
+ * 返回 1 = 任务已创建（session 可返回，bootstrap 转 idle）；
+ * 返回 0 = 调度器不可用，调用方应回退到 srv.desktop.run 直接执行。 */
+static void desktop_task_entry(void *arg) {
+    (void)arg;
+    desktop_run();
+}
+
+static int desktop_spawn(void) {
+    const struct dkm_kernel_api *api = g_dsk_api;
+    if (!api || !api->sched || !api->sched->task_create) {
+        api->log->warn("[desktop] no sched api; spawn unavailable");
+        return 0;
+    }
+    /* 0xFFFFFFFF = 无进程关联的纯内核任务（sched_ext.h 约定） */
+    int slot = api->sched->task_create(0xFFFFFFFFu, 20, desktop_task_entry, 0);
+    if (slot < 0) {
+        api->log->error("[desktop] task_create failed");
+        return 0;
+    }
+    slog_num("[desktop] task slot=", slot);
+    return 1;
+}
+
+static int desktop_run(void) {
+    const struct dkm_kernel_api *api = g_dsk_api;
     slog("boot");
 
-    if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
-        desktop_fatal("DSK-E01-BADCONTEXT");
-        return;   /* fallback 不可达（无上下文 = 标志位读不到，按 strict 停机） */
+    /* P6b：输入经服务总线（IRQ1/IRQ12 已由 session.drv 解屏蔽）。 */
+    if (dt_input_init() != 0) {
+        api->log->error("[desktop] srv.input.kbd.poll missing");
+        api->log->panic("INPUT-E01 KBD POLL SERVICE MISSING");
+        return 0;
     }
-    g_boot_ctx = ctx;
-    g_panic_fallback = (ctx->flags & DSK_BOOT_FLAG_PANIC_FALLBACK) ? 1 : 0;
+    __asm__ volatile("sti" ::: "memory");
+    slog("input: kbd+mouse via service bus");
 
-    g_fb_addr = ctx->framebuffer_address;
-    g_fb_w = ctx->framebuffer_width;
-    g_fb_h = ctx->framebuffer_height;
-    g_fb_pitch = ctx->framebuffer_pitch;
-    g_kernel_api = (const void *)ctx->dkm_kernel_api;
-
-    /* block API：kernel_api + 0xA8 → block_api 结构，read @ +0x10, write @ +0x18 */
+    /* lxc / pe 服务（P4e：经服务总线 kern.lxc.service / kern.pe.service，
+     * 不再 reserved[4]/[5]）。缺席即降级（lxc→本地 editor，pe→报错）。 */
     {
-        u64 blk = *(u64 *)(ctx->dkm_kernel_api + 0xA8);
-        g_block_read  = blk ? (desktop_block_read_fn)*(u64 *)(blk + 16) : 0;
-        g_block_write = blk ? (desktop_block_write_fn)*(u64 *)(blk + 24) : 0;
+        void *fn = 0;
+        if (api && api->bus && api->bus->probe("kern.lxc.service", &fn, 0) == 0 && fn) {
+            const linux_compat_service *(*get)(void) = (const linux_compat_service *(*)(void))fn;
+            const linux_compat_service *lxc = get();
+            if (lxc && lxc->magic == LINUX_COMPAT_MAGIC) g_lxc_svc = lxc;
+        }
+        if (g_lxc_svc) slog("lxc service available");
+        else { g_lxc_svc = 0; slog("lxc service unavailable (IDE will use local editor)"); }
+
+        fn = 0;
+        if (api && api->bus && api->bus->probe("kern.pe.service", &fn, 0) == 0 && fn) {
+            const pe_service *(*pget)(void) = (const pe_service *(*)(void))fn;
+            const pe_service *pe = pget();
+            if (pe && pe->magic == PE_SERVICE_MAGIC) g_pe_svc = pe;
+        }
+        if (g_pe_svc) slog("pe service available");
+        else { g_pe_svc = 0; slog("pe service unavailable"); }
+
+        /* 串口键鼠：FUCK [desktop] serial_test=1。不绑 dev_mode，避免先被 shell 自测挡住。 */
+        fn = 0;
+        if (api && api->bus && api->bus->probe("kern.config.get", &fn, 0) == 0 && fn) {
+            const char *(*get)(const char *, const char *) = (const char *(*)(const char *, const char *))fn;
+            const char *st = get("desktop", "serial_test");
+            if (st && st[0] == '1') {
+                g_serial_test = 1;
+                slog("serial test on: !M x y | !C | !R | !K hh | !T text");
+            }
+        }
+
+
+        /* P4e 过渡补齐：外部 ELF 子应用（browser 等）仍按旧 ABI 读
+         * g_compat_ctx.reserved[4]=pe / [5]=lxc（desktop_init 里 reserved[]
+         * 被清零）。这里把刚经总线拿到的服务回填，否则子应用永远看不到
+         * lxc/pe —— browser 就因此 "lxc unavailable" 只能走 host 回退。 */
+        g_compat_ctx.reserved[4] = (u64)g_pe_svc;
+        g_compat_ctx.reserved[5] = (u64)g_lxc_svc;
     }
 
-    /* VSCode Phase 2: Linux 兼容层服务指针（dsk_loader 在 reserved[5] 写入）。
-     * 为 NULL 表示 Linux guest 未启动 / IPC 未就绪，IDE attach 时降级为本地 editor。 */
-    g_lxc_svc = (const linux_compat_service *)ctx->reserved[5];
-    if (g_lxc_svc && g_lxc_svc->magic == LINUX_COMPAT_MAGIC) {
-        slog("lxc service available");
-    } else {
-        g_lxc_svc = 0;
-        slog("lxc service unavailable (IDE will use local editor)");
-    }
-
-    /* P5d: PE 兼容层服务指针（dsk_loader 在 reserved[4] 写入）。
-     * 为 NULL 表示 PE 服务未注册，PEAPPS.CNF 应用启动时降级报错。 */
-    g_pe_svc = (const pe_service *)ctx->reserved[4];
-    if (g_pe_svc && g_pe_svc->magic == PE_SERVICE_MAGIC) {
-        slog("pe service available");
-    } else {
-        g_pe_svc = 0;
-        slog("pe service unavailable");
+    /* 双缓冲只有 8MiB（SPRITE_BUF_ADDR 0x7000000 → PE_SURFACE_ADDR 0x7800000）。
+     * 引导器已把 GOP 模式限制在预算内；这里再做硬校验，越界即 DESK-E05，
+     * 绝不带病渲染（越界会踩到字库/PE surface，表现为整屏错位）。 */
+    if (g_fb_h * g_fb_pitch > (8u * 1024u * 1024u)) {
+        slog_num("[desktop] fb bytes over sprite budget=", g_fb_h * g_fb_pitch);
+        desktop_fatal("DESK-E05 SPRITE BUF OVERFLOW");
     }
 
     du_context_init(&g_fb, g_fb_addr, g_fb_w, g_fb_h, g_fb_pitch);
@@ -235,7 +554,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
     /* M1: 中文位图字库加载（system/font/simhei_16.dbf → 0x8000000）。
      * 失败阻塞启动。 */
     {
-        int zrc = zhfont_init(f32_read_path_lfn_to_w);
+        int zrc = zhfont_init(dt_read_to);
         if (zrc == 0) {
             slog("[zhfont] dbf loaded (16px ok)");
         } else {
@@ -247,23 +566,27 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     /* M2: FUCK 配置（[desktop] fluent=）→ 壁纸初始化（Fluent 路径需要） */
     load_fuck_config();
+    slog(g_fluent ? "[cfg] shell=aqua" : "[cfg] shell=kate");
     if (g_prank_enabled) {
         slog(g_prank_boot_demo > 0 ? "[cfg] prank enabled (boot demo on)"
                                    : "[cfg] prank enabled");
     }
     if (g_fluent) {
-        int wrc = wallpaper_init(f32_read_path_lfn_to_w, (int)g_fb_w, (int)g_fb_h);
+        int wrc = wallpaper_init(dt_read_to, (int)g_fb_w, (int)g_fb_h);
         if (wrc == 0) {
+            int grc;
             slog("[wallpaper] loaded + scaled");
+            grc = glass_init((int)g_fb_w, (int)g_fb_h);
+            if (grc != 0) slog_num("[glass] blur failed rc=", grc);
         } else {
             slog_num("[wallpaper] load failed rc=", wrc);
             /* 严格错误策略：材质包（壁纸）缺失不降级，fatal 屏 + 错误码 */
             desktop_fatal("DESK-E02 TEXTURE PACK MISSING");
             g_fluent = 0;   /* fallback：回落经典（非 Fluent）桌面 */
         }
-        /* M2: 开始菜单 logo（textures/startMenuLogo.rgba → 0x8700000） */
-        if (g_fluent && taskbar_init(f32_read_path_lfn_to_w) == 0)
-            slog("[taskbar] startMenu logo loaded");
+        /* 顶栏 Apple 菜单 logo（textures/startMenuLogo.rgba → 0x8700000） */
+        if (g_fluent && taskbar_init(dt_read_to) == 0)
+            slog("[menubar] logo loaded");
         else if (g_fluent) {
             /* 严格错误策略：材质包（开始菜单 logo）缺失不降级 */
             desktop_fatal("DESK-E03 STARTMENU LOGO MISSING");
@@ -273,6 +596,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
     }
 
     tsc_calibrate();
+    if (g_motion_selftest) {
+        motion_selftest();
+        slog(glass_ready() ? "[glass] blur ok" : "[glass] blur skipped");
+    }
     g_rtc_boot_sec = rtc_day_sec();
     g_last_sec = g_rtc_boot_sec;
 
@@ -307,9 +634,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     files_refresh();
 
-    /* 桌面首帧绘入 sprite buffer，然后从登录帧渐隐渐显到桌面（无 boot 屏） */
+    /* 先只出壁纸，从上一画面（Logo 或登录）缓入，再让顶栏 / Dock / 图标入场 */
+    g_boot_reveal = 0;
     redraw_all();
     crossfade_login_to_desktop();
+    desktop_reveal();
     g_booted = 1;
 
     slog("desktop ready");
@@ -321,6 +650,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
     /* P8.1: dev 自动 VSCode 启动测试--无需 GUI 交互即可验证 launch 链路 */
     static int g_autotest_state = 0;
     static u64 g_autotest_tsc = 0;
+    static int g_hover_key = 0;
 
     while (!g_quit) {
         int need_redraw = 0;
@@ -372,19 +702,130 @@ void dsk_entry(const dsk_boot_context *ctx) {
         /* 鼠标：排空所有数据包 */
         while (ps2_mouse_poll()) moved = 1;
 
-        if (inb(COM1 + 5) & 1) {
-            unsigned char ch = inb(COM1);
-            if (ch == '2') {
-                int ki;
-                slog("serial 2: launch KDE");
-                for (ki = 0; ki < g_app_count; ki++) {
-                    if (g_apps[ki].name &&
-                        fat32_lfn_streq_ci(g_apps[ki].name, "kde")) {
-                        launch_app(ki);
-                        need_redraw = 1;
-                        break;
+        /* dev 串口测试（一行一条，以 ! 开头，CR/LF 结束）：
+         *   !M x y   光标移到绝对坐标
+         *   !C / !R  左键 / 右键单击
+         *   !K hh    注入 Set-1 扫描码（两位十六进制，如 1C=Enter）
+         *   !T text  把字母数字打成扫描码
+         * 非 ! 的单字节仍走下面的启动通道。 */
+        {
+            static char line[80];
+            static int llen, armed;
+            unsigned char ch = 0;
+            int have = 0;
+            if (inb(COM1 + 5) & 1) { ch = inb(COM1); have = 1; }
+            if (have && g_serial_test && (armed || ch == '!')) {
+                have = 0;
+                if (!armed) { armed = 1; llen = 0; }
+                else if (ch == '\n' || ch == '\r') {
+                line[llen] = 0;
+                armed = 0;
+                if (line[0] == 'M') {
+                    int x = 0, y = 0, i = 1, sign = 1;
+                    while (line[i] == ' ') i++;
+                    if (line[i] == '-') { sign = -1; i++; }
+                    while (line[i] >= '0' && line[i] <= '9') { x = x * 10 + line[i] - '0'; i++; }
+                    x *= sign; sign = 1;
+                    while (line[i] == ' ') i++;
+                    if (line[i] == '-') { sign = -1; i++; }
+                    while (line[i] >= '0' && line[i] <= '9') { y = y * 10 + line[i] - '0'; i++; }
+                    y *= sign;
+                    if (x < 0) x = 0;
+                    if (y < 0) y = 0;
+                    if (g_fb_w && x >= (int)g_fb_w) x = (int)g_fb_w - 1;
+                    if (g_fb_h && y >= (int)g_fb_h) y = (int)g_fb_h - 1;
+                    g_mouse_x = x; g_mouse_y = y;
+                    slog("serial !M");
+                    need_redraw = 1;
+                } else if (line[0] == 'C') {
+                    g_left_pressed = 1;
+                    g_left_released = 1;
+                    slog("serial !C");
+                } else if (line[0] == 'R') {
+                    g_right_pressed = 1;
+                    slog("serial !R");
+                } else if (line[0] == 'K') {
+                    int i = 1, v = 0, n = 0;
+                    while (line[i] == ' ') i++;
+                    while (n < 2 && line[i]) {
+                        char c = line[i++];
+                        int d = (c >= '0' && c <= '9') ? c - '0' :
+                                (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
+                                (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+                        if (d < 0) break;
+                        v = (v << 4) | d; n++;
                     }
+                    if (n) { dt_kbd_inject((u8)v); slog("serial !K"); }
+                } else if (line[0] == 'T') {
+                    static const char alpha[] = "qwertyuiopasdfghjklzxcvbnm";
+                    static const u8 alpha_sc[] = {
+                        0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,
+                        0x1E,0x1F,0x20,0x21,0x22,0x23,0x24,0x25,0x26,
+                        0x2C,0x2D,0x2E,0x2F,0x30,0x31,0x32
+                    };
+                    int i = 1;
+                    while (line[i] == ' ') i++;
+                    for (; line[i]; i++) {
+                        unsigned char c = (unsigned char)line[i];
+                        int shift = 0;
+                        u8 sc = 0;
+                        if (c >= 'A' && c <= 'Z') { shift = 1; c = (unsigned char)(c + 32); }
+                        if (c >= 'a' && c <= 'z') {
+                            for (int k = 0; k < 26; k++) if (alpha[k] == c) { sc = alpha_sc[k]; break; }
+                        } else if (c >= '1' && c <= '9') sc = (u8)(0x02 + c - '1');
+                        else if (c == '0') sc = 0x0B;
+                        else if (c == ' ') sc = 0x39;
+                        else if (c == '-') sc = 0x0C;
+                        else if (c == '=') sc = 0x0D;
+                        if (!sc) continue;
+                        if (shift) dt_kbd_inject(0x2A);
+                        dt_kbd_inject(sc);
+                        dt_kbd_inject((u8)(sc | 0x80));
+                        if (shift) dt_kbd_inject(0xAA);
+                    }
+                    slog("serial !T");
                 }
+                llen = 0;
+            } else if (llen < 79) {
+                line[llen++] = (char)ch;
+            }
+            }
+            if (have) {
+            if (ch == '2') {
+                slog("serial 2: launch KDE");
+                launch_app_by_name("kde");
+                need_redraw = 1;
+            } else if (ch == '3') {
+                slog("serial 3: launchpad toggle");
+                launchpad_toggle();
+                need_redraw = 1;
+            } else if (ch == '4') {
+                slog("serial 4: control center toggle");
+                taskbar_cc_toggle();
+                need_redraw = 1;
+            } else if (ch == '5') {
+                slog("serial 5: launch sysinfo.exe");
+                if (launch_app_by_name("sysinfo")) need_redraw = 1;
+            } else if (ch == '6') {
+                slog("serial 6: launch clock.exe");
+                if (launch_app_by_name("clock")) need_redraw = 1;
+            } else if (ch == '7') {
+                slog("serial 7: launch diskinfo.elf");
+                if (launch_app_by_name("diskinfo")) need_redraw = 1;
+            } else if (ch == '8') {
+                slog("serial 8: close overlays");
+                launchpad_close();
+                menubar_close_menus();
+                taskbar_cards_close();
+                need_redraw = 1;
+            } else if (ch >= 'a' && ch <= 'f') {
+                static const char *names[6] = {
+                    "shell", "cmd", "browser", "settings", "proedit", "editor"
+                };
+                slog("serial a-f: launch by name");
+                launch_app_by_name(names[ch - 'a']);
+                need_redraw = 1;
+            }
             }
         }
 
@@ -412,11 +853,16 @@ void dsk_entry(const dsk_boot_context *ctx) {
             if (w) {
                 w->x = g_mouse_x - g_drag_off_x;
                 w->y = g_mouse_y - g_drag_off_y;
-                if (w->y < KATE_TOPBAR_H) w->y = KATE_TOPBAR_H;
+                {
+                    int top = g_fluent ? AQUA_MENUBAR_H : KATE_TOPBAR_H;
+                    if (w->y < top) w->y = top;
+                }
+                w->zoomed = 0;
                 if (w->x < 0 - w->w + 40) w->x = 0 - w->w + 40;
                 if (w->x > (int)g_fb_w - 40) w->x = (int)g_fb_w - 40;
                 if (w->y > (int)g_fb_h - KATE_TASKBAR_H - 20)
                     w->y = (int)g_fb_h - KATE_TASKBAR_H - 20;
+                win_present_sync(w);
             }
             need_redraw = 1;
         }
@@ -425,13 +871,17 @@ void dsk_entry(const dsk_boot_context *ctx) {
         if (moved && g_drag_slider == 1) { slider_set(g_vol_rect, &g_vol, g_mouse_x); need_redraw = 1; }
         if (moved && g_drag_slider == 2) { slider_set(g_bri_rect, &g_bright, g_mouse_x); need_redraw = 1; }
 
-        /* 键盘：排空 */
-        for (;;) {
-            u8 st = inb(0x64);
-            if (!(st & 1) || (st & 0x20)) break;
-            u8 sc = inb(0x60);
-            /* 整蛊"打字乱码"：按键可打印码被随机重映射（特殊键/释放码放行） */
-            if (handle_key(prank_filter_key(sc))) need_redraw = 1;
+        /* 键盘：排空（srv.input.kbd.poll ← ps2kbd.drv IRQ1 ring） */
+        {
+            u8 sc;
+            while (dt_kbd_poll(&sc)) {
+                if (!g_desktop_kbd_logged) {
+                    g_desktop_kbd_logged = 1;
+                    slog("kbd event via srv.input.kbd.poll");
+                }
+                /* 整蛊"打字乱码"：按键可打印码被随机重映射（特殊键/释放码放行） */
+                if (handle_key(prank_filter_key(sc))) need_redraw = 1;
+            }
         }
 
         /* RTC 秒 tick：DASHBOARD 状态栏时钟/UP 计时刷新 */
@@ -441,6 +891,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 g_last_sec = sec;
                 if (g_page == 1 && !g_taskview) need_redraw = 1;
             }
+        }
+
+        /* guest 里的 X/VSCode 只有在 resume 时才跑。挂上 IDE 后每帧切几片。 */
+        if (g_ide_attached && g_lxc_svc && g_lxc_svc->run_slice) {
+            for (int s = 0; s < 4; s++) (void)g_lxc_svc->run_slice();
         }
 
         /* VSCode Phase 3/7: IDE attached 时轮询 guest scanout dirty，
@@ -467,6 +922,12 @@ void dsk_entry(const dsk_boot_context *ctx) {
             g_prof_fps_tsc = rdtsc();
         }
         if (need_redraw && g_page == 2) g_prof_frames++;
+
+        if (desktop_motion_step()) need_redraw = 1;
+        if (moved && g_fluent) {
+            int hk = aqua_hover_key();
+            if (hk != g_hover_key) { g_hover_key = hk; need_redraw = 1; }
+        }
 
         if (need_redraw) {
             /* 脏矩形渲染：合并脏矩形，只 flip 变化区域 */
@@ -501,9 +962,34 @@ void dsk_entry(const dsk_boot_context *ctx) {
             flip_rect(g_mouse_x, g_mouse_y, CURSOR_SIZE, CURSOR_SIZE);
         }
 
-        __asm__("pause");
-    }
+        /* P6b：桌面是长驻任务，每帧让出 1ms——否则忙等会吃掉整个时间片。
+         * 无调度器 API 时退回 pause 忙等（旧行为）。 */
+        if (api->sched && api->sched->sleep_ms) api->sched->sleep_ms(1);
+        else __asm__("pause");
+    }   /* for(;;) 桌面主循环：永不返回 */
 
     slog("exit");
-    /* 返回到 DSK */
+    return 0;   /* 不可达 */
+}
+
+/* ===================================================================
+ *  P4e: DKM 驱动描述符 + 退出
+ * =================================================================== */
+static const char *const g_provides[] = { "desktop" };
+
+__attribute__((visibility("default"), used))
+const struct dkm_driver_desc driver_desc = {
+    .magic = DKM_DRIVER_MAGIC, .abi_version = DKM_ABI_VERSION,
+    .desc_size = sizeof(struct dkm_driver_desc),
+    .name = "desktop", .version = "0.1.0", .vendor = "Deshab",
+    .driver_class = DKM_CLASS_MISC, .stage = 4,
+    .flags = DKM_F_NO_UNLOAD, .priority = 0,
+    .depends = NULL, .depends_count = 0,
+    .provides = g_provides, .provides_count = 1,
+    .min_kernel_abi = 1,
+};
+
+__attribute__((visibility("default")))
+int driver_exit(struct dkm_driver_handle *handle) {
+    (void)handle; return 0;
 }

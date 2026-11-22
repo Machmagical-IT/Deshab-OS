@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Apply the current SYSTEM/boot/utsm.elf to the ESP of one or more GPT images,
+# Apply the current SYSTEM/ESP/boot/utsm.elf to the ESP of one or more GPT images,
 # then prove the in-image copy matches (md5 + FLUSH_N marker). Idempotent.
 # ESP-only: Limine loads the kernel via boot(): from the FAT32 ESP.
 # Usage: apply_utsm.sh IMG [IMG...]
 set -Eeuo pipefail
 
 ROOT=/mnt/d/Code/DEAICUP/Deshab
-SRC="$ROOT/SYSTEM/boot/utsm.elf"
+SRC="$ROOT/SYSTEM/ESP/boot/utsm.elf"
 [[ -f "$SRC" ]] || { echo "missing $SRC"; exit 2; }
 
 EXP=$(md5sum "$SRC" | cut -d' ' -f1)

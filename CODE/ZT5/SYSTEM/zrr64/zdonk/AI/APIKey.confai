@@ -1,0 +1,70 @@
+# ZratroOS AI Configuration
+# AI鹊桥 - ZratroOS AI Self-Development Module
+#
+# Available free model providers (OpenAI-compatible API):
+#   - SiliconFlow (硅基流动): https://api.siliconflow.cn/v1
+#   - DeepSeek: https://api.deepseek.com/v1
+#   - Moonshot (月之暗面): https://api.moonshot.cn/v1
+#   - Qwen (通义千问): https://dashscope.aliyuncs.com/compatible-mode/v1
+#   - GLM (智谱): https://open.bigmodel.cn/api/paas/v4
+#
+# Free models available on SiliconFlow (no credit card required):
+#   - deepseek-ai/DeepSeek-V3
+#   - Qwen/Qwen2.5-72B-Instruct
+#   - THUDM/glm-4-9b-chat
+#
+# Register at: https://cloud.siliconflow.cn (free 14M tokens)
+#
+# Usage: Fill in api_key and uncomment the service you want to use
+
+# ===== Active Service =====
+# Options: openai, deepseek, moonshot, qwen, zhipu, siliconflow, custom
+active_service=siliconflow
+
+# ===== SiliconFlow (硅基流动) - Free Tier Available =====
+[siliconflow]
+api_key=sk-your-siliconflow-api-key-here
+endpoint=https://api.siliconflow.cn/v1/chat/completions
+model=deepseek-ai/DeepSeek-V3
+
+# ===== DeepSeek =====
+[deepseek]
+api_key=sk-your-deepseek-api-key-here
+endpoint=https://api.deepseek.com/v1/chat/completions
+model=deepseek-chat
+
+# ===== Moonshot (月之暗面) =====
+[moonshot]
+api_key=sk-your-moonshot-api-key-here
+endpoint=https://api.moonshot.cn/v1/chat/completions
+model=moonshot-v1-8k
+
+# ===== Qwen (通义千问) =====
+[qwen]
+api_key=sk-your-qwen-api-key-here
+endpoint=https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+model=qwen-turbo
+
+# ===== GLM (智谱) =====
+[zhipu]
+api_key=sk-your-zhipu-api-key-here
+endpoint=https://open.bigmodel.cn/api/paas/v4/chat/completions
+model=glm-4-flash
+
+# ===== OpenAI (Paid) =====
+[openai]
+api_key=
+endpoint=https://api.openai.com/v1/chat/completions
+model=gpt-4o
+
+# ===== Claude (Paid) =====
+[claude]
+api_key=
+endpoint=https://api.anthropic.com/v1/messages
+model=claude-sonnet-4-20250514
+
+# ===== Custom Provider =====
+[custom]
+api_key=
+endpoint=
+model=

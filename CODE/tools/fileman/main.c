@@ -19,7 +19,6 @@
 
 static da_app_context g_ac;
 static da_cursor g_cursor;
-static da_mouse g_mouse;
 
 typedef struct {
     char name[13];
@@ -110,10 +109,10 @@ static void redraw_list(void) {
     /* 当前路径 */
     char path_str[200];
     build_path_str(path_str, sizeof(path_str));
-    da_draw_string(&g_ac, path_str, 12, DA_TITLEBAR_H + 4, DA_ACCENT, DA_BG_PRIMARY, CHAR_STEP);
+    da_draw_string(&g_ac, path_str, 12, da_chrome_h() + 4, DA_ACCENT, DA_BG_PRIMARY, CHAR_STEP);
 
     int margin = 12;
-    int top_y = DA_TITLEBAR_H + 4 + CHAR_H + 4;
+    int top_y = da_chrome_h() + 4 + CHAR_H + 4;
     int row_h = CHAR_H + 6;
     int visible_rows = ((int)g_ac.fb_h - top_y - DA_STATUSBAR_H - 8) / row_h;
     int col_name_x = margin + 32;
@@ -201,7 +200,7 @@ static void redraw_view(void) {
     da_draw_titlebar(&g_ac, title, (i64)g_ac.fb_w);
 
     int margin = 12;
-    int top_y = DA_TITLEBAR_H + 4;
+    int top_y = da_chrome_h() + 4;
     int row_h = CHAR_H + 2;
     int visible_rows = ((int)g_ac.fb_h - top_y - DA_STATUSBAR_H - 8) / row_h;
 
@@ -360,7 +359,9 @@ static void find_user_dir(void) {
 
 __attribute__((visibility("default")))
 void dsk_entry(const da_boot_context *ctx) {
-    __asm__ volatile("cli");
+    /* P6b：输入走 srv.input.*.poll（IRQ1/IRQ12 由 ps2kbd/ps2mouse 投递），
+     * 必须开中断 —— sti 取代旧的 cli。 */
+    __asm__ volatile("sti");
     da_slog("fileman", "boot");
 
     if (!ctx || ctx->magic != DA_BOOT_MAGIC) {
@@ -370,7 +371,11 @@ void dsk_entry(const da_boot_context *ctx) {
 
     da_init(&g_ac, ctx);
     da_cursor_init(&g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
-    da_mouse_init();
+    static da_input g_in;
+    if (da_input_open(&g_in, &g_ac) != 0) {
+        da_slog("fileman", "input bus missing (INPUT-E01)");
+        return;
+    }
 
     /* 初始化 fat32_io：注入 block_read/block_write */
     f32_init((f32_block_read_fn)g_ac.block_read, (f32_block_write_fn)g_ac.block_write);
@@ -385,8 +390,8 @@ void dsk_entry(const da_boot_context *ctx) {
     for (;;) {
         int need_redraw = 0;
 
-        /* 鼠标轮询 */
-        if (da_mouse_poll(&g_mouse, &g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
+        /* 鼠标轮询（总线快照绝对坐标） */
+        if (da_input_mouse(&g_in, &g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
             need_redraw = 1;
             if (g_cursor.btn) {
                 /* 检查关闭按钮点击（右上角：w-28, 4, 24, 20） */
@@ -396,7 +401,7 @@ void dsk_entry(const da_boot_context *ctx) {
                     return;
                 }
                 if (!view_mode) {
-                    int top_y = DA_TITLEBAR_H + 4 + CHAR_H + 4;
+                    int top_y = da_chrome_h() + 4 + CHAR_H + 4;
                     int row_h = CHAR_H + 6;
                     int click_y = g_cursor.my - top_y - CHAR_H - 6;
                     if (click_y >= 0) {
@@ -410,11 +415,9 @@ void dsk_entry(const da_boot_context *ctx) {
             }
         }
 
-        /* 键盘轮询 */
-        u8 st = inb(0x64);
-        if ((st & 1) && !(st & 0x20)) {
-            u8 data = inb(0x60);
-            u8 sc = data;
+        /* 键盘轮询（总线 ring，一次取一个扫描码） */
+        u8 sc;
+        while (da_input_kbd(&g_in, &sc)) {
             if (sc == 0xE0) { e0 = 1; goto skip; }
             if (sc == 0x2A || sc == 0x36) { shift = 1; goto skip; }
             if (sc == 0xAA || sc == 0xB6) { shift = 0; goto skip; }

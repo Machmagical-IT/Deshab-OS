@@ -109,6 +109,8 @@ static const dkm_kapi_entry g_kapi_entries[] = {
     { "apic.register_eoi",  (void *)idt_register_apic_eoi },
     { "drr.snapshot_dirty", (void *)drr_ckpt_snapshot_dirty },
     { "drr.rollback_pages", (void *)drr_rollback_pages },
+    { "drr.rollback_segment", (void *)drr_rollback_segment },   /* R4 */
+    { "drr.rollback_system",  (void *)drr_rollback_system },    /* R4 */
     { "utrw.debug_dump",    (void *)utrw_debug_dump_page },
 };
 

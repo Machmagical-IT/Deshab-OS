@@ -144,6 +144,8 @@ struct ipc_exec_request {
     uint32_t flags;                                  /* UTSM_EXEC_FLAG_* (0 = sync) */
     char     path[UTSM_EXEC_PATH_MAX];               /* program path (NUL-terminated) */
     char     argv_blob[UTSM_EXEC_ARGV_MAX];          /* argv strings, each NUL-terminated */
+    uint32_t timeout_sec;                            /* 0 = UTSM_EXEC_TIMEOUT_SEC 默认；
+                                                      * >0 覆盖（长任务如 VSCode 解包需更久） */
 } __attribute__((packed));
 
 struct ipc_exec_exit {

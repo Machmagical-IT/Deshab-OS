@@ -2,6 +2,7 @@
 #include <utsm/panic.h>
 #include <utsm/vmx.h>
 #include <utsm/ept.h>
+#include <utsm/vm_machine.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/dma.h>
@@ -45,32 +46,7 @@ static const char *vmx_error_str(u64 err) {
 
 /* ===== VMM 全局状态 ===== */
 static int g_vmm_ready;
-static u64 g_vmcs_phys;
-
-/* VM-Exit 后回到 host 的栈与 RIP 恢复点。
- * vmm_self_test 在 vmlaunch 前保存当前 RSP 与"launch 后"的 RIP，
- * VM-Exit 处理器在决定终止 guest 时恢复 RSP 并 jmp 到该 RIP。
- * 注意：这些变量必须是非 static 的全局符号，因为 vmexit_asm.S 通过
- * RIP 相对寻址引用它们。 */
-volatile u64 g_saved_host_rsp;
-volatile u64 g_saved_return_rip;
-volatile int g_guest_terminated;
-volatile u64 g_last_exit_reason;
-
-/* Linux guest park-and-resume 状态。
- * g_linux_guest_active: 1 = 当前运行的 guest 是 Linux（HLT 时 park，不终止）
- * g_guest_parked: 1 = Linux guest 已 HLT 驻留，等待 vmresume 唤醒 */
-volatile int g_linux_guest_active;
-volatile int g_guest_parked;
-
-/* Guest GPR save area (referenced by vmexit_asm.S).
- * VM-Exit 时 CPU 不自动保存 guest GPR，由汇编入口保存到此结构。
- * C 处理器可读写此结构（如 VMCALL 返回值写入 rax）。 */
-volatile struct vmexit_guest_regs g_guest_regs;
-
-/* host 栈：VM-Exit 时使用（HOST_RSP）。
- * 非static：linux_boot.c 共用同一个 host 栈。 */
-u8 g_host_stack[8192] __attribute__((aligned(16)));
+static struct vm_machine *g_legacy_machine;
 
 /* VM-Exit 汇编入口（vmexit_asm.S） */
 extern void vmx_vm_exit_handler(void);
@@ -244,7 +220,7 @@ static void vmcs_setup_host_state(void) {
     }
 
     /* Host RSP/RIP：VM-Exit 后跳到 vmx_vm_exit_handler */
-    vmx_vmcs_write(VMCS_HOST_RSP, (u64)&g_host_stack[sizeof(g_host_stack) - 16]);
+    vmx_vmcs_write(VMCS_HOST_RSP, vmm_get_host_stack_top());
     vmx_vmcs_write(VMCS_HOST_RIP, (u64)vmx_vm_exit_handler);
 }
 
@@ -409,8 +385,64 @@ static void vmcs_setup_controls(u64 eptp) {
 
 /* ===== VMM API ===== */
 
+int vmm_machine_prepare(struct vm_machine *machine) {
+    if (!machine || machine->vcpu_count == 0) {
+        panic_full("VMM-E35 INVALID MACHINE PREPARE",
+                   "vmm_machine_prepare received an invalid machine", 0);
+        return -1;
+    }
+    if (!machine->ept.ready && ept_context_init(&machine->ept) != 0) {
+        return -2;
+    }
+    for (u32 i = 0; i < machine->vcpu_count; i++) {
+        struct vm_vcpu *vcpu = &machine->vcpus[i];
+        if (!vcpu->vmcs_phys && vmx_vmcs_alloc(&vcpu->vmcs_phys) != 0) {
+            panic_full("VMM-E36 VCPU VMCS ALLOC FAILED",
+                       "vmx_vmcs_alloc failed while preparing a machine", 0);
+            return -3;
+        }
+        vcpu->state = VM_VCPU_RUNNABLE;
+    }
+    machine->state = VM_MACHINE_READY;
+    return 0;
+}
+
+int vmm_machine_activate(struct vm_machine *machine, u32 vcpu_id) {
+    if (vm_machine_activate(machine, vcpu_id) != 0) return -1;
+    struct vm_vcpu *vcpu = vm_vcpu_active();
+    if (!vcpu || !vcpu->vmcs_phys) {
+        panic_full("VMM-E37 VCPU HAS NO VMCS",
+                   "attempted to activate a vcpu before machine preparation", 0);
+        return -2;
+    }
+    if (vmx_vmcs_load(vcpu->vmcs_phys) != 0) {
+        panic_full("VMM-E38 VCPU VMPTRLD FAILED",
+                   "vmptrld failed while activating a machine vcpu", 0);
+        return -3;
+    }
+    return 0;
+}
+
+void vmm_set_active_profile(enum vm_profile profile) {
+    struct vm_machine *machine = vm_machine_active();
+    if (!machine) {
+        panic_full("VMM-E40 NO ACTIVE MACHINE PROFILE",
+                   "attempted to set a guest profile without an active machine", 0);
+        return;
+    }
+    machine->profile = profile;
+}
+
 int vmm_init(void) {
     log_info("[VMM] init begin");
+
+    vm_machine_registry_init();
+    g_legacy_machine = vm_machine_create("legacy", VM_PROFILE_SELFTEST, 1);
+    if (!g_legacy_machine || vm_machine_activate(g_legacy_machine, 0) != 0) {
+        panic_full("VMM-E33 LEGACY MACHINE CREATE FAILED",
+                   "vmm_init could not create the compatibility machine", 0);
+        return -6;
+    }
 
     if (vmx_enable() != 0) {
         /* 【插桩白名单】设计内环境探测：WHPX/无嵌套 VMX 等 VMX 不可用属
@@ -419,22 +451,21 @@ int vmm_init(void) {
         return -1;
     }
 
-    if (ept_init() != 0) {
-        /* 【插桩白名单】同上：EPT 不可用走 shadow paging 回退，由外层门跳过 guest 段。 */
-        log_error("[VMM] EPT init failed (environment probe, skipping)");
+    if (vmm_machine_prepare(g_legacy_machine) != 0) {
+        log_error("[VMM] machine prepare failed (environment probe, skipping)");
         return -2;
     }
 
-    if (vmx_vmcs_alloc(&g_vmcs_phys) != 0) {
-        /* 【插桩白名单】同上：init 期资源探测失败，非运行期语义错误。 */
-        log_error("[VMM] VMCS alloc failed (environment probe, skipping)");
+    struct vm_vcpu *boot_vcpu = vm_vcpu_active();
+    if (!boot_vcpu) {
+        panic_full("VMM-E39 ACTIVE VCPU LOST",
+                   "the compatibility vcpu disappeared after preparation", 0);
         return -3;
     }
-    log_hex64("[VMM] VMCS phys=", g_vmcs_phys);
+    log_hex64("[VMM] VMCS phys=", boot_vcpu->vmcs_phys);
 
-    if (vmx_vmcs_load(g_vmcs_phys) != 0) {
-        /* 【插桩白名单】同上。 */
-        log_error("[VMM] VMCS load failed (environment probe, skipping)");
+    if (vmm_machine_activate(g_legacy_machine, 0) != 0) {
+        log_error("[VMM] vCPU activate failed (environment probe, skipping)");
         return -4;
     }
 
@@ -468,7 +499,25 @@ int vmm_is_ready(void) { return g_vmm_ready; }
 u64 vmm_get_eptp(void) { return ept_get_eptp(); }
 /* P8.5: 暴露 VMCS 物理地址，供 linux_launch() 在 vmlaunch 前
  * 执行 VMCLEAR+VMPTRLD（VMCS 状态机：VMLAUNCH 要求 clear 态）。 */
-u64 vmm_get_vmcs_phys(void) { return g_vmcs_phys; }
+u64 vmm_get_vmcs_phys(void) {
+    struct vm_vcpu *vcpu = vm_vcpu_active();
+    return vcpu ? vcpu->vmcs_phys : 0;
+}
+
+u8 *vmm_get_host_stack(void) {
+    struct vm_vcpu *vcpu = vm_vcpu_active();
+    return vcpu ? vcpu->host_stack : (u8 *)0;
+}
+
+u64 vmm_get_host_stack_top(void) {
+    u8 *stack = vmm_get_host_stack();
+    if (!stack) {
+        panic_full("VMM-E34 NO ACTIVE HOST STACK",
+                   "a VMCS host state was requested without an active vcpu", 0);
+        return 0;
+    }
+    return (u64)&stack[VM_VCPU_HOST_STACK_SIZE - 16];
+}
 
 /* P8.4: Dump all guest-state VMCS fields for KVM nested VMX debugging.
  * Called before VMLAUNCH to identify field encoding/value errors. */
@@ -562,6 +611,7 @@ int vmm_self_test(void) {
     }
 
     log_info("[VMM] self-test begin");
+    vmm_set_active_profile(VM_PROFILE_SELFTEST);
 
     /* 重置状态 */
     g_guest_terminated = 0;
@@ -641,12 +691,12 @@ int vmm_self_test(void) {
 
     /* P8.4: VMCLEAR + VMPTRLD to put VMCS in "clear" state before VMLAUNCH.
      * Without this, VMLAUNCH fails (error 4 or silent failure under KVM). */
-    if (vmx_vmcs_clear(g_vmcs_phys) != 0) {
+    if (vmx_vmcs_clear(vmm_get_vmcs_phys()) != 0) {
         log_error("[VMM] vmclear failed");
         panic_full("VMM-E22 VMCLEAR FAILED", "vmclear failed on the self test vmcs", 0);
         return -10;
     }
-    if (vmx_vmcs_load(g_vmcs_phys) != 0) {
+    if (vmx_vmcs_load(vmm_get_vmcs_phys()) != 0) {
         log_error("[VMM] vmptrld after vmclear failed");
         panic_full("VMM-E23 VMPTRLD FAILED", "vmptrld failed after vmclear on the self test vmcs", 0);
         return -11;
@@ -678,9 +728,11 @@ int vmm_self_test(void) {
     int failed;
     u64 vm_flags = 0;
     __asm__ volatile(
-        "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"      /* 保存当前 RSP */
+        "movq g_active_saved_host_rsp(%%rip), %%rax\n\t"
+        "movq %%rsp, (%%rax)\n\t"                       /* 保存当前 RSP */
         "leaq 1f(%%rip), %%rax\n\t"                     /* 取 post_guest 标签地址 */
-        "movq %%rax, g_saved_return_rip(%%rip)\n\t"     /* 保存返回 RIP */
+        "movq g_active_saved_return_rip(%%rip), %%rcx\n\t"
+        "movq %%rax, (%%rcx)\n\t"                       /* 保存返回 RIP */
         "vmlaunch\n\t"                                  /* 启动 guest */
         /* ---- 失败路径（mov 不改 flags，先存 failed 再抓 RFLAGS） ---- */
         "movl $1, %0\n\t"
@@ -767,14 +819,23 @@ int vmm_self_test(void) {
  * 不再在 C 中调用。这样 C 处理器可以修改 g_guest_regs.rax 等，
  * 汇编恢复后 vmresume 时 CPU GPR = 修改后的 guest 值。 */
 void vmm_vmexit_entry(void) {
+    struct vm_vcpu *origin = vm_vcpu_active();
+    u64 reason = vmx_vmcs_read(VMCS_EXIT_REASON) & 0xFFFF;
     int resume = vmexit_dispatch();
-    g_last_exit_reason = vmx_vmcs_read(VMCS_EXIT_REASON) & 0xFFFF;
+    if (origin) {
+        origin->last_exit_reason = reason;
+        origin->exit_count++;
+    }
 
     if (resume) {
         /* 汇编侧会恢复 GPR 并执行 vmresume，无需在此调用。
          * 如果 vmresume 失败，汇编会设置 g_guest_terminated=1。 */
     } else {
         g_guest_terminated = 1;
+        if (origin) {
+            origin->terminated = 1;
+            origin->state = VM_VCPU_HALTED;
+        }
     }
 }
 

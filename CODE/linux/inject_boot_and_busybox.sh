@@ -9,7 +9,7 @@ if [ ! -x "$BB" ]; then
         https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox; then
         echo "[bb] extract from initrd"
         XT=$(mktemp -d)
-        (cd "$XT" && cpio -id < "$ROOT/SYSTEM/boot/linux-initrd.img" >/dev/null 2>&1) || true
+        (cd "$XT" && cpio -id < "$ROOT/SYSTEM/ESP/boot/linux-initrd.img" >/dev/null 2>&1) || true
         if [ -x "$XT/bin/busybox" ]; then
             cp "$XT/bin/busybox" "$BB"
         fi

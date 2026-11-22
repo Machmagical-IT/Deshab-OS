@@ -1,0 +1,52 @@
+# ==============================
+# Build Artifacts
+# ==============================
+
+# Kernel object files
+SYSTEM/lib/Ztknl/*.o
+SYSTEM/lib/Ztknl/vmm/*.o
+
+# User program object files
+SYSTEM/lib/init/*.o
+SYSTEM/lib/desk/*.o
+
+# Compiled user programs (built from source)
+
+
+
+
+# ==============================
+# ISO / Image
+# ==============================
+
+ISO/*.iso
+ISO/iso_staging/
+
+# ==============================
+# Server (not part of OS build)
+# ==============================
+
+SERVER/
+
+# ==============================
+# Editor & IDE
+# ==============================
+
+*.swp
+*.swo
+*~
+.DS_Store
+*.kate-swp
+.*.kate-swp
+
+.vscode/
+.idea/
+*.code-workspace
+
+# ==============================
+# AI / Tooling
+# ==============================
+
+.qoder/
+.claude/
+.marscode/

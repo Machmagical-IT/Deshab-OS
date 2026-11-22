@@ -7,7 +7,7 @@ exec > >(stdbuf -oL tee "$OUT") 2>&1
 killall qemu-system-x86_64 2>/dev/null || true
 
 echo "===== arch rootfs on SYSTEM (768M, ok to loop) ====="
-ARCH=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/boot/linux-rootfs.img
+ARCH=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/ESP/boot/linux-rootfs.img
 if [[ -f "$ARCH" ]]; then
     r=$(mktemp -d)
     if mount -o loop,ro "$ARCH" "$r"; then

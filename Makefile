@@ -29,24 +29,27 @@ BTMP    := $(ROOT)/.build_tmp
 
 MAKEFLAGS += -j
 
-# ---- sub-builds (each MAKEFILE outputs straight into SYSTEM/) ----
-KERNELS := CODE/UTSM CODE/dsk
+# ---- sub-builds (each MAKEFILE outputs straight into SYSTEM/ESP/) ----
+KERNELS := CODE/UTSM
 APPS    := CODE/firstInit CODE/login CODE/mouse CODE/netman CODE/shell CODE/desktop CODE/cmd \
            $(addprefix CODE/tools/,editor fileman browser curl ping settings)
 
-# ---- DKM drivers: src -> SYSTEM/driver/... ----
+# ---- DKM drivers: src -> SYSTEM/ESP/driver/... ----
+# -I 指向 UTSM 公共头：ath9k/wpa2_crypto 与 desktop/cmd 等模块引用 <utsm/...>。
+UTSM_INC := $(ROOT)/CODE/UTSM/include
 DRV_FLAGS := -target x86_64-unknown-none -std=c11 -ffreestanding -fno-builtin \
              -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone \
-             -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra -O2
+             -mno-sse -mno-sse2 -mno-mmx -msoft-float -m64 -Wall -Wextra \
+             -I $(UTSM_INC) -O2
 
-DRV_SRCS := CODE/DKM/console_fb/console_fb.c:SYSTEM/driver/console/console_fb.drv \
-            CODE/DKM/apic/apic.c:SYSTEM/driver/platform/apic.drv \
-            CODE/DKM/nvme/nvme.c:SYSTEM/driver/block/nvme.drv \
-            CODE/DKM/ehci/ehci.c:SYSTEM/driver/block/ehci.drv \
-            CODE/DKM/xhci/xhci.c:SYSTEM/driver/block/xhci.drv \
-            CODE/DKM/e1000/e1000.c:SYSTEM/driver/net/e1000.drv \
-            CODE/DKM/virtio_net/virtio_net.c:SYSTEM/driver/net/virtio_net.drv \
-            CODE/DKM/ath9k/ath9k.c:SYSTEM/driver/net/ath9k.drv
+DRV_SRCS := CODE/DKM/console_fb/console_fb.c:SYSTEM/ESP/driver/console/console_fb.drv \
+            CODE/DKM/apic/apic.c:SYSTEM/ESP/driver/platform/apic.drv \
+            CODE/DKM/nvme/nvme.c:SYSTEM/ESP/driver/block/nvme.drv \
+            CODE/DKM/ehci/ehci.c:SYSTEM/ESP/driver/block/ehci.drv \
+            CODE/DKM/xhci/xhci.c:SYSTEM/ESP/driver/block/xhci.drv \
+            CODE/DKM/e1000/e1000.c:SYSTEM/ESP/driver/net/e1000.drv \
+            CODE/DKM/virtio_net/virtio_net.c:SYSTEM/ESP/driver/net/virtio_net.drv \
+            CODE/DKM/ath9k/ath9k.c:SYSTEM/ESP/driver/net/ath9k.drv
 
 DRV_OUTS := $(foreach s,$(DRV_SRCS),$(ROOT)/$(word 2,$(subst :, ,$(s))))
 
@@ -84,7 +87,7 @@ apps:
 
 drivers: $(DRV_OUTS)
 
-$(ROOT)/SYSTEM/driver/%.drv: $(ROOT)/CODE/DKM/%.c
+$(ROOT)/SYSTEM/ESP/driver/%.drv: $(ROOT)/CODE/DKM/%.c
 	@mkdir -p $(dir $@) $(BTMP)
 	@echo "[build] DKM driver: $< -> $@"
 	$(CC) $(DRV_FLAGS) -c $< -o $(BTMP)/$(notdir $<).o
@@ -101,8 +104,8 @@ inject-%:
 	@if [ -d build/configs/$* ]; then \
 	  if [ ! -f build/configs/$*/FUCK ] || [ ! -f build/configs/$*/firstInit.txt ]; then \
 	    echo "Missing FUCK/firstInit.txt template in build/configs/$*"; exit 1; fi; \
-	  cp build/configs/$*/FUCK SYSTEM/system/deshab64/FUCK; \
-	  cp build/configs/$*/firstInit.txt SYSTEM/system/user/use/firstInit.txt; \
+	  cp build/configs/$*/FUCK SYSTEM/ESP/system/deshab64/FUCK; \
+	  cp build/configs/$*/firstInit.txt SYSTEM/ESP/system/user/use/firstInit.txt; \
 	  echo "[build] Injected config variant=$* (FUCK + firstInit.txt)"; \
 	else \
 	  echo "[build] WARN: configs/$* absent, packaging SYSTEM as-is"; \

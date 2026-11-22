@@ -6,10 +6,10 @@
 #ifndef DESHAB_FAT32_PART_H
 #define DESHAB_FAT32_PART_H
 
-/* pack_system_image.sh uses 64 sectors/cluster (32KiB) when the ESP is >= 4GiB.
- * Every FAT32 cluster buffer in DSK/UTSM/userland must cover that size. */
+/* 镜像用 2KiB 簇。firstinit 把 ESP 扩到 FAT32 扇区号上限时把簇加大，
+ * BPB 允许的最大簇是 64KiB。读 ESP 的缓冲都要盖住这个值。 */
 #ifndef FAT32_MAX_CLUSTER_BYTES
-#define FAT32_MAX_CLUSTER_BYTES 32768u
+#define FAT32_MAX_CLUSTER_BYTES 65536u
 #endif
 
 typedef int (*fat32_part_read_fn)(u32 index, u64 lba, u32 count, void *buf);

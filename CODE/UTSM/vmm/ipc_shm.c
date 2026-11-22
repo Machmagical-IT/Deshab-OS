@@ -45,12 +45,18 @@ int ipc_shm_init(void) {
     log_info("[IPC] shm init begin");
 
     /* 1. Allocate 1MB contiguous physical memory for the shared region.
-     * Alignment: 4KB (page-aligned). Max phys: none (EPT maps any HPA). */
+     * 诊断修复：改用高内存（≥4G）分配。原低内存分配（dma_alloc_pages）疑似与
+     * 某个主机低内存缓冲重叠 → SHM 头/环被覆写 → ipc_shm_send 算出越界 memcpy
+     * → UTSM-EXC0E 崩机。guest RAM 本就高内存分配，SHM 走 HHDM 直映射，HPA 位置
+     * 任意，EPT 映射只需 GPA 固定（0x4000000），故可安全移到高内存。 */
     u64 page_count = UTSM_IPC_SHM_SIZE / 4096;
-    if (dma_alloc_pages(page_count, 4096, 0, &g_shm_buf) != 0) {
-        log_error("[IPC] failed to alloc shared memory (1MB)");
-        panic_full("IPC-E01 ALLOC SHARED MEMORY FAILED", "dma_alloc_pages failed for the 1mb ipc shared memory region", 0);
-        return -1;
+    if (dma_alloc_high_pages(page_count, 4096, &g_shm_buf) != 0) {
+        log_warn("[IPC] high-mem SHM alloc failed, falling back to low mem");
+        if (dma_alloc_pages(page_count, 4096, 0, &g_shm_buf) != 0) {
+            log_error("[IPC] failed to alloc shared memory (1MB)");
+            panic_full("IPC-E01 ALLOC SHARED MEMORY FAILED", "dma_alloc_pages failed for the 1mb ipc shared memory region", 0);
+            return -1;
+        }
     }
     log_hex64("[IPC] shm HPA=", g_shm_buf.phys);
     log_hex64("[IPC] shm virt=", (u64)g_shm_buf.virt);
@@ -112,6 +118,10 @@ int ipc_shm_is_ready(void) {
     return g_shm_ready;
 }
 
+int ipc_shm_linux_ready(void) {
+    return (g_shm_ready && g_shm && g_shm->header.linux_ready) ? 1 : 0;
+}
+
 u64 ipc_shm_get_hpa(void) {
     return g_shm_ready ? g_shm_buf.phys : 0;
 }
@@ -146,6 +156,10 @@ int ipc_shm_send(u32 msg_type, const void *data, u32 data_len) {
     /* Check if Linux is ready to receive */
     if (!g_shm->header.linux_ready) {
         log_warn("[IPC] send: Linux not ready, dropping message");
+        /* HELLO_ACK 是信息性消息（客户机 utsm_hcall 不消费它）；guest 早期 HELLO
+         * 阶段 linux_ready 尚未置位属正常，跳过即可，不该触发零降级 panic。
+         * 其余所有消息保持零降级（IPC-E03）。 */
+        if (msg_type == UTSM_MSG_HELLO_ACK) return -1;
         panic_full("IPC-E03 SEND WITH LINUX NOT READY", "message dropped because the linux side never became ready", 0);
         return -1;
     }

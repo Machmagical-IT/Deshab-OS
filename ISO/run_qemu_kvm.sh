@@ -20,12 +20,18 @@
 #   QEMU_SMP=4 ./run_qemu_kvm.sh   # override vcpu count
 #   QEMU_ACCEL=tcg ./run_qemu_kvm.sh # force TCG fallback (no nested VMX)
 #
-# See ISO/run_qemu.bat for Windows host fallback (WHPX/TCG, no Linux guest).
+# ISO/run_qemu.bat on Windows calls this script through WSL.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMG="${IMG_OVERRIDE:-$SCRIPT_DIR/deshab-dev.img}"
+VARIANT="${1:-dev}"
+case "$VARIANT" in
+    1) VARIANT=dev ;;
+    2) VARIANT=release ;;
+    3) VARIANT=realtest ;;
+esac
+IMG="${IMG_OVERRIDE:-$SCRIPT_DIR/deshab-${VARIANT}.img}"
 SATA_IMG="${SATA_IMG_OVERRIDE:-$SCRIPT_DIR/../.build_tmp/sata_fat32_dsk.img}"
 NVME_IMG="${NVME_IMG_OVERRIDE:-$SCRIPT_DIR/../.build_tmp/nvme_test.img}"
 USB_IMG="${USB_IMG_OVERRIDE:-$SCRIPT_DIR/../.build_tmp/usb_test.img}"
@@ -146,10 +152,10 @@ SMP="${QEMU_SMP:-2}"
 # Detect whether Linux compat layer is enabled (bzImage module present in IMG).
 LINUX_ENABLED=0
 if grep -q 'module_path: boot():/boot/linux-bzImage' \
-        "$SCRIPT_DIR/../SYSTEM/limine/limine.conf" 2>/dev/null ; then
+        "$SCRIPT_DIR/../SYSTEM/ESP/limine/limine.conf" 2>/dev/null ; then
     # Check the line is uncommented (not prefixed with '#')
     if grep -E '^\s*module_path: boot\(\):/boot/linux-bzImage' \
-            "$SCRIPT_DIR/../SYSTEM/limine/limine.conf" >/dev/null 2>&1 ; then
+            "$SCRIPT_DIR/../SYSTEM/ESP/limine/limine.conf" >/dev/null 2>&1 ; then
         LINUX_ENABLED=1
     fi
 fi
@@ -224,16 +230,20 @@ else
     echo "[qemu] Serial: $SERIAL"
 fi
 
-DISPLAY_OPTS=()
-if [[ -n "${QEMU_DISPLAY:-}" ]]; then
-    DISPLAY_OPTS=(-display "$QEMU_DISPLAY")
-    echo "[qemu] Display: $QEMU_DISPLAY"
-fi
+# gtk 在 WSLg 里卡在 gdk seat，窗口不出来。默认 SDL。
+DISP="${QEMU_DISPLAY:-sdl,gl=off}"
+DISPLAY_OPTS=(-display "$DISP")
+echo "[qemu] Display: $DISP"
 
 MONITOR_OPTS=()
 if [[ -n "${QEMU_MONITOR:-}" ]]; then
     MONITOR_OPTS=(-monitor "$QEMU_MONITOR")
     echo "[qemu] Monitor: $QEMU_MONITOR"
+fi
+# QEMU_QMP=unix:/tmp/q.sock,server,nowait exposes QMP (input-send-event for abs-pointer tests)
+if [[ -n "${QEMU_QMP:-}" ]]; then
+    MONITOR_OPTS+=(-qmp "$QEMU_QMP")
+    echo "[qemu] QMP: $QEMU_QMP"
 fi
 
 PFLASH_VARS=()
@@ -243,7 +253,7 @@ fi
 
 exec "$QEMU" \
     -accel "$ACCEL" \
-    -machine q35 \
+    -machine q35,vmport=on \
     -m "$MEM" \
     -smp "$SMP" \
     -cpu "$CPU" \
@@ -252,7 +262,7 @@ exec "$QEMU" \
     "${SERIAL_ARGS[@]}" \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
     "${PFLASH_VARS[@]}" \
-    -drive if=none,id=osdisk,format=raw,file="$IMG" \
+    -drive if=none,id=osdisk,format=raw,file="$IMG",file.locking=off \
     -device ide-hd,drive=osdisk,bus=ide.0,bootindex=1 \
     $SATA_OPTS \
     $NVME_OPTS \

@@ -4,6 +4,70 @@ Command failures and integration errors.
 
 ---
 
+## [ERR-20261121-002] fat32_cp_archive_owner
+
+**Logged**: 2026-11-21T15:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: infra
+
+### Summary
+向 FAT32 测试镜像复制 Windows VM 载荷时不能使用 `cp -a`。
+
+### Error
+```
+cp: failed to preserve ownership: Operation not permitted
+```
+
+### Context
+- Source: `SYSTEM/ESP/boot/windows-vm`
+- Destination: mounted FAT32 ESP
+
+### Suggested Fix
+在 FAT32 目标上使用 `cp -r source/. destination/`，不请求保存 Unix owner。
+
+### Metadata
+- Reproducible: yes
+- Related Files: .build_tmp/patch_dev_windows_test.sh
+
+### Resolution
+- **Resolved**: 2026-11-21T15:00:00+08:00
+- **Notes**: 测试注入脚本已改为普通递归复制。
+
+---
+
+## [ERR-20261121-001] make_not_on_powershell_path
+
+**Logged**: 2026-11-21T14:17:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: config
+
+### Summary
+UTSM 增量构建不能直接从当前 PowerShell PATH 调用 `make`。
+
+### Error
+```
+make : 无法将“make”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。
+```
+
+### Context
+- Command: `make -C CODE/UTSM -j4`
+- Environment: Windows PowerShell
+
+### Suggested Fix
+通过项目已有 WSL 构建环境调用 `make`，或使用 `build.ps1` 配置的工具链。
+
+### Metadata
+- Reproducible: yes
+- Related Files: CODE/UTSM/MAKEFILE, build.ps1
+
+### Resolution
+- **Resolved**: 2026-11-21T14:17:00+08:00
+- **Notes**: 后续构建切换至 WSL。
+
+---
+
 ## [ERR-20260906-001] linux_compat exec returns -4 after guest park
 
 **Logged**: 2026-09-06T23:10:00+08:00

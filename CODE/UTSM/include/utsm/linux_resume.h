@@ -18,7 +18,7 @@
  */
 
 /* 唤醒已 park 的 Linux guest。
- * 前置条件：g_guest_parked == 1（linux_launch 已完成且 guest 已 HLT）。
+ * 前置条件：active Linux machine 为 VM_MACHINE_PARKED。
  * 返回 0 成功（guest 再次 park），负值失败。 */
 int linux_resume(void);
 

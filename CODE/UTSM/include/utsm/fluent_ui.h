@@ -187,6 +187,44 @@ static inline void du_wf_ring(du_context *ctx, du_i64 cx, du_i64 cy,
 /* 按钮态 */
 typedef enum { WF_BTN_NORMAL = 0, WF_BTN_HOVER, WF_BTN_PRESS } wf_btn_state;
 
+/* L4 图标 id（枚举前置——L3 组件按 id 引用；绘制实现见下方 L4 节） */
+typedef enum wf_icon_id {
+    WF_ICON_START = 1,     /* 四方块（开始） */
+    WF_ICON_SEARCH,        /* 放大镜 */
+    WF_ICON_NETWORK,       /* WiFi 扇形 */
+    WF_ICON_VOLUME,        /* 喇叭 */
+    WF_ICON_POWER,         /* 电源 */
+    WF_ICON_TASKMGR,       /* 折线图 */
+    WF_ICON_SETTINGS,      /* 齿轮（简化） */
+    WF_ICON_FOLDER,        /* 文件夹 */
+    WF_ICON_TERMINAL,      /* 终端 >_ */
+    WF_ICON_EDITOR,        /* 文档横线 */
+    WF_ICON_CALC,          /* 计算器格子 */
+    WF_ICON_BROWSER,       /* 地球 */
+    WF_ICON_TASKVIEW,      /* 双矩形 */
+    WF_ICON_WIDGETS,       /* 四小件 */
+    WF_ICON_NOTIFY,        /* 铃铛 */
+    WF_ICON_CLOSE,         /* × */
+    WF_ICON_MIN,           /* – */
+    WF_ICON_MAX,           /* □ */
+    WF_ICON_RESTORE,       /* 双层 □ */
+    WF_ICON_USER,          /* 人形 */
+    /* M3 开始菜单/系统工具批次 */
+    WF_ICON_APPS,          /* 3×3 点阵（应用列表） */
+    WF_ICON_CLOCK,         /* 圆 + 指针 */
+    WF_ICON_INFO,          /* 圆 + i */
+    WF_ICON_DISK,          /* 圆柱（磁盘） */
+    WF_ICON_PICTURE,       /* 山 + 太阳（画板/图片） */
+    WF_ICON_MUSIC,         /* 音符 */
+    WF_ICON_GAME,          /* 手柄 */
+    WF_ICON_CHIP,          /* CPU 芯片 */
+    WF_ICON_REFRESH,       /* 环形箭头 */
+    WF_ICON_LOCK,          /* 挂锁 */
+    WF_ICON_TRASH,         /* 垃圾桶 */
+} wf_icon_id;
+static inline void du_wf_icon(du_context *ctx, wf_icon_id id,
+                              du_i64 x, du_i64 y, du_i64 size, du_u32 color);
+
 /* 标准按钮：圆角 4，三态底色，ASCII 标签居中（accent=1 为强调按钮） */
 static inline void du_wf_button(du_context *ctx, du_i64 x, du_i64 y, du_i64 w,
                                 const char *label, const wf_theme *t,
@@ -406,43 +444,8 @@ static inline void du_wf_badge(du_context *ctx, du_i64 cx, du_i64 cy,
  *  L4 — 矢量图标（24 网格设计，线性 2px 笔触，Win11 Segoe 风格）
  *
  *  所有图标以 (x, y) 为左上角、size 为边长绘制，按 u = size/24 缩放
- *  （u 为最小单位，笔触 s = 2u）。
+ *  （u 为最小单位，笔触 s = 2u）。枚举 wf_icon_id 定义在 L3 节之前。
  * =================================================================== */
-
-typedef enum {
-    WF_ICON_START = 1,     /* 四方块（开始） */
-    WF_ICON_SEARCH,        /* 放大镜 */
-    WF_ICON_NETWORK,       /* WiFi 扇形 */
-    WF_ICON_VOLUME,        /* 喇叭 */
-    WF_ICON_POWER,         /* 电源 */
-    WF_ICON_TASKMGR,       /* 折线图 */
-    WF_ICON_SETTINGS,      /* 齿轮（简化） */
-    WF_ICON_FOLDER,        /* 文件夹 */
-    WF_ICON_TERMINAL,      /* 终端 >_ */
-    WF_ICON_EDITOR,        /* 文档横线 */
-    WF_ICON_CALC,          /* 计算器格子 */
-    WF_ICON_BROWSER,       /* 地球 */
-    WF_ICON_TASKVIEW,      /* 双矩形 */
-    WF_ICON_WIDGETS,       /* 四小件 */
-    WF_ICON_NOTIFY,        /* 铃铛 */
-    WF_ICON_CLOSE,         /* × */
-    WF_ICON_MIN,           /* – */
-    WF_ICON_MAX,           /* □ */
-    WF_ICON_RESTORE,       /* 双层 □ */
-    WF_ICON_USER,          /* 人形 */
-    /* M3 开始菜单/系统工具批次 */
-    WF_ICON_APPS,          /* 3×3 点阵（应用列表） */
-    WF_ICON_CLOCK,         /* 圆 + 指针 */
-    WF_ICON_INFO,          /* 圆 + i */
-    WF_ICON_DISK,          /* 圆柱（磁盘） */
-    WF_ICON_PICTURE,       /* 山 + 太阳（画板/图片） */
-    WF_ICON_MUSIC,         /* 音符 */
-    WF_ICON_GAME,          /* 手柄 */
-    WF_ICON_CHIP,          /* CPU 芯片 */
-    WF_ICON_REFRESH,       /* 环形箭头 */
-    WF_ICON_LOCK,          /* 挂锁 */
-    WF_ICON_TRASH,         /* 垃圾桶 */
-} wf_icon_id;
 
 static inline void du_wf_icon(du_context *ctx, wf_icon_id id,
                               du_i64 x, du_i64 y, du_i64 size, du_u32 color) {
@@ -460,11 +463,42 @@ static inline void du_wf_icon(du_context *ctx, wf_icon_id id,
         du_wf_ring(ctx, x + 10 * u, y + 10 * u, 7 * u, s, 0, color);
         du_wf_line(ctx, x + 15 * u, y + 15 * u, x + 20 * u, y + 20 * u, s, color);
         break;
-    case WF_ICON_NETWORK:
-        du_fill_rounded_rect(ctx, x + 10 * u, y + 17 * u, 3 * u, 3 * u, color, (du_u32)u);
-        du_wf_ring(ctx, x + 11 * u, y + 19 * u, 6 * u, s, 1, color);
-        du_wf_ring(ctx, x + 11 * u, y + 21 * u, 10 * u, s, 1, color);
+    case WF_ICON_NETWORK: {
+        /* 同心三弧，共用底点圆心。半径之间留出比笔触更宽的空档，
+         * 缩到顶栏后仍是三道分开的扇形，不会叠成一条。 */
+        du_i64 cx = x + 12 * u;
+        du_i64 cy = y + 20 * u;
+        du_i64 th = (u * 3) / 2;
+        du_i64 rads[3];
+        int ai;
+        if (th < 1) th = 1;
+        rads[0] = 5 * u;
+        rads[1] = 9 * u;
+        rads[2] = 13 * u;
+        for (du_i64 dy = -u; dy <= u; dy++) {
+            for (du_i64 dx = -u; dx <= u; dx++) {
+                if (dx * dx + dy * dy <= u * u)
+                    du_pixel(ctx, cx + dx, cy + dy, color);
+            }
+        }
+        for (ai = 0; ai < 3; ai++) {
+            du_i64 r = rads[ai];
+            du_i64 ri = r - th;
+            du_i64 dy, dx;
+            if (ri < 1) ri = 1;
+            for (dy = -r; dy < 0; dy++) {
+                for (dx = -r; dx <= r; dx++) {
+                    du_i64 adx = dx < 0 ? -dx : dx;
+                    du_i64 ady = -dy;
+                    du_i64 d2 = dx * dx + dy * dy;
+                    if (adx * 4 > ady * 5) continue;
+                    if (d2 >= ri * ri && d2 <= r * r)
+                        du_pixel(ctx, cx + dx, cy + dy, color);
+                }
+            }
+        }
         break;
+    }
     case WF_ICON_VOLUME:
         /* 喇叭主体：梯形 */
         du_fill_rect(ctx, x + 3 * u, y + 9 * u, 4 * u, 6 * u, color);

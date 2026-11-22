@@ -22,6 +22,16 @@
 #define DSK_BOOT_FLAG_FAT32_PATH (1ULL << 2)
 #define DSK_BOOT_FLAG_PROBE_INFO (1ULL << 3)
 #define DSK_BOOT_FLAG_PANIC_FALLBACK (1ULL << 4)  /* FUCK [panic] mode=fallback */
+/* 桌面窗口宿主：置位时 kernel_stack_top 指向 desk_host_view。 */
+#define DSK_BOOT_FLAG_HOSTED         (1ULL << 5)
+#define DESK_HOST_MAGIC              0x484F5354u /* "HOST" */
+
+typedef struct desk_host_view {
+    u32 magic;
+    u16 ox, oy;
+    u16 close_x, close_y, close_w, close_h;
+    void (*pump)(void);
+} desk_host_view;
 
 /* ---- reserved 槽位索引（dsk_boot_context.reserved[]） ---- */
 #define DSB_BOOT_RESERVED_PE_SERVICE      4u
@@ -96,5 +106,32 @@ typedef struct dsk_boot_context {
 
 /* 应用入口点签名。DSK 加载 .elf 后调用 dsk_entry(context)。 */
 typedef void (*dsk_entry_fn)(const dsk_boot_context *context);
+
+/* 同一编译单元里的输入轮询用：把窗口原点/关闭钮从 context 里取出。 */
+static int g_dsb_hosted;
+static int g_dsb_ox, g_dsb_oy;
+static int g_dsb_close_x, g_dsb_close_y, g_dsb_close_w, g_dsb_close_h;
+static int g_dsb_esc;
+static void (*g_dsb_pump)(void);
+
+static inline void dsb_host_bind(const dsk_boot_context *ctx) {
+    const desk_host_view *v;
+    g_dsb_hosted = 0;
+    g_dsb_ox = g_dsb_oy = 0;
+    g_dsb_close_w = g_dsb_close_h = 0;
+    g_dsb_esc = 0;
+    g_dsb_pump = 0;
+    if (!ctx || !(ctx->flags & DSK_BOOT_FLAG_HOSTED)) return;
+    v = (const desk_host_view *)ctx->kernel_stack_top;
+    if (!v || v->magic != DESK_HOST_MAGIC) return;
+    g_dsb_hosted = 1;
+    g_dsb_ox = (int)v->ox;
+    g_dsb_oy = (int)v->oy;
+    g_dsb_close_x = (int)v->close_x;
+    g_dsb_close_y = (int)v->close_y;
+    g_dsb_close_w = (int)v->close_w;
+    g_dsb_close_h = (int)v->close_h;
+    g_dsb_pump = v->pump;
+}
 
 #endif /* DESHAB_BOOT_CONTEXT_H */

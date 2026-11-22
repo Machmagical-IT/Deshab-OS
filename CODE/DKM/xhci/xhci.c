@@ -58,11 +58,15 @@ const struct dkm_driver_desc driver_desc = {
 #define XHCI_SUBCLASS_USB  0x03
 #define XHCI_PROGIF_XHCI   0x30
 
-/* Capability Registers (MMIO + 0x00) */
-#define XHCI_CAP_HCSPARAMS1   0x00
-#define XHCI_CAP_HCSPARAMS2   0x04
-#define XHCI_CAP_HCSPARAMS3   0x08
-#define XHCI_CAP_HCCPARAMS1   0x0C
+/* Capability Registers (xHCI 1.2 §5.3)。
+ * MMIO+0x00 = CAPLENGTH(8) | HCIVERSION(16)；HCSPARAMS1 在 0x04。
+ * BUG-FIX: 原定义把 HCSPARAMS1 写成 0x00，读到的是 CAPLENGTH|HCIVERSION
+ * → MaxPorts 恒为 1、MaxSlots 恒为 0x40，多端口控制器只扫端口 0
+ * （QEMU qemu-xhci 的 usb-kbd 在端口 1 上，永远枚举不到）。 */
+#define XHCI_CAP_HCSPARAMS1   0x04
+#define XHCI_CAP_HCSPARAMS2   0x08
+#define XHCI_CAP_HCSPARAMS3   0x0C
+#define XHCI_CAP_HCCPARAMS1   0x10
 #define XHCI_CAP_DBOFF        0x14
 #define XHCI_CAP_RTSOFF       0x18
 
@@ -164,6 +168,12 @@ const struct dkm_driver_desc driver_desc = {
 #define EP_TYPE_CTRL_IN   4
 #define EP_TYPE_BULK_OUT  2
 #define EP_TYPE_BULK_IN   6
+#define EP_TYPE_INT_IN    7
+
+/* USB class codes（HID boot protocol） */
+#define USB_CLASS_HID        0x03
+#define HID_SUBCLASS_BOOT    0x01
+#define HID_PROTOCOL_KEYBOARD 0x01
 
 /* Slot states */
 #define SLOT_STATE_DISABLED     0
@@ -219,6 +229,7 @@ typedef struct {
 typedef struct {
     u8  slot_id;
     u8  speed;
+    u8  iface;          /* MSC BOT interface number（Reset Recovery 用） */
     u8  bulk_out_ep;    /* EP number for Bulk OUT */
     u8  bulk_in_ep;     /* EP number for Bulk IN */
     u16 bulk_out_mps;   /* Max Packet Size */
@@ -251,6 +262,7 @@ static u32  g_ppc;                   /* Per-Port Power Control (HCCPARAMS1 bit 3
 static xhci_ring  g_cmd_ring;
 static xhci_ring  g_evt_ring;
 static u32        g_evt_ccs;         /* consumer cycle state for event ring */
+static u32        g_evt_consumed;    /* 已消费事件总数（诊断） */
 
 static struct dkm_dma_buffer g_erst;     /* ERST DMA buffer */
 static struct dkm_dma_buffer g_dcbaa;   /* DCBAA DMA buffer */
@@ -258,16 +270,42 @@ static struct dkm_dma_buffer g_sp_bufs; /* Scratchpad buffer array */
 /* Scratchpad individual pages — max 32 scratchpads for safety */
 static struct dkm_dma_buffer g_sp_pages[32];
 
-/* Per-device DMA buffers */
-static struct dkm_dma_buffer g_input_ctx;  /* Input Context */
-static struct dkm_dma_buffer g_dev_ctx;    /* Device Context (output) */
-static xhci_ring             g_ep0_ring;   /* EP0 control transfer ring */
-static xhci_ring             g_bulk_out_ring;
-static xhci_ring             g_bulk_in_ring;
-static struct dkm_dma_buffer g_xfer_buf;   /* Data transfer bounce buffer */
-static struct dkm_dma_buffer g_csw_buf;    /* CSW receive buffer */
+/* Per-device resources。xHCI 的 Input/Device Context、EP0 ring 与传输
+ * 暂存缓冲都是**每个 slot 独立**的：MSC（U 盘）与 HID（键盘）各自持有一份，
+ * 互不覆盖。枚举函数一律接受 bundle 指针，不再读全局。 */
+typedef struct {
+    struct dkm_dma_buffer input_ctx;   /* Input Context */
+    struct dkm_dma_buffer dev_ctx;     /* Device Context (output) */
+    xhci_ring             ep0_ring;    /* EP0 control transfer ring */
+    xhci_ring             bulk_out_ring;  /* MSC only */
+    xhci_ring             bulk_in_ring;   /* MSC only */
+    struct dkm_dma_buffer xfer_buf;    /* Data transfer bounce buffer */
+    struct dkm_dma_buffer csw_buf;     /* CSW receive buffer (MSC only) */
+} xhci_dev_res;
+
+static xhci_dev_res g_msc_res;
 
 static xhci_msc_dev g_msc;
+
+/* ---- USB HID 键盘（HID Boot Protocol, 8 字节报告） ----
+ * 母本 SYSTEMCOPY/OpenXJ380 kmod/xhci/{usb_core,usb_hid}：外部 hub 与
+ * route string 依赖 hub 驱动拓扑；这里实现**直接挂载**（Root Hub 端口
+ * 上的 HID 设备），与 MASK 的 route_string=0 约束一致。外部 hub 下的
+ * HID 需要 hub 类驱动 + 多级 route string，另立任务。
+ *
+ * 消费者经 ps2kbd.drv 的 srv.input.kbd.push 拿到 Set-1 扫描码，
+ * 因此 desktop/shell/cmd/firstInit 无需感知键鼠来自 PS/2 还是 USB。 */
+typedef struct {
+    u8  slot_id;
+    u8  iface;          /* 0 */
+    u8  ep_in;          /* Interrupt IN endpoint number */
+    u16 mps;            /* endpoint max packet size */
+    u8  report[8];      /* 上一份 boot 报告（键位差分用） */
+    int ready;
+} xhci_hid_kbd;
+
+static xhci_hid_kbd g_hid;
+static xhci_dev_res *g_hid_res_owner;   /* HID 所属 slot 的 bundle */
 
 /* PCI device location */
 static u8 g_pci_bus, g_pci_dev, g_pci_func;
@@ -828,9 +866,10 @@ static u32 xhci_ring_enqueue(xhci_ring *ring, u64 param, u32 status, u32 control
     xhci_trb *trbs = (xhci_trb *)ring->dma.virt;
     u32 idx = ring->enqueue;
 
-    /* Set cycle bit in control */
+    /* Set cycle bit in control（本 TRB 属于当前这一圈） */
     control &= ~TRB_CYCLE;
     if (ring->ccs) control |= TRB_CYCLE;
+    u32 lap_cycle = control & TRB_CYCLE;   /* 本圈 cycle，Link TRB 必须用它 */
 
     trbs[idx].parameter = param;
     trbs[idx].status    = status;
@@ -838,9 +877,26 @@ static u32 xhci_ring_enqueue(xhci_ring *ring, u64 param, u32 status, u32 control
 
     /* Advance enqueue */
     ring->enqueue = (idx + 1) % (ring->size - 1); /* -1 to skip Link TRB */
-    /* If we wrapped, toggle CCS */
-    if (idx + 1 >= ring->size - 1)
+    /* If we wrapped, toggle CCS。
+     * 关键：Link TRB 自身的 cycle 位必须同步翻转。控制器按 PCS 判定
+     * TRB 有效性；回绕后若 Link TRB 仍是旧 cycle，控制器把环视为空，
+     * 之后该端点提交的所有 TRB 永远不被处理（实机表现为读盘/写盘在
+     * 若干次成功后永久超时，且卡死阶段固定在某个端点）。 */
+    if (idx + 1 >= ring->size - 1) {
         ring->ccs ^= 1;
+        /* Link TRB 的 cycle 必须等于“刚结束这一圈”的 cycle（lap_cycle），
+         * 而不是翻转后的新 cycle：控制器在本圈末尾读到 Link 时，PCS 仍是
+         * 本圈值；TC=1 让它在跟随 Link 之后自行翻转到下一圈。
+         * （写成新 cycle 会让 Link 在本圈无效 → 控制器停机 → 该端点
+         * 从此收不到任何事件；实机表现为首次回绕后永久超时。） */
+        xhci_trb *link = &trbs[ring->size - 1];
+        link->control = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | lap_cycle;
+    }
+
+    /* 环内存由 CPU 写、控制器 DMA 读（WB 映射）：必须刷 cache，
+     * 否则控制器可能读到旧的 cycle/Link TRB —— 回绕后表现为该端点
+     * 永久收不到事件。代价是性能，本项目按"正确性优先"处理。 */
+    __asm__ volatile("wbinvd" ::: "memory");
 
     return idx;
 }
@@ -881,21 +937,26 @@ static int xhci_poll_event(u32 expected_type, u64 timeout_ms,
                 if (out_status) *out_status = evt->status;
                 if (out_control)*out_control= evt->control;
 
-                /* Advance dequeue */
-                g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % (g_evt_ring.size - 1);
+                g_evt_consumed++;
+                /* Advance dequeue。
+                 * 事件环没有 Link TRB：硬件按 ERST seg_size 写满全部
+                 * EVT_RING_SIZE 项后回到 0。原实现用 %(size-1) 与硬件
+                 * %size 漂移 —— 事件累计超过 255 个后索引错位，后续
+                 * 传输永远等不到事件（大文件读取必然超时）。 */
+                g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % g_evt_ring.size;
                 if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
 
                 /* Update ERDP: 地址 16 字节对齐，bit0 保持 0，bit3=EHB 清挂起 */
                 u64 erdp = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
                 mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | ERDP_EHB);
 
-                /* Check completion code */
+                /* Check completion code。
+                 * 13 = Short Packet：是正常终止（IN 数据少于 TRB 长度），
+                 * 由调用方按 residual 判定，不能当错误丢弃。 */
                 u32 cc = (evt->status >> 24) & 0xFF;
-                if (cc != 1) {  /* 1 = Success */
-                    if (cc != 0) {
-                        log_hex("[xhci] event completion code=", cc);
-                        return -2;
-                    }
+                if (cc != 1 && cc != 13 && cc != 0) {
+                    log_hex("[xhci] event completion code=", cc);
+                    return -2;
                 }
                 return 0;
             }
@@ -914,7 +975,8 @@ static int xhci_poll_event(u32 expected_type, u64 timeout_ms,
             } else {
                 log_hex("[xhci] unexpected event type=", type);
             }
-            g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % (g_evt_ring.size - 1);
+            g_evt_consumed++;
+            g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % g_evt_ring.size;
             if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
             u64 erdp2 = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
             mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp2 | ERDP_EHB);
@@ -923,6 +985,19 @@ static int xhci_poll_event(u32 expected_type, u64 timeout_ms,
 
         if (dkm_rdtsc() > deadline) {
             g_log->warn("[xhci] event poll timeout");
+            /* 诊断：控制器状态 + 当前事件槽内容（区分"控制器停机"与"消费者错位"） */
+            log_hex("[xhci] to usbsts=", mmio_read32(g_cap_length + XHCI_OP_USBSTS));
+            log_hex("[xhci] to trb_ctl=", trbs[g_evt_ring.enqueue].control);
+            log_hex("[xhci] to trb_sts=", trbs[g_evt_ring.enqueue].status);
+            log_hex("[xhci] to trb_par=", trbs[g_evt_ring.enqueue].parameter);
+            log_hex("[xhci] to idx=", g_evt_ring.enqueue);
+            log_hex("[xhci] to ccs=", g_evt_ccs);
+            log_hex("[xhci] to consumed=", g_evt_consumed);
+            log_hex("[xhci] to bin enq=", g_msc_res.bulk_in_ring.enqueue);
+            log_hex("[xhci] to bin ccs=", g_msc_res.bulk_in_ring.ccs);
+            log_hex("[xhci] to bin phys=", g_msc_res.bulk_in_ring.dma.phys);
+            log_hex("[xhci] to bout enq=", g_msc_res.bulk_out_ring.enqueue);
+            log_hex("[xhci] to bout ccs=", g_msc_res.bulk_out_ring.ccs);
             return -1;
         }
         __asm__ volatile("pause");
@@ -995,6 +1070,15 @@ static int xhci_setup_rings(void) {
         return -3;
     }
     g_evt_ccs = 1;  /* Consumer Cycle State starts at 1 */
+    /* 事件环按 xHCI 规范没有 Link TRB：控制器按 ERST 段大小（256 项）
+     * 顺序填充并自行回绕翻转 PCS。ring_init 为传输环写下的 Link TRB
+     * 必须清掉 —— 否则消费者在索引 255 会把它当作"cycle 匹配的事件"
+     * 白白消费一项并提前翻转 CCS，此后所有事件错位一格，最终表现为
+     * 某次传输永远等不到事件（实机表现为读盘在若干次成功后卡死）。 */
+    {
+        xhci_trb *etrbs = (xhci_trb *)g_evt_ring.dma.virt;
+        xhci_zero(&etrbs[EVT_RING_SIZE - 1], sizeof(xhci_trb));
+    }
     log_hex("[xhci] evt ring phys=", g_evt_ring.dma.phys);
 
     /* ERST (Event Ring Segment Table) */
@@ -1141,8 +1225,13 @@ static int xhci_reset_port(u32 port_idx) {
                     u32 port_id = (u32)((evt->parameter >> 24) & 0xFF);
                     log_hex("[xhci] drained port change event, port=", port_id);
                 }
-                /* Advance dequeue */
-                g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % (g_evt_ring.size - 1);
+                g_evt_consumed++;
+                /* Advance dequeue。
+                 * 事件环没有 Link TRB：硬件按 ERST seg_size 写满全部
+                 * EVT_RING_SIZE 项后回到 0。原实现用 %(size-1) 与硬件
+                 * %size 漂移 —— 事件累计超过 255 个后索引错位，后续
+                 * 传输永远等不到事件（大文件读取必然超时）。 */
+                g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % g_evt_ring.size;
                 if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
                 u64 erdp = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
                 mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | ERDP_EHB);
@@ -1193,9 +1282,9 @@ static int xhci_enable_slot(u8 *out_slot_id) {
  *  Phase 3: Address Device
  * ================================================================ */
 
-static int xhci_address_device(u8 slot_id, int bsr) {
+static int xhci_address_device(xhci_dev_res *d, u8 slot_id, int bsr) {
     /* Input Context physical address */
-    u64 input_ctx_phys = g_input_ctx.phys;
+    u64 input_ctx_phys = d->input_ctx.phys;
 
     u32 control = (TRB_TYPE_ADDRESS_DEV << TRB_TYPE_SHIFT);
     if (bsr) control |= (1u << 9);  /* BSR (Block Set Address) */
@@ -1218,8 +1307,8 @@ static int xhci_address_device(u8 slot_id, int bsr) {
  *  Phase 3: Configure Endpoint
  * ================================================================ */
 
-static int xhci_configure_endpoint(u8 slot_id) {
-    u64 input_ctx_phys = g_input_ctx.phys;
+static int xhci_configure_endpoint(xhci_dev_res *d, u8 slot_id) {
+    u64 input_ctx_phys = d->input_ctx.phys;
     u32 control = (TRB_TYPE_CONFIGURE_EP << TRB_TYPE_SHIFT) | ((u32)slot_id << 24);
 
     u64 out_param = 0;
@@ -1237,8 +1326,8 @@ static int xhci_configure_endpoint(u8 slot_id) {
  *  Phase 3: Control Transfer (EP0)
  * ================================================================ */
 
-static int xhci_control_transfer(const u8 *setup_pkt, u8 *data, u32 data_len,
-                                 u8 direction) {
+static int xhci_control_transfer(xhci_dev_res *d, const u8 *setup_pkt,
+                                 u8 *data, u32 data_len, u8 direction) {
     /* Setup Stage TRB */
     u64 setup_val = ((u64)setup_pkt[4] << 32) | ((u64)setup_pkt[5] << 40) |
                     ((u64)setup_pkt[6] << 48) | ((u64)setup_pkt[7] << 56);
@@ -1259,23 +1348,23 @@ static int xhci_control_transfer(const u8 *setup_pkt, u8 *data, u32 data_len,
     /* Set direction in TRB: bit 16 of Setup Stage TRB */
     if (direction) setup_control |= (1u << 16);
 
-    xhci_ring_enqueue(&g_ep0_ring, setup_val, setup_status, setup_control);
+    xhci_ring_enqueue(&d->ep0_ring, setup_val, setup_status, setup_control);
 
     /* Data Stage TRB (if data_len > 0) */
     if (data_len > 0 && data) {
         /* Copy data to transfer buffer for OUT direction */
         if (direction == 0) {
-            xhci_memcpy(g_xfer_buf.virt, data, data_len);
+            xhci_memcpy(d->xfer_buf.virt, data, data_len);
             __asm__ volatile("wbinvd" ::: "memory");
         }
 
-        u64 data_phys = direction ? g_xfer_buf.phys : g_xfer_buf.phys;
+        u64 data_phys = d->xfer_buf.phys;
         u32 data_status = data_len;
         /* Data Stage 不设 IOC（避免多余事件残留） */
         u32 data_control = (TRB_TYPE_DATA_STAGE << TRB_TYPE_SHIFT);
         if (direction) data_control |= (1u << 16);  /* DIR=IN */
 
-        xhci_ring_enqueue(&g_ep0_ring, data_phys, data_status, data_control);
+        xhci_ring_enqueue(&d->ep0_ring, data_phys, data_status, data_control);
     }
 
     /* Status Stage TRB */
@@ -1283,7 +1372,7 @@ static int xhci_control_transfer(const u8 *setup_pkt, u8 *data, u32 data_len,
     u32 status_control = (TRB_TYPE_STATUS_STAGE << TRB_TYPE_SHIFT) | TRB_IOC;
     if (status_dir) status_control |= (1u << 16);
 
-    xhci_ring_enqueue(&g_ep0_ring, 0, 0, status_control);
+    xhci_ring_enqueue(&d->ep0_ring, 0, 0, status_control);
 
     xhci_mb();
     xhci_ring_doorbell(g_msc.slot_id, 1);  /* EP1 = EP0+1 */
@@ -1301,7 +1390,7 @@ static int xhci_control_transfer(const u8 *setup_pkt, u8 *data, u32 data_len,
 
     /* For IN direction, copy data from DMA buffer */
     if (direction && data_len > 0 && data) {
-        xhci_memcpy(data, g_xfer_buf.virt, data_len);
+        xhci_memcpy(data, d->xfer_buf.virt, data_len);
     }
 
     /* Clear EINT */
@@ -1315,7 +1404,7 @@ static int xhci_control_transfer(const u8 *setup_pkt, u8 *data, u32 data_len,
  *  Phase 3: USB Descriptor reads
  * ================================================================ */
 
-static int xhci_get_device_descriptor(u8 *out_desc) {
+static int xhci_get_device_descriptor(xhci_dev_res *d, u8 *out_desc) {
     u8 setup[8];
     setup[0] = 0x80;  /* bmRequestType: Device-to-Host, Standard, Device */
     setup[1] = 0x06;  /* bRequest: GET_DESCRIPTOR */
@@ -1327,10 +1416,10 @@ static int xhci_get_device_descriptor(u8 *out_desc) {
     setup[7] = 0x00;  /* wLength high */
 
     xhci_zero(out_desc, 18);
-    return xhci_control_transfer(setup, out_desc, 18, 1);
+    return xhci_control_transfer(d, setup, out_desc, 18, 1);
 }
 
-static int xhci_get_config_descriptor(u8 *out_desc, u32 max_len) {
+static int xhci_get_config_descriptor(xhci_dev_res *d, u8 *out_desc, u32 max_len) {
     u8 setup[8];
     setup[0] = 0x80;  /* Device-to-Host, Standard, Device */
     setup[1] = 0x06;  /* GET_DESCRIPTOR */
@@ -1342,49 +1431,79 @@ static int xhci_get_config_descriptor(u8 *out_desc, u32 max_len) {
     setup[7] = (u8)((max_len >> 8) & 0xFF);
 
     xhci_zero(out_desc, max_len);
-    return xhci_control_transfer(setup, out_desc, max_len, 1);
+    return xhci_control_transfer(d, setup, out_desc, max_len, 1);
 }
 
 /* ================================================================
  *  Phase 4: Bulk Transfer
  * ================================================================ */
 
-static int xhci_bulk_transfer(xhci_ring *ring, u8 ep_num,
-                              u8 direction,  /* 0=OUT, 1=IN */
-                              const void *data, u32 data_len) {
+/* 通用 bulk 传输：显式指定 DMA 缓冲。
+ *
+ * 关键：BOT 的三个阶段（CBW / 数据 / CSW）必须用**不同的** DMA 缓冲。
+ * 原实现三者共用 g_xfer_buf，CSW 的 13 字节状态包会在数据阶段之后
+ * 覆盖 g_xfer_buf 开头 —— 读盘返回的数据前 13 字节是 "USBS"+tag 垃圾，
+ * FAT32 目录项/BPB 解析全部失败（实机 U 盘启动 DESK-E04 的根因）。
+ *
+ * CBW 不设 IOC：否则其 Transfer Event 会被紧随的数据阶段 poll 误消费
+ *（xhci_poll_event 不区分端点）。 */
+static int xhci_bulk_transfer_dma(xhci_ring *ring, u8 ep_num,
+                                  u8 direction,  /* 0=OUT, 1=IN */
+                                  void *dma_virt, u64 dma_phys,
+                                  const void *out_src, u32 data_len,
+                                  int wait_event) {
     if (data_len == 0) return -1;
 
-    /* For OUT, copy data to DMA buffer */
-    if (direction == 0) {
-        xhci_memcpy(g_xfer_buf.virt, data, data_len);
+    if (direction == 0 && out_src) {
+        xhci_memcpy(dma_virt, out_src, data_len);
         __asm__ volatile("wbinvd" ::: "memory");
     }
 
-    /* Enqueue Normal TRB(s) — single TRB for now (up to 64KB) */
-    u32 control = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC;
-    xhci_ring_enqueue(ring, g_xfer_buf.phys, data_len, control);
+    u32 control = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT);
+    if (wait_event) control |= TRB_IOC;
+    /* TRB Status：bit[16:0]=Transfer Length，bit[21:17]=TD Size（剩余包数）。
+     * TD Size 原实现恒为 0；多包 Bulk 传输（8KB=16 包）时控制器按
+     * "0 剩余包" 调度，事件在数据未完成时就可能上报 → 后续阶段错位超时。 */
+    u32 packets = (data_len + 511u) / 512u;
+    u32 tdsize = packets ? (packets - 1u) : 0u;
+    if (tdsize > 31u) tdsize = 31u;
+    u32 trb_status = (data_len & 0x1FFFFu) | ((tdsize & 0x1Fu) << 17);
+    xhci_ring_enqueue(ring, dma_phys, trb_status, control);
 
     xhci_mb();
-    /* Doorbell target = Endpoint ID：EPn OUT→2n，EPn IN→2n+1。
-     * BUG-FIX: 原实现传 EP 号（2/1），QEMU xhci_kick_ep 按 Endpoint ID
-     * 索引 eps[epid-1] → 敲错端点 → 无 Transfer Event → 轮询超时。 */
+    /* Doorbell target = Endpoint ID：EPn OUT→2n，EPn IN→2n+1。 */
     u8 db_target = (direction ? (u8)(2u * ep_num + 1) : (u8)(2u * ep_num));
     xhci_ring_doorbell(g_msc.slot_id, db_target);
 
-    /* Poll for Transfer Event */
+    if (!wait_event) return 0;
+
     u64 out_param = 0;
     u32 out_status = 0;
-    int rc = xhci_poll_event(EVT_TYPE_TRANSFER, 10000,
+    int rc = xhci_poll_event(EVT_TYPE_TRANSFER, 3000,
                              &out_param, &out_status, 0);
+    (void)out_param;
     if (rc != 0) {
         g_log->warn("[xhci] bulk transfer failed");
         log_hex("[xhci] bulk rc=", (u64)(i64)rc);
+        log_hex("[xhci]   ep_num=", ep_num);
+        log_hex("[xhci]   dir=", direction);
+        log_hex("[xhci]   evt_idx=", g_evt_ring.enqueue);
+        log_hex("[xhci]   ccs=", g_evt_ccs);
+        log_hex("[xhci]   slot=", g_msc.slot_id);
         return rc;
     }
 
-    /* For IN, copy data from DMA buffer */
+    /* 长度校验：事件 status[23:0] = 未传完的残留字节数。
+     * 短包（resid>0）必须报错 —— 否则调用方会把不足的数据当完整数据用，
+     * FAT32 簇链解析读到文件内容当簇号（实机上表现为读盘 LBA 变成
+     * 0x0d0a16dc 之类的垃圾值，最终 CSW failed + 端点 stall）。 */
     if (direction == 1) {
-        xhci_memcpy((void *)data, g_xfer_buf.virt, data_len);
+        u32 resid = out_status & 0xFFFFFFu;
+        if (resid != 0) {
+            log_hex("[xhci] short read resid=", resid);
+            log_hex("[xhci]   want=", data_len);
+            return -3;
+        }
     }
 
     /* Clear EINT */
@@ -1392,6 +1511,20 @@ static int xhci_bulk_transfer(xhci_ring *ring, u8 ep_num,
                  mmio_read32(g_cap_length + XHCI_OP_USBSTS) | USBSTS_EINT);
 
     return 0;
+}
+
+static int xhci_bulk_transfer(xhci_ring *ring, u8 ep_num,
+                              u8 direction, const void *data, u32 data_len) {
+    int rc = xhci_bulk_transfer_dma(ring, ep_num, direction,
+                                    g_msc_res.xfer_buf.virt, g_msc_res.xfer_buf.phys,
+                                    data, data_len, 1);
+    if (rc == 0 && direction == 1) {
+        /* DMA 写入后 CPU cache 可能仍是旧内容：必须 invalidate 再读，
+         * 否则读到上一次传输的残留（FAT 簇号变成文件内容字节）。 */
+        __asm__ volatile("wbinvd" ::: "memory");
+        xhci_memcpy((void *)data, g_msc_res.xfer_buf.virt, data_len);
+    }
+    return rc;
 }
 
 /* ================================================================
@@ -1426,17 +1559,22 @@ static int xhci_bot_send_cbw(u8 lun, u8 flags, u32 data_len,
     for (u8 i = 0; i < cb_len && i < 16; i++)
         cbw[15 + i] = cb[i];
 
-    return xhci_bulk_transfer(&g_bulk_out_ring, g_msc.bulk_out_ep,
-                              0, cbw, 31);
+    /* BOT 三阶段严格串行：CBW 也必须等 Transfer Event，否则其事件会
+     * 被数据阶段的 poll 误消费（xhci_poll_event 不区分端点）。 */
+    return xhci_bulk_transfer_dma(&g_msc_res.bulk_out_ring, g_msc.bulk_out_ep,
+                                  0, g_msc_res.xfer_buf.virt, g_msc_res.xfer_buf.phys,
+                                  cbw, 31, 1);
 }
 
 static int xhci_bot_receive_csw(void) {
-    int rc = xhci_bulk_transfer(&g_bulk_in_ring, g_msc.bulk_in_ep,
-                                1, g_csw_buf.virt, 13);
+    /* CSW 用独立 DMA 缓冲：绝不能用 g_xfer_buf，否则覆盖数据阶段内容 */
+    int rc = xhci_bulk_transfer_dma(&g_msc_res.bulk_in_ring, g_msc.bulk_in_ep,
+                                    1, g_msc_res.csw_buf.virt, g_msc_res.csw_buf.phys,
+                                    0, 13, 1);
     if (rc != 0) return rc;
 
     /* Verify CSW signature */
-    u8 *csw = (u8 *)g_csw_buf.virt;
+    u8 *csw = (u8 *)g_msc_res.csw_buf.virt;
     if (csw[0] != 0x55 || csw[1] != 0x53 || csw[2] != 0x42 || csw[3] != 0x53) {
         g_log->error("[xhci] CSW signature mismatch");
         return -2;
@@ -1451,6 +1589,73 @@ static int xhci_bot_receive_csw(void) {
     return 0;
 }
 
+/* 事件环排空：消费所有已就绪事件（不等待）。
+ * 传输超时后其 Transfer Event 可能迟到，若不排空会被下一次轮询误认作
+ * 当次传输完成。 */
+static void xhci_event_drain(void) {
+    xhci_trb *trbs = (xhci_trb *)g_evt_ring.dma.virt;
+    for (u32 n = 0; n < g_evt_ring.size; n++) {
+        xhci_trb *evt = &trbs[g_evt_ring.enqueue];
+        u32 ctrl = evt->control;
+        if ((u8)(ctrl & TRB_CYCLE) != (u8)g_evt_ccs) break;
+        g_evt_consumed++;
+        g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % g_evt_ring.size;
+        if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
+        u64 erdp = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
+        mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | ERDP_EHB);
+    }
+}
+
+/* 无数据阶段的控制传输（BOT Reset / Clear Feature 用）：
+ * Setup DIR=1、无 Data Stage、Status Stage=IN。 */
+static int xhci_control_no_data(xhci_dev_res *d, const u8 *setup_pkt) {
+    u64 setup_val = ((u64)setup_pkt[4] << 32) | ((u64)setup_pkt[5] << 40) |
+                    ((u64)setup_pkt[6] << 48) | ((u64)setup_pkt[7] << 56);
+    setup_val |= (u64)setup_pkt[0] | ((u64)setup_pkt[1] << 8) |
+                 ((u64)setup_pkt[2] << 16) | ((u64)setup_pkt[3] << 24);
+    u32 setup_control = (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT) | (1u << 6) | (1u << 16);
+    xhci_ring_enqueue(&d->ep0_ring, setup_val, 8, setup_control);
+    u32 status_control = (TRB_TYPE_STATUS_STAGE << TRB_TYPE_SHIFT) | TRB_IOC | (1u << 16);
+    xhci_ring_enqueue(&d->ep0_ring, 0, 0, status_control);
+    xhci_mb();
+    xhci_ring_doorbell(g_msc.slot_id, 1);
+    u64 out_param = 0; u32 out_status = 0;
+    int rc = xhci_poll_event(EVT_TYPE_TRANSFER, 3000, &out_param, &out_status, 0);
+    mmio_write32(g_cap_length + XHCI_OP_USBSTS,
+                 mmio_read32(g_cap_length + XHCI_OP_USBSTS) | USBSTS_EINT);
+    return rc;
+}
+
+/* BOT Reset Recovery（USB MSC BOT 规范 §5.3.4）：
+ * 一次失败的传输后设备会把 Bulk 管道置于 Halt，后续所有 CBW 都等不到
+ * 事件（实机表现为首次读失败后整盘永久超时）。必须：
+ *   1. Bulk-Only Mass Storage Reset（class request, interface）
+ *   2. Clear Feature(ENDPOINT_HALT) 对 Bulk OUT/IN
+ */
+static void xhci_bot_reset_recovery(void) {
+    u8 setup[8];
+
+    xhci_event_drain();
+
+    setup[0]=0x21; setup[1]=0xFF; setup[2]=0; setup[3]=0;
+    setup[4]=g_msc.iface; setup[5]=0; setup[6]=0; setup[7]=0;
+    if (xhci_control_no_data(&g_msc_res, setup) != 0)
+        log_hex("[xhci] reset recovery: mass storage reset rc<0", 1);
+
+    setup[0]=0x02; setup[1]=0x01; setup[2]=0; setup[3]=0;
+    setup[4]=g_msc.bulk_out_ep; setup[5]=0; setup[6]=0; setup[7]=0;
+    if (xhci_control_no_data(&g_msc_res, setup) != 0)
+        log_hex("[xhci] reset recovery: clear halt OUT rc<0", 1);
+
+    setup[0]=0x02; setup[1]=0x01; setup[2]=0; setup[3]=0;
+    setup[4]=(u8)(0x80 | g_msc.bulk_in_ep); setup[5]=0; setup[6]=0; setup[7]=0;
+    if (xhci_control_no_data(&g_msc_res, setup) != 0)
+        log_hex("[xhci] reset recovery: clear halt IN rc<0", 1);
+
+    g_msc.cbw_tag++;
+    g_log->warn("[xhci] BOT reset recovery done");
+}
+
 /* SCSI INQUIRY */
 static int xhci_scsi_inquiry(void) {
     u8 cb[16];
@@ -1463,7 +1668,7 @@ static int xhci_scsi_inquiry(void) {
 
     /* Data phase: IN 36 bytes */
     u8 inq_data[36];
-    rc = xhci_bulk_transfer(&g_bulk_in_ring, g_msc.bulk_in_ep,
+    rc = xhci_bulk_transfer(&g_msc_res.bulk_in_ring, g_msc.bulk_in_ep,
                             1, inq_data, 36);
     if (rc != 0) return rc;
 
@@ -1491,7 +1696,7 @@ static int xhci_scsi_read_capacity(u64 *out_sectors, u32 *out_blk_size) {
 
     /* Data phase: IN 8 bytes */
     u8 cap_data[8];
-    rc = xhci_bulk_transfer(&g_bulk_in_ring, g_msc.bulk_in_ep,
+    rc = xhci_bulk_transfer(&g_msc_res.bulk_in_ring, g_msc.bulk_in_ep,
                             1, cap_data, 8);
     if (rc != 0) return rc;
 
@@ -1538,15 +1743,22 @@ static int xhci_scsi_read10(u64 lba, u32 count, void *buffer) {
 
     u32 data_len = count * 512;
 
-    int rc = xhci_bot_send_cbw(0, 0x80, data_len, cb, 10);
-    if (rc != 0) return rc;
-
-    /* Data phase: IN */
-    rc = xhci_bulk_transfer(&g_bulk_in_ring, g_msc.bulk_in_ep,
-                            1, buffer, data_len);
-    if (rc != 0) return rc;
-
-    return xhci_bot_receive_csw();
+    int rc = -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rc = xhci_bot_send_cbw(0, 0x80, data_len, cb, 10);
+        if (rc == 0)
+            rc = xhci_bulk_transfer(&g_msc_res.bulk_in_ring, g_msc.bulk_in_ep,
+                                    1, buffer, data_len);
+        if (rc == 0)
+            rc = xhci_bot_receive_csw();
+        if (rc == 0) return 0;
+        log_hex("[xhci] R10 failed rc=", (u64)(i64)rc);
+        if (attempt == 0) {
+            xhci_bot_reset_recovery();
+            dkm_delay_ms(5);
+        }
+    }
+    return rc;
 }
 
 /* SCSI WRITE(10) */
@@ -1563,15 +1775,22 @@ static int xhci_scsi_write10(u64 lba, u32 count, const void *buffer) {
 
     u32 data_len = count * 512;
 
-    int rc = xhci_bot_send_cbw(0, 0x00, data_len, cb, 10);
-    if (rc != 0) return rc;
-
-    /* Data phase: OUT */
-    rc = xhci_bulk_transfer(&g_bulk_out_ring, g_msc.bulk_out_ep,
-                            0, buffer, data_len);
-    if (rc != 0) return rc;
-
-    return xhci_bot_receive_csw();
+    int rc = -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rc = xhci_bot_send_cbw(0, 0x00, data_len, cb, 10);
+        if (rc == 0)
+            rc = xhci_bulk_transfer(&g_msc_res.bulk_out_ring, g_msc.bulk_out_ep,
+                                    0, buffer, data_len);
+        if (rc == 0)
+            rc = xhci_bot_receive_csw();
+        if (rc == 0) return 0;
+        log_hex("[xhci] W10 failed rc=", (u64)(i64)rc);
+        if (attempt == 0) {
+            xhci_bot_reset_recovery();
+            dkm_delay_ms(5);
+        }
+    }
+    return rc;
 }
 
 /* ================================================================
@@ -1586,12 +1805,12 @@ static int xhci_block_read(void *ctx, u64 lba, u32 count, void *buffer) {
     u8 *buf = (u8 *)buffer;
     while (count > 0) {
         u32 chunk = count > 16 ? 16 : count;  /* max 16 sectors (8KB) per SCSI cmd */
-        int rc = xhci_scsi_read10(lba, chunk, g_xfer_buf.virt);
+        int rc = xhci_scsi_read10(lba, chunk, g_msc_res.xfer_buf.virt);
         if (rc != 0) {
             log_hex("[xhci] READ10 failed lba=", lba);
             return rc;
         }
-        xhci_memcpy(buf, g_xfer_buf.virt, chunk * 512);
+        xhci_memcpy(buf, g_msc_res.xfer_buf.virt, chunk * 512);
         buf   += chunk * 512;
         lba   += chunk;
         count -= chunk;
@@ -1607,9 +1826,9 @@ static int xhci_block_write(void *ctx, u64 lba, u32 count, const void *buffer) {
     const u8 *buf = (const u8 *)buffer;
     while (count > 0) {
         u32 chunk = count > 16 ? 16 : count;
-        xhci_memcpy(g_xfer_buf.virt, buf, chunk * 512);
+        xhci_memcpy(g_msc_res.xfer_buf.virt, buf, chunk * 512);
         __asm__ volatile("wbinvd" ::: "memory");  /* Cache flush for DMA */
-        int rc = xhci_scsi_write10(lba, chunk, g_xfer_buf.virt);
+        int rc = xhci_scsi_write10(lba, chunk, g_msc_res.xfer_buf.virt);
         if (rc != 0) {
             log_hex("[xhci] WRITE10 failed lba=", lba);
             return rc;
@@ -1625,11 +1844,12 @@ static int xhci_block_write(void *ctx, u64 lba, u32 count, const void *buffer) {
  *  Phase 3: Build Input Context for Address Device
  * ================================================================ */
 
-static void xhci_build_input_ctx_slot(u8 slot_id, u8 speed, u16 mps0, u32 port_idx) {
+static void xhci_build_input_ctx_slot(xhci_dev_res *d, u8 slot_id, u8 speed,
+                                      u16 mps0, u32 port_idx) {
     (void)slot_id;
     u32 ctx_sz = g_ctx_size;
-    u8 *ic = (u8 *)g_input_ctx.virt;
-    xhci_zero(ic, g_input_ctx.size);
+    u8 *ic = (u8 *)d->input_ctx.virt;
+    xhci_zero(ic, d->input_ctx.size);
 
     /* Input Control Context (xHCI 1.2 §6.4.3):
      *   DWORD0 = Drop Context Flags（本次全 0，不 drop 任何上下文）
@@ -1663,16 +1883,16 @@ static void xhci_build_input_ctx_slot(u8 slot_id, u8 speed, u16 mps0, u32 port_i
      * dequeue → kick_epctx 直接返回，TRB 永不处理 → 无 Transfer Event。 */
     u32 *ep0_ctx = (u32 *)(ic + ctx_sz * 2);
     ep0_ctx[1] = (4u << 3) | ((u32)mps0 << 16);  /* EP Type=4 (Control IN), MPS */
-    u64 ep0_deq = g_ep0_ring.dma.phys | (u64)g_ep0_ring.ccs;
-    ep0_ctx[2] = (u32)(ep0_deq & 0xFFFFFFF0u) | (u32)g_ep0_ring.ccs;
+    u64 ep0_deq = d->ep0_ring.dma.phys | (u64)d->ep0_ring.ccs;
+    ep0_ctx[2] = (u32)(ep0_deq & 0xFFFFFFF0u) | (u32)d->ep0_ring.ccs;
     ep0_ctx[3] = (u32)(ep0_deq >> 32);
     ep0_ctx[4] = 8;   /* Average TRB Length */
 }
 
-static void xhci_build_input_ctx_bulk_eps(u8 bulk_out_ep, u8 bulk_in_ep,
-                                           u16 out_mps, u16 in_mps) {
+static void xhci_build_input_ctx_bulk_eps(xhci_dev_res *d, u8 bulk_out_ep,
+                                           u8 bulk_in_ep, u16 out_mps, u16 in_mps) {
     u32 ctx_sz = g_ctx_size;
-    u8 *ic = (u8 *)g_input_ctx.virt;
+    u8 *ic = (u8 *)d->input_ctx.virt;
 
     /* Input Control Context（Configure Endpoint 语义，xHCI 1.2 §6.4.3）：
      *   DWORD0 = Drop（0），DWORD1 = Add。
@@ -1701,16 +1921,16 @@ static void xhci_build_input_ctx_bulk_eps(u8 bulk_out_ep, u8 bulk_in_ep,
      * 槽 → 全部错位 32 字节 → QEMU 读到零 EP context。 */
     u32 *out_ctx = (u32 *)(ic + ctx_sz * (out_idx + 1));
     out_ctx[1] = (EP_TYPE_BULK_OUT << 3) | ((u32)out_mps << 16);
-    u64 out_deq = g_bulk_out_ring.dma.phys | (u64)g_bulk_out_ring.ccs;
-    out_ctx[2] = (u32)(out_deq & 0xFFFFFFF0u) | (u32)g_bulk_out_ring.ccs;
+    u64 out_deq = d->bulk_out_ring.dma.phys | (u64)d->bulk_out_ring.ccs;
+    out_ctx[2] = (u32)(out_deq & 0xFFFFFFF0u) | (u32)d->bulk_out_ring.ccs;
     out_ctx[3] = (u32)(out_deq >> 32);
     out_ctx[4] = 512;  /* Average TRB Length */
 
     /* Bulk IN Endpoint Context (at offset ctx_sz * (in_idx + 1)) */
     u32 *in_ctx = (u32 *)(ic + ctx_sz * (in_idx + 1));
     in_ctx[1] = (EP_TYPE_BULK_IN << 3) | ((u32)in_mps << 16);
-    u64 in_deq = g_bulk_in_ring.dma.phys | (u64)g_bulk_in_ring.ccs;
-    in_ctx[2] = (u32)(in_deq & 0xFFFFFFF0u) | (u32)g_bulk_in_ring.ccs;
+    u64 in_deq = d->bulk_in_ring.dma.phys | (u64)d->bulk_in_ring.ccs;
+    in_ctx[2] = (u32)(in_deq & 0xFFFFFFF0u) | (u32)d->bulk_in_ring.ccs;
     in_ctx[3] = (u32)(in_deq >> 32);
     in_ctx[4] = 512;  /* Average TRB Length */
 }
@@ -1719,6 +1939,13 @@ static void xhci_build_input_ctx_bulk_eps(u8 bulk_out_ep, u8 bulk_in_ep,
  *  Phase 3: Full device enumeration
  * ================================================================ */
 
+static int xhci_configure_hid(xhci_dev_res *d, u8 slot_id, u8 iface,
+                              u8 int_ep, u16 int_mps);
+static void hid_submit_in(void);
+
+/* 枚举一个端口的设备。返回 0 = MSC（U 盘）就绪，1 = HID 键盘就绪，
+ * 负值 = 失败。MSC 与 HID 共用同一份 bundle（g_msc_res）：
+ * 一个端口不可能同时是 U 盘和键盘。 */
 static int xhci_enum_msc_device(u32 port_idx) {
     u8 speed = xhci_get_port_speed(port_idx);
     log_hex("[xhci] port speed=", speed);
@@ -1739,36 +1966,48 @@ static int xhci_enum_msc_device(u32 port_idx) {
     g_msc.speed = speed;
 
     /* Step 1.5: Allocate per-device DMA buffers（在 DCBAA 指向输出上下文之前） */
-    if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_input_ctx) != 0) return -2;
-    if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_dev_ctx) != 0) return -2;
-    if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_xfer_buf) != 0) return -2;
-    if (g_api->dma->alloc_pages(1, 4096, 0x100000000ULL, &g_csw_buf) != 0) return -2;
-    if (xhci_ring_init(&g_ep0_ring, XFER_RING_SIZE) != 0) return -2;
-    if (xhci_ring_init(&g_bulk_out_ring, XFER_RING_SIZE) != 0) return -2;
-    if (xhci_ring_init(&g_bulk_in_ring, XFER_RING_SIZE) != 0) return -2;
+    if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_msc_res.input_ctx) != 0) return -2;
+    if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_msc_res.dev_ctx) != 0) return -2;
+    if (g_api->dma->alloc_pages(4, 4096, 0x100000000ULL, &g_msc_res.xfer_buf) != 0) return -2;
+    if (g_api->dma->alloc_pages(1, 4096, 0x100000000ULL, &g_msc_res.csw_buf) != 0) return -2;
+    if (xhci_ring_init(&g_msc_res.ep0_ring, XFER_RING_SIZE) != 0) return -2;
+    if (xhci_ring_init(&g_msc_res.bulk_out_ring, XFER_RING_SIZE) != 0) return -2;
+    if (xhci_ring_init(&g_msc_res.bulk_in_ring, XFER_RING_SIZE) != 0) return -2;
 
     /* DCBAA[slot_id] 必须指向输出上下文（Device Context）。
      * Address Device/Configure Endpoint 命令都会读取该地址；
      * 缺失时 QEMU/实机将 octx=0 → DMA 写失败/CC_TRB_ERROR。 */
-    xhci_zero(g_dev_ctx.virt, g_dev_ctx.size);
+    xhci_zero(g_msc_res.dev_ctx.virt, g_msc_res.dev_ctx.size);
     u64 *dcbaa = (u64 *)g_dcbaa.virt;
-    dcbaa[slot_id] = g_dev_ctx.phys;
+    dcbaa[slot_id] = g_msc_res.dev_ctx.phys;
     log_hex("[xhci] DCBAA[slot]=", dcbaa[slot_id]);
 
-    /* Step 3: Build Input Context and Address Device (BSR=1 first) */
-    xhci_build_input_ctx_slot(slot_id, speed, mps0, port_idx);
-    if (xhci_address_device(slot_id, 1) != 0) {
-        /* BSR=1 failed, try without BSR */
-        xhci_build_input_ctx_slot(slot_id, speed, mps0, port_idx);
-        if (xhci_address_device(slot_id, 0) != 0) {
-            FB_ENUM_FAIL(0x0B);  /* 黄: Address Device 失败（BSR=1/0 均失败） */
-            return -3;
+    /* Step 3: Build Input Context and Address Device.
+     *
+     * BSR=1 只用于读设备描述符（设备停在 DEFAULT 态、地址 0）。读完后
+     * **必须** 再用 BSR=0 做一次 Address Device，把槽位推进到 ADDRESSED：
+     * QEMU `xhci_configure_slot` 校验输出 Slot Context 的 state ≥ ADDRESSED，
+     * 停留在 DEFAULT 时 Configure Endpoint 直接返回 0x13
+     * (CC_CONTEXT_STATE_ERROR)。原实现只在 BSR=1 失败时才试 BSR=0，
+     * 导致 MSC 能枚举成功但 HID 一配置端点就 0x13。 */
+    xhci_build_input_ctx_slot(&g_msc_res, slot_id, speed, mps0, port_idx);
+    if (xhci_address_device(&g_msc_res, slot_id, 1) == 0) {
+        /* 先在 DEFAULT 态读一次设备描述符，取得真实 bMaxPacketSize0 */
+        u8 probe_desc[18];
+        if (xhci_get_device_descriptor(&g_msc_res, probe_desc) == 0) {
+            u8 real_mps = probe_desc[7];
+            if (real_mps >= 8 && real_mps != mps0) mps0 = real_mps;
         }
+    }
+    xhci_build_input_ctx_slot(&g_msc_res, slot_id, speed, mps0, port_idx);
+    if (xhci_address_device(&g_msc_res, slot_id, 0) != 0) {
+        FB_ENUM_FAIL(0x0B);  /* 黄: Address Device 失败（BSR=0） */
+        return -3;
     }
 
     /* Step 4: Get Device Descriptor */
     u8 dev_desc[18];
-    if (xhci_get_device_descriptor(dev_desc) != 0) {
+    if (xhci_get_device_descriptor(&g_msc_res, dev_desc) != 0) {
         g_log->warn("[xhci] GET_DESCRIPTOR(Device) failed");
         FB_ENUM_FAIL(0x0C);  /* 黄: GET_DESCRIPTOR(Device) 失败 */
         return -4;
@@ -1787,8 +2026,8 @@ static int xhci_enum_msc_device(u32 port_idx) {
     /* Step 5: Re-address with real MPS if different */
     if (real_mps0 != mps0 && real_mps0 >= 8) {
         mps0 = real_mps0;
-        xhci_build_input_ctx_slot(slot_id, speed, mps0, port_idx);
-        if (xhci_address_device(slot_id, 0) != 0) {
+        xhci_build_input_ctx_slot(&g_msc_res, slot_id, speed, mps0, port_idx);
+        if (xhci_address_device(&g_msc_res, slot_id, 0) != 0) {
             g_log->warn("[xhci] re-address failed");
             /* Continue anyway — device may still work */
         }
@@ -1796,7 +2035,7 @@ static int xhci_enum_msc_device(u32 port_idx) {
 
     /* Step 6: Get Configuration Descriptor */
     u8 cfg_desc[255];
-    if (xhci_get_config_descriptor(cfg_desc, 255) != 0) {
+    if (xhci_get_config_descriptor(&g_msc_res, cfg_desc, 255) != 0) {
         g_log->warn("[xhci] GET_DESCRIPTOR(Config) failed");
         FB_ENUM_FAIL(0x0C);  /* 黄: GET_DESCRIPTOR(Config) 失败 */
         return -5;
@@ -1812,6 +2051,9 @@ static int xhci_enum_msc_device(u32 port_idx) {
     u8 bulk_out_ep = 0, bulk_in_ep = 0;
     u16 bulk_out_mps = 512, bulk_in_mps = 512;
     int msc_found = 0;
+    int hid_found = 0;
+    u8  hid_iface = 0, hid_ep = 0;
+    u16 hid_mps = 8;
 
     /* Walk through descriptors: config(9) + interface(9) + endpoints(7*N) */
     u32 pos = 9;  /* skip config descriptor */
@@ -1825,8 +2067,36 @@ static int xhci_enum_msc_device(u32 port_idx) {
             u8 iface_subclass = cfg_desc[pos + 6];
             u8 iface_protocol = cfg_desc[pos + 7];
 
+            if (iface_class == USB_CLASS_HID &&
+                iface_subclass == HID_SUBCLASS_BOOT &&
+                iface_protocol == HID_PROTOCOL_KEYBOARD) {
+                /* HID boot 键盘：记录 iface 与 Interrupt IN 端点，走 HID 分支 */
+                hid_found = 1;
+                hid_iface = cfg_desc[pos + 2];
+                u32 ep_pos = pos + desc_len;
+                while (ep_pos + 2 <= (u32)total_len) {
+                    u8 ep_len = cfg_desc[ep_pos];
+                    if (!ep_len || ep_pos + ep_len > (u32)total_len) break;
+                    if (cfg_desc[ep_pos + 1] == 5) {
+                        u8 ep_addr = cfg_desc[ep_pos + 2];
+                        u8 ep_attr = cfg_desc[ep_pos + 3];
+                        u16 ep_mps = (u16)cfg_desc[ep_pos + 4] |
+                                     ((u16)cfg_desc[ep_pos + 5] << 8);
+                        if ((ep_attr & 0x03) == 0x03 && (ep_addr & 0x80)) {
+                            hid_ep = ep_addr & 0x0F;
+                            hid_mps = ep_mps;
+                        }
+                    } else if (cfg_desc[ep_pos + 1] == 4) {
+                        break;
+                    }
+                    ep_pos += ep_len;
+                }
+                break;
+            }
             if (iface_class == 0x08 && iface_subclass == 0x06 && iface_protocol == 0x50) {
                 msc_found = 1;
+                g_msc.iface = cfg_desc[pos + 2];
+                log_hex("[xhci] MSC iface=", g_msc.iface);
                 g_log->info("[xhci] MSC BOT interface found");
 
                 /* Scan following endpoint descriptors.
@@ -1864,9 +2134,20 @@ static int xhci_enum_msc_device(u32 port_idx) {
         pos += desc_len;
     }
 
+    if (hid_found && hid_ep) {
+        /* 已 Address 的 slot 上直接配置 HID —— 不再重复 Enable Slot。
+         * MSC 与 HID 共用 g_msc_res（一个端口只有一台设备）。 */
+        if (xhci_configure_hid(&g_msc_res, slot_id, hid_iface, hid_ep, hid_mps) == 0) {
+            g_log->info("[xhci] HID keyboard enumeration successful");
+            hid_submit_in();
+            return 1;                  /* 1 = HID（与 MSC 的 0 区分） */
+        }
+        return -6;
+    }
+
     if (!msc_found || bulk_out_ep == 0 || bulk_in_ep == 0) {
-        g_log->warn("[xhci] no MSC BOT interface found");
-        FB_ENUM_FAIL(0x0D);  /* 黄: 未找到 MSC BOT 接口/端点 */
+        g_log->warn("[xhci] no MSC/HID interface found");
+        FB_ENUM_FAIL(0x0D);  /* 黄: 未找到 MSC BOT / HID 接口 */
         return -6;
     }
 
@@ -1881,10 +2162,10 @@ static int xhci_enum_msc_device(u32 port_idx) {
     g_msc.bulk_in_mps  = bulk_in_mps;
 
     /* Step 7: Configure Endpoint */
-    xhci_zero(g_input_ctx.virt, g_input_ctx.size);
-    xhci_build_input_ctx_bulk_eps(bulk_out_ep, bulk_in_ep,
+    xhci_zero(g_msc_res.input_ctx.virt, g_msc_res.input_ctx.size);
+    xhci_build_input_ctx_bulk_eps(&g_msc_res, bulk_out_ep, bulk_in_ep,
                                    bulk_out_mps, bulk_in_mps);
-    if (xhci_configure_endpoint(slot_id) != 0) {
+    if (xhci_configure_endpoint(&g_msc_res, slot_id) != 0) {
         g_log->warn("[xhci] Configure Endpoint failed");
         FB_ENUM_FAIL(0x0E);  /* 黄: Configure Endpoint 失败 */
         return -7;
@@ -1922,6 +2203,228 @@ static int xhci_enum_msc_device(u32 port_idx) {
     log_hex("[xhci] MSC device block_size=", blk_size);
 
     return 0;
+}
+
+/* ================================================================
+ *  Phase 3b: USB HID Boot Keyboard
+ *
+ *  只处理 Root Hub 端口直连的 HID 键盘（外部 hub 需要 hub 类驱动 +
+ *  多级 route string，另立任务）。报告是标准 8 字节 boot 格式：
+ *    [0] 修饰键位图（LCtrl..RGUI）
+ *    [1] 保留
+ *    [2..7] 当前按下的 HID usage（最多 6 个，差分得到按下/释放）
+ *  翻译成 PS/2 Set-1 扫描码后经 srv.input.kbd.push 注入，消费者
+ *  （desktop/shell/cmd/firstInit）无需区分键源。
+ * ================================================================ */
+
+/* HID usage（Keyboard/Keypad page 0x07）→ PS/2 Set-1 make code。
+ * 只覆盖 ASCII 区常用键；未列出的 usage 丢弃（不做猜测）。 */
+static const u8 g_hid2scan[128] = {
+    [0x04] = 0x1E, [0x05] = 0x30, [0x06] = 0x2E, [0x07] = 0x20,  /* a b c d */
+    [0x08] = 0x12, [0x09] = 0x21, [0x0A] = 0x22, [0x0B] = 0x23,  /* e f g h */
+    [0x0C] = 0x17, [0x0D] = 0x24, [0x0E] = 0x25, [0x0F] = 0x26,  /* i j k l */
+    [0x10] = 0x32, [0x11] = 0x31, [0x12] = 0x18, [0x13] = 0x19,  /* m n o p */
+    [0x14] = 0x10, [0x15] = 0x13, [0x16] = 0x1F, [0x17] = 0x14,  /* q r s t */
+    [0x18] = 0x16, [0x19] = 0x2F, [0x1A] = 0x11, [0x1B] = 0x2D,  /* u v w x */
+    [0x1C] = 0x15, [0x1D] = 0x2C,                                /* y z */
+    [0x1E] = 0x02, [0x1F] = 0x03, [0x20] = 0x04, [0x21] = 0x05,  /* 1 2 3 4 */
+    [0x22] = 0x06, [0x23] = 0x07, [0x24] = 0x08, [0x25] = 0x09,  /* 5 6 7 8 */
+    [0x26] = 0x0A, [0x27] = 0x0B,                                /* 9 0 */
+    [0x28] = 0x1C,                                               /* Enter */
+    [0x29] = 0x01,                                               /* Esc */
+    [0x2A] = 0x0E,                                               /* Backspace */
+    [0x2B] = 0x0F,                                               /* Tab */
+    [0x2C] = 0x39,                                               /* Space */
+    [0x2D] = 0x0C, [0x2E] = 0x4A, [0x2F] = 0x4E,                 /* - = [ */
+    [0x30] = 0x4B, [0x31] = 0x4C, [0x32] = 0x4D,                 /* ] \ ; */
+    [0x33] = 0x27, [0x34] = 0x28, [0x35] = 0x29,                 /* ' ` , */
+    [0x36] = 0x33, [0x37] = 0x34, [0x38] = 0x35,                 /* . / CapsLock */
+    [0x4F] = 0x4D, [0x50] = 0x4B, [0x51] = 0x50,                 /* arrows */
+    [0x52] = 0x48,                                               /* Up */
+};
+
+/* 修饰键位 bit → Set-1 make/break 码（左右合并，与 PS/2 行为一致） */
+static const u8 g_hid_mod_scan[8] = {
+    0x1D, 0x2A, 0x38, 0x5B,   /* LCtrl LShift LAlt LGUI */
+    0x1D, 0x36, 0x38, 0x5B,   /* RCtrl RShift RAlt RGUI */
+};
+
+static void (*g_kbd_push)(const u8 *sc, u32 n);
+static int  g_kbd_push_resolved;
+
+static void hid_emit(u8 sc) {
+    if (!g_kbd_push_resolved) {
+        g_kbd_push_resolved = 1;
+        void *fn = 0;
+        if (g_api && g_api->bus &&
+            g_api->bus->probe("srv.input.kbd.push", &fn, 0) == 0 && fn) {
+            g_kbd_push = (void (*)(const u8 *, u32))fn;
+        }
+    }
+    if (g_kbd_push) g_kbd_push(&sc, 1);
+}
+
+static int hid_report_has(const u8 *rep, u8 usage) {
+    for (int i = 2; i < 8; i++) if (rep[i] == usage) return 1;
+    return 0;
+}
+
+/* 差分新旧报告 → 扫描码流 */
+static void hid_diff_report(const u8 *old_r, const u8 *new_r) {
+    /* 修饰键：逐位比较 */
+    for (int b = 0; b < 8; b++) {
+        int was = (old_r[0] >> b) & 1;
+        int now = (new_r[0] >> b) & 1;
+        if (was == now) continue;
+        u8 sc = g_hid_mod_scan[b];
+        if (now) hid_emit(sc);
+        else { hid_emit(0xE0); hid_emit((u8)(sc | 0x80)); }
+    }
+
+    /* 普通键：旧报告有、新报告无 = 释放（先发释放，语义同 PS/2） */
+    for (int i = 2; i < 8; i++) {
+        u8 u = old_r[i];
+        if (!u || u >= 128) continue;
+        if (hid_report_has(new_r, u)) continue;
+        u8 sc = g_hid2scan[u];
+        if (sc) { hid_emit(0xE0); hid_emit((u8)(sc | 0x80)); }
+    }
+    for (int i = 2; i < 8; i++) {
+        u8 u = new_r[i];
+        if (!u || u >= 128) continue;
+        if (hid_report_has(old_r, u)) continue;
+        u8 sc = g_hid2scan[u];
+        if (sc) hid_emit(sc);
+    }
+}
+
+/* Configure Endpoint：只挂一个 Interrupt IN 端点（复用该 slot 的 bundle） */
+static void hid_build_input_ctx_int_in(xhci_dev_res *d, u8 ep_num, u16 mps) {
+    u32 ctx_sz = g_ctx_size;
+    u8 *ic = (u8 *)d->input_ctx.virt;
+    u32 in_idx = 2u * ep_num + 1;
+
+    u32 *icc = (u32 *)ic;
+    icc[0] = 0;
+    icc[1] = (1u << 0) | (1u << in_idx);
+
+    u32 *slot_ctx = (u32 *)(ic + ctx_sz);
+    slot_ctx[0] &= ~(0x1Fu << 27);
+    slot_ctx[0] |= (in_idx << 27);
+
+    u32 *in_ctx = (u32 *)(ic + ctx_sz * (in_idx + 1));
+    in_ctx[1] = (EP_TYPE_INT_IN << 3) | ((u32)mps << 16);
+    /* Interval：HID boot 键盘常用 8ms；Endpoint Context DWORD0
+     * bits[23:16] = Interval。这里按 8 帧编码，避免 0 被控制器当非法值。 */
+    in_ctx[0] = (8u << 16);
+    u64 deq = d->bulk_in_ring.dma.phys | (u64)d->bulk_in_ring.ccs;
+    in_ctx[2] = (u32)(deq & 0xFFFFFFF0u) | (u32)d->bulk_in_ring.ccs;
+    in_ctx[3] = (u32)(deq >> 32);
+    in_ctx[4] = 8;
+}
+
+/* 控制传输：class request（HID SET_PROTOCOL / SET_IDLE） */
+static int hid_class_set(xhci_dev_res *d, u8 req, u16 value, u16 index) {
+    u8 setup[8];
+    setup[0] = 0x21;                  /* Host→Device, Class, Interface */
+    setup[1] = req;
+    setup[2] = (u8)(value & 0xFF);
+    setup[3] = (u8)(value >> 8);
+    setup[4] = (u8)(index & 0xFF);
+    setup[5] = (u8)(index >> 8);
+    setup[6] = 0;
+    setup[7] = 0;
+    return xhci_control_no_data(d, setup);
+}
+
+/* 在**已 Address** 的 slot 上配置 HID 键盘（与 MSC 共用该 slot 的 bundle：
+ * 一个端口上的设备要么是 U 盘要么是键盘，绝不会同时是两者）。
+ * 由 xhci_enum_device 在解析配置描述符判型后调用。返回 0 = 就绪。 */
+static int xhci_configure_hid(xhci_dev_res *d, u8 slot_id, u8 iface,
+                              u8 int_ep, u16 int_mps) {
+    hid_build_input_ctx_int_in(d, int_ep, int_mps);
+    if (xhci_configure_endpoint(d, slot_id) != 0) {
+        g_log->warn("[xhci] HID configure endpoint failed");
+        return -1;
+    }
+
+    /* SET_PROTOCOL(boot) / SET_IDLE(0) —— 失败不致命（部分设备忽略） */
+    (void)hid_class_set(d, 0x0B, 0, iface);
+    (void)hid_class_set(d, 0x0A, 0, iface);
+
+    xhci_zero(g_hid.report, sizeof(g_hid.report));
+    g_hid.slot_id = slot_id;
+    g_hid.iface = iface;
+    g_hid.ep_in = int_ep;
+    g_hid.mps = int_mps;
+    g_hid_res_owner = d;
+    g_hid.ready = 1;
+
+    log_hex("[xhci] HID kbd slot=", slot_id);
+    log_hex("[xhci] HID kbd iface=", iface);
+    log_hex("[xhci] HID kbd ep_in=", int_ep);
+    log_hex("[xhci] HID kbd mps=", int_mps);
+    return 0;
+}
+
+/* 轮询事件环里的 HID Transfer Event（非阻塞）。返回 1 = 收到一份新报告。 */
+static int hid_reap_event(void) {
+    xhci_trb *trbs = (xhci_trb *)g_evt_ring.dma.virt;
+    xhci_trb *evt = &trbs[g_evt_ring.enqueue];
+    if ((u8)(evt->control & TRB_CYCLE) != (u8)g_evt_ccs) return 0;
+    u8 type = (u8)((evt->control >> TRB_TYPE_SHIFT) & TRB_TYPE_MASK);
+    if (type != EVT_TYPE_TRANSFER) return 0;   /* 其他事件留给自己的消费者 */
+
+    /* 该 Transfer Event 的 parameter = 完成 TRB 的物理地址；
+     * 只认本端点 ring 范围内的（MSC 的事件不动）。 */
+    u64 trb_phys = evt->parameter & ~0xFULL;
+    u64 ring_lo = g_hid_res_owner->bulk_in_ring.dma.phys;
+    u64 ring_hi = ring_lo + (u64)g_hid_res_owner->bulk_in_ring.size * sizeof(xhci_trb);
+    if (trb_phys < ring_lo || trb_phys >= ring_hi) return 0;
+
+    u32 cc = (evt->status >> 24) & 0xFF;
+
+    /* 消费事件 */
+    g_evt_consumed++;
+    g_evt_ring.enqueue = (g_evt_ring.enqueue + 1) % g_evt_ring.size;
+    if (g_evt_ring.enqueue == 0) g_evt_ccs ^= 1;
+    u64 erdp = g_evt_ring.dma.phys + (u64)g_evt_ring.enqueue * sizeof(xhci_trb);
+    mmio_write64(g_runtime_off + XHCI_RT_IR0_ERDP_LO, erdp | ERDP_EHB);
+
+    if (cc != 1 && cc != 13) {                 /* 1=Success 13=Short Packet */
+        log_hex("[xhci] HID event cc=", cc);
+        return 0;
+    }
+
+    u8 report[8];
+    __asm__ volatile("wbinvd" ::: "memory");
+    for (int i = 0; i < 8; i++) report[i] = ((u8 *)g_hid_res_owner->xfer_buf.virt)[i];
+
+    /* 全零报告（无键）也要走差分，以产生释放码 */
+    hid_diff_report(g_hid.report, report);
+    for (int i = 0; i < 8; i++) g_hid.report[i] = report[i];
+    return 1;
+}
+
+/* 提交一次 Interrupt IN（8 字节 boot 报告） */
+static void hid_submit_in(void) {
+    xhci_dev_res *d = g_hid_res_owner;
+    if (!d) return;
+    u8 *buf = (u8 *)d->xfer_buf.virt;
+    xhci_zero(buf, 8);
+    u32 control = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC;
+    u32 trb_status = 8;
+    xhci_ring_enqueue(&d->bulk_in_ring, d->xfer_buf.phys,
+                      trb_status, control);
+    xhci_mb();
+    xhci_ring_doorbell(g_hid.slot_id, (u32)(2u * g_hid.ep_in + 1));
+}
+
+/* srv.input.usb.pump —— ps2kbd.drv 在每次 kbd_poll 前调用 */
+static void xhci_hid_pump(void) {
+    if (!g_hid.ready) return;
+    if (!hid_reap_event()) return;
+    hid_submit_in();                            /* 立即续订下一份报告 */
 }
 
 /* ================================================================
@@ -2077,14 +2580,23 @@ again_ctrl:
     dkm_delay_ms(1500);
 
     g_msc.ready = 0;
+    g_hid.ready = 0;
     int saw_ccs = 0;
     int saw_reset_fail = 0;
-    for (int pass = 0; pass < 2 && !g_msc.ready; pass++) {
+    /* 已成功枚举的端口：第二遍扫描必须跳过，否则对同一设备重复
+     * Address Device —— QEMU 返回 0x05 (CC_USB_TRANSACTION_ERROR)，
+     * 并把已就绪的 HID/MSC 一起判失败。 */
+    u32 port_done = 0;                 /* bit[port] = 1 已枚举 */
+    for (int pass = 0; pass < 2; pass++) {
+        if (g_msc.ready && g_hid.ready) break;
         if (pass == 1) {
             g_log->info("[xhci] second port scan");
             dkm_delay_ms(1500);
         }
-        for (u32 port = 0; port < g_max_ports; port++) {
+        int progressed = 0;
+        for (u32 port = 0; port < g_max_ports && port < 32; port++) {
+            if (port_done & (1u << port)) continue;
+
             u32 port_off = g_port_base + port * XHCI_PORT_STRIDE + XHCI_PORT_SC;
             u32 portsc = mmio_read32(port_off);
 
@@ -2099,19 +2611,33 @@ again_ctrl:
             if (xhci_reset_port(port) != 0) {
                 g_log->warn("[xhci] port reset failed");
                 saw_reset_fail = 1;
+                port_done |= (1u << port);
                 continue;
             }
             g_log->info("[xhci] port reset OK");
 
-            if (xhci_enum_msc_device(port) == 0) {
+            /* 枚举按配置描述符判型：同一端口只做一次 Enable Slot，
+             * 命中 MSC 就配 Bulk 端点，命中 HID 就配 Interrupt IN。 */
+            int kind = xhci_enum_msc_device(port);
+            if (kind == 0) {
                 g_log->info("[xhci] MSC enumeration successful");
-                break;
+                port_done |= (1u << port);
+                progressed = 1;
+                continue;
             }
-
-            g_log->warn("[xhci] MSC enumeration failed; trying next port");
+            if (kind == 1) {
+                g_log->info("[xhci] HID keyboard ready");
+                port_done |= (1u << port);
+                progressed = 1;
+                continue;
+            }
+            g_log->warn("[xhci] port has no supported device");
+            port_done |= (1u << port);
         }
+        /* 没有新设备且没有可用目标时，下一遍扫描毫无意义 */
+        if (!progressed && (g_msc.ready || g_hid.ready)) break;
     }
-    if (!g_msc.ready && saw_ccs && xhci_nth >= 3) {
+    if (!g_msc.ready && !g_hid.ready && saw_ccs && xhci_nth >= 3) {
         g_log->panic(saw_reset_fail ? "XHC-E01 PORT RESET FAILED"
                                     : "XHC-E02 MSC ENUM FAILED");
     }
@@ -2133,12 +2659,24 @@ again_ctrl:
         }
     } else {
         g_log->info("[xhci] no MSC device found; block provider not registered");
-        if (xhci_nth < 3) {
+        /* HID 键盘已就绪时不必换控制器找块设备（块设备由 AHCI/NVMe 承担）。
+         * 两者都没有才继续试下一只 xHCI。 */
+        if (!g_hid.ready && xhci_nth < 3) {
             xhci_nth++;
             g_log->info("[xhci] trying next controller");
             goto again_ctrl;
         }
-        FB_FATAL(api, 0x08);  /* 黄: 所有端口无设备/枚举全部失败 */
+        if (!g_hid.ready) FB_FATAL(api, 0x08);  /* 黄: 所有端口无设备/枚举全部失败 */
+    }
+
+    /* ---- Phase 6: 注册 USB HID 泵（ps2kbd.drv 在每次 kbd_poll 前调用） ---- */
+    if (g_hid.ready) {
+        if (api->bus && api->bus->register_service) {
+            api->bus->register_service("srv.input.usb.pump", 1, (void *)xhci_hid_pump);
+            g_log->info("[xhci] srv.input.usb.pump registered");
+        } else {
+            g_log->warn("[xhci] bus unavailable; HID pump not registered");
+        }
     }
 
     g_log->info("[xhci] driver ready");

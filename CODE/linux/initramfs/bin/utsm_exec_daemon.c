@@ -224,7 +224,16 @@ static void handle_exec_request(const struct ipc_exec_request *req)
         }
         if (pid == 0) {
             char line[192];
-            /* Child: new session, no controlling tty, stdio → /dev/null */
+            /* Double-fork: fork the real (grand)child so it is reparented to
+             * init and reaped there. This is the standard daemonize pattern and
+             * lets the parent keep the DEFAULT SIGCHLD disposition — required so
+             * the synchronous waitpid path below reports real exit codes (a
+             * global SIGCHLD=SIG_IGN used to make waitpid fail with ECHILD and
+             * every sync exec reported exit 0). */
+            pid_t g = fork();
+            if (g < 0) _exit(127);
+            if (g > 0) _exit(0);   /* intermediate: exit immediately */
+            /* Grandchild: new session, no controlling tty, stdio → /dev/null */
             setsid();
             int nullfd = open("/dev/null", O_RDWR);
             if (nullfd >= 0) {
@@ -248,10 +257,12 @@ static void handle_exec_request(const struct ipc_exec_request *req)
             kmsg_write(line);
             _exit(127);  /* execv 仅失败时返回 */
         }
-        /* Parent: report successful spawn immediately */
+        /* Parent: reap the intermediate (fast), then report successful spawn. */
         g_async_live = 1;
         {
+            int st;
             char line[128];
+            waitpid(pid, &st, 0);
             snprintf(line, sizeof(line),
                      "[deshab-kde] async spawn pid=%d\n", (int)pid);
             kmsg_write(line);
@@ -321,7 +332,14 @@ static void handle_exec_request(const struct ipc_exec_request *req)
         sa.sa_handler = on_exec_alarm;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGALRM, &sa, NULL);
-        alarm(UTSM_EXEC_TIMEOUT_SEC);
+        /* Per-request timeout override (e.g. VSCode tarball extraction needs
+         * several minutes; the 15s default would SIGKILL it). 0 = default. */
+        {
+            unsigned int to = UTSM_EXEC_TIMEOUT_SEC;
+            if (req->timeout_sec)
+                to = req->timeout_sec;
+            alarm(to);
+        }
     }
 
     char buf[4096];
@@ -611,9 +629,12 @@ static void handle_file_write(const struct ipc_file_request *req)
 
 int main(void)
 {
-    /* ASYNC children (VSCode Phase 5: X server / VSCode) are never waitpid'd;
-     * SIG_IGN lets the kernel reap them automatically so they don't zombie. */
-    signal(SIGCHLD, SIG_IGN);
+    /* Do NOT set SIGCHLD to SIG_IGN here: the synchronous exec path relies on
+     * waitpid() to obtain the child's real exit status. With SIG_IGN the child
+     * is auto-reaped, waitpid fails (ECHILD), and every exec would report
+     * exit_code 0 regardless of success (silent false-success: e.g. a missing
+     * file probed with `test -e` looked present, so VSCode install was skipped).
+     * Async children are reparented to init via double-fork instead. */
 
     g_utsm_fd = open("/dev/utsm", O_RDWR);
     if (g_utsm_fd < 0) {

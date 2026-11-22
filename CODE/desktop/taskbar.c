@@ -1,42 +1,29 @@
-﻿/* taskbar.c — Win11 Fluent 居中悬浮任务栏 + 系统托盘（M2）
+/* taskbar.c — Aqua 顶栏弹出卡片 + Apple logo 纹理
  *
- * 布局（深色主题 g_wf_dark）：
- *   主任务栏：48px 高，距底 8px，水平居中悬浮，acrylic 圆角 12
- *     [开始 40×40] [任务视图 40×40] [运行窗口按钮 44×44 ...]
- *     运行中 = 底部 3×16 accent 指示条；聚焦 = 指示条加宽 6px + 微亮蒙层
- *   托盘组（右下角独立悬浮，同视觉）：
- *     [网络 40] [音量 40] [电源 40] [两行时钟：HH:MM / M-D]
- *
- * 点击路由 taskbar_click() 由 shell.c 在 Fluent 分支调用。
- * 开始菜单 M3 接入；电源 M2 直接退出（M7 扩展菜单）。
+ * 原 Win11 底部任务栏已删除，外壳改为 menubar.c（顶栏）+ dock.c。
+ * 这里保留三张卡片，从顶栏图标下方弹出：
+ *   Wi-Fi 卡片   锚点 g_tb2_net_rect（顶栏 Wi-Fi 图标），右对齐
+ *   控制中心     锚点 g_tb2_vol_rect（顶栏控制中心图标），音量/亮度滑块
+ *   关机确认     锚点 g_tb2_pwr_rect（Apple logo），左对齐
+ * 锚点矩形由 menubar_draw 每帧写入。
  */
 #include "desktop.h"
-#include "ascii_font.h"          /* 顺序敏感：先于 fluent_ui.h */
-#include "../UTSM/include/utsm/fluent_ui.h"
+#include "aqua_draw.h"
 #include "zhfont.h"
 #include "textures.h"
 
-/* ---- 命中矩形（绘制时更新，点击时使用） ---- */
-int g_tb2_start_rect[4];
-int g_tb2_tv_rect[4];
-int g_tb2_app_rect[MAX_WINDOWS][4];
-int g_tb2_tray_rect[4];          /* 托盘组整体 */
+/* ---- 卡片锚点（顶栏绘制时更新） ---- */
 int g_tb2_net_rect[4];
 int g_tb2_vol_rect[4];
 int g_tb2_pwr_rect[4];
-int g_tb2_clk_rect[4];
 
-#define TB_H      48
-#define TB_BOTTOM_GAP 8
-#define TB_BTN    40             /* 开始/任务视图/托盘钮边长 */
-#define TB_APPBTN 44             /* 应用钮边长 */
-#define TB_PAD    8              /* 条内边距 */
+#define CARD_TOP (AQUA_MENUBAR_H + 6)
 
-static const wf_theme *tb_theme(void) { return &g_wf_light; }
+static const wf_theme *tb_theme(void) { return &g_wf_aqua; }
 static wf_btn_state tb_hover_state(const int r[4]);
 
 /* ============================================================
- *  WiFi 快捷卡片（托盘网络图标弹出：扫描列表 → 密码 → 连接）
+ *  WiFi 快捷卡片（顶栏 Wi-Fi 图标弹出：扫描列表 → 密码 → 连接）
  *
  *  net API 经 g_kernel_api + 0x48（DSB_KAPI_OFF_NET）取得，
  *  dkm_net_api 槽位按 UTSM include/utsm/net.h 布局（每槽 8 字节）：
@@ -293,31 +280,26 @@ static int wifi_guest_scan(void) {
     g_wifi_guest = 0;
     g_wifi_n = 0;
     g_guest_have = 0;
-    if (!g_lxc_svc || !g_lxc_svc->is_available || !g_lxc_svc->exec || !g_lxc_svc->file_read)
+    if (!g_lxc_svc || !g_lxc_svc->is_available)
         return -1;
     if (!g_lxc_svc->is_available()) return -1;
-    const char *argv[] = {
-        "sh", "-c",
-        "if ! iw dev wlan0 info >/dev/null 2>&1; then echo NOIF; exit 0; fi; "
-        "iw dev wlan0 scan > /tmp/deshab-wifi.txt 2>/tmp/deshab-wifi.err; echo OK"
-    };
-    char head[8];
-    for (int i = 0; i < 8; i++) head[i] = 0;
-    u64 ec = 0;
-    int rc = g_lxc_svc->exec("/bin/sh", 3, argv, head, 7, 0, &ec);
-    slog_num("[wifi] guest iw rc=", rc);
-    if (rc != 0) return -2;
-    if (head[0] == 'N' && head[1] == 'O') return -3;
-    if (head[0] != 'O') return -2;
+
+    /* guest 启动 wrapper 已用最小 nl80211 工具（/usr/local/bin/deshab_ap，零
+     * OpenSSL）在 wlan1 起了开放 AP "Deshab-Net"，并执行 `iw dev wlan0 scan`
+     * 把结果写入 /tmp/deshab-wifi.txt。这里经 lxc file_read 取回并解析。 */
+    if (!g_lxc_svc->file_read) return -1;
 
     static char chunk[2048];
     char line[192];
-    int ln = 0;
+    int ln = 0, any = 0;
     u64 off = 0;
     for (int part = 0; part < 32; part++) {
         u64 got = 0;
-        int fr = g_lxc_svc->file_read("/tmp/deshab-wifi.txt", off, chunk, sizeof(chunk), &got, 0);
-        if (fr != 0 || got == 0) break;
+        int fr = g_lxc_svc->file_read("/tmp/deshab-wifi.txt", off, chunk,
+                                      sizeof(chunk), &got, 0);
+        if (fr != 0) { if (!any) { slog_num("[wifi] file_read rc=", fr); return -2; } break; }
+        if (got == 0) break;
+        any = 1;
         for (u64 i = 0; i < got; i++) {
             char c = chunk[i];
             if (c == '\n' || ln >= (int)sizeof(line) - 1) {
@@ -330,14 +312,11 @@ static int wifi_guest_scan(void) {
         }
         off += got;
     }
-    if (ln) {
-        line[ln] = 0;
-        wifi_guest_line(line);
-    }
+    if (ln) { line[ln] = 0; wifi_guest_line(line); }
     wifi_guest_commit();
     g_wifi_guest = 1;
     slog_num("[wifi] guest aps=", g_wifi_n);
-    return 0;
+    return any ? 0 : -2;
 }
 
 /* 打开卡片并踢一脚扫描 */
@@ -368,6 +347,14 @@ static void wifi_card_open(void) {
             wifi_status_set("客户机扫描失败");
             return;
         }
+        if (grc == -1) {
+            /* Linux 客户机未运行（如 Windows/WHPX 或 FUCK linux_guest=0）：
+             * 无线扫描必须经客户机，此处明确提示，避免误以为"就是有线"。 */
+            if (g_tray_up > 0) wifi_status_set("有线已连接 / WiFi 需 Linux 客户机");
+            else wifi_status_set("WiFi 需 Linux 客户机");
+            slog("[wifi] guest unavailable (need Linux guest for WiFi scan)");
+            return;
+        }
         if (g_tray_up > 0) {
             wifi_status_set("有线已连接");
             slog("[wifi] wired link up, no wireless device");
@@ -388,11 +375,68 @@ static void wifi_card_open(void) {
     }
 }
 
+/* 经 Linux guest 关联无线：guest 内用 wpa_supplicant（有密码）或 iw（开放网络）
+ * 关联 wlan0，随后回读 `iw dev wlan0 link` 判定是否连上。
+ * 返回 0=已连接，<0=失败（-1 客户机不可用 / -2 exec 失败 / -3 未连上）。 */
+static int wifi_guest_connect(const char *ssid, const char *pw) {
+    if (!g_lxc_svc || !g_lxc_svc->exec || !g_lxc_svc->is_available) return -1;
+    if (g_lxc_svc->is_available() != 1) return -1;
+
+    /* 单引号不转义——出现即判失败，避免命令注入。 */
+    for (const char *s = ssid; *s; s++) if (*s == '\'') return -1;
+    for (const char *s = pw; s && *s; s++) if (*s == '\'') return -1;
+
+    static char shcmd[400];
+    int p = 0;
+    #define WC_ADD(str) do { const char *_s=(str); while (*_s && p < 360) shcmd[p++]=*_s++; } while (0)
+    WC_ADD("ip link set wlan0 up 2>/dev/null; pkill -f 'wpa_supplicant.*wlan0' 2>/dev/null; ");
+    if (pw && pw[0]) {
+        WC_ADD("wpa_passphrase '");
+        while (*ssid && p < 360) shcmd[p++] = *ssid++;
+        WC_ADD("' '");
+        while (*pw && p < 360) shcmd[p++] = *pw++;
+        WC_ADD("' >/tmp/w.conf 2>/dev/null; wpa_supplicant -B -i wlan0 -c /tmp/w.conf >/dev/null 2>&1; ");
+    } else {
+        WC_ADD("iw dev wlan0 connect '");
+        while (*ssid && p < 360) shcmd[p++] = *ssid++;
+        WC_ADD("'; ");
+    }
+    WC_ADD("sleep 5; iw dev wlan0 link");
+    #undef WC_ADD
+    shcmd[p] = 0;
+
+    char out[256];
+    u64 len = 0, ec = 0;
+    const char *argv[] = { "sh", "-c", shcmd };
+    int rc = g_lxc_svc->exec("/bin/sh", 3, argv, out, sizeof(out) - 1, &len, &ec);
+    if (rc != 0) { slog_num("[wifi] guest connect rc=", rc); return -2; }
+    if (len > sizeof(out) - 1) len = sizeof(out) - 1;
+    out[len] = 0;
+    slog("[wifi] guest link:");
+    slog(out);
+    for (u64 i = 0; i + 6 < len; i++)
+        if (out[i] == 'C' && out[i+1] == 'o' && out[i+2] == 'n' && out[i+3] == 'n'
+            && out[i+4] == 'e' && out[i+5] == 'c' && out[i+6] == 't')
+            return 0;
+    return -3;
+}
+
 /* 发起连接（当前选中网络 + 密码） */
 static void wifi_connect_go(void) {
     if (g_wifi_guest) {
-        wifi_status_set("客户机关联未实现");
-        slog("[wifi] guest assoc not implemented");
+        wifi_status_set("客户机连接中...");
+        int grc = wifi_guest_connect(g_wifi_sel_ssid, g_wifi_pw);
+        if (grc == 0) {
+            wifi_status_set("已连接");
+            g_wifi_mode = 0;
+            g_wifi_open = 0;    /* 连接成功收起卡片 */
+        } else if (grc == -1) {
+            wifi_status_set("客户机不可用");
+            slog("[wifi] guest connect: service unavailable");
+        } else {
+            wifi_status_set("连接失败");
+        }
+        g_wifi_pw[0] = 0;
         return;
     }
     wifi_fn_connect conn = (wifi_fn_connect)wifi_slot(WIFI_NETAPI_CONNECT);
@@ -422,7 +466,7 @@ static void wifi_connect_go(void) {
     g_wifi_pw[0] = 0;
 }
 
-/* 卡片绘制（taskbar_draw 末尾调用；每次绘制顺带收割扫描结果） */
+/* 卡片绘制（taskbar_cards_draw 调用；每次绘制顺带收割扫描结果） */
 static void wifi_draw(void) {
     if (!g_wifi_open) return;
     const wf_theme *t = tb_theme();
@@ -443,14 +487,14 @@ static void wifi_draw(void) {
     int cx = g_tb2_net_rect[0] + g_tb2_net_rect[2] - CW;
     if (cx < 8) cx = 8;
     if (cx + CW > W - 8) cx = W - 8 - CW;
-    int cy = (int)g_fb_h - TB_H - TB_BOTTOM_GAP - ch - 8;
+    int cy = CARD_TOP;
 
     g_wifi_card_rect[0] = cx; g_wifi_card_rect[1] = cy;
     g_wifi_card_rect[2] = CW; g_wifi_card_rect[3] = ch;
-    du_wf_card(&g_fb, cx, cy, CW, ch, 235, t);
+    aqua_panel(&g_fb, cx, cy, CW, ch, t->radius_md);
 
     /* 标题行 */
-    zh_draw_string(&g_fb, "WLAN", cx + 14, cy + 12, t->text_primary, 0);
+    zh_draw_string(&g_fb, "Wi-Fi", cx + 14, cy + 12, t->text_primary, 0);
     /* 重新扫描按钮（右上） */
     int rx = cx + CW - 76, ry = cy + 8;
     g_wifi_rescan_rect[0] = rx; g_wifi_rescan_rect[1] = ry;
@@ -520,7 +564,7 @@ static void wifi_draw(void) {
         zh_draw_string(&g_fb, g_wifi_status, cx + 14, y + 2, t->accent, 0);
 }
 
-/* 卡片点击（taskbar_click 中调用；返回 1 = 已消费） */
+/* 卡片点击（taskbar_cards_click 调用；返回 1 = 已消费） */
 static int wifi_click(int mx, int my) {
     if (!g_wifi_open) return 0;
     if (!rect_hit(g_wifi_card_rect, mx, my)) {
@@ -607,7 +651,7 @@ int wifi_key(u8 sc, int shift) {
 }
 
 /* ============================================================
- *  快速设置卡片（托盘音量按钮弹出：音量/亮度滑块）
+ *  控制中心卡片（顶栏控制中心图标弹出：音量/亮度滑块）
  *
  *  M6 提前落地最小版：du_wf_slider 组件实战。音量接 g_vol（状态），
  *  亮度接 g_bright（apply_brightness 真实调暗）。拖拽复用主循环
@@ -629,13 +673,13 @@ static void qs_draw(void) {
     int cx = g_tb2_vol_rect[0] + g_tb2_vol_rect[2] - CW;
     if (cx < 8) cx = 8;
     if (cx + CW > W - 8) cx = W - 8 - CW;
-    int cy = (int)g_fb_h - TB_H - TB_BOTTOM_GAP - CH - 8;
+    int cy = CARD_TOP;
 
     g_qs_card_rect[0] = cx; g_qs_card_rect[1] = cy;
     g_qs_card_rect[2] = CW; g_qs_card_rect[3] = CH;
-    du_wf_card(&g_fb, cx, cy, CW, CH, 235, t);
+    aqua_panel(&g_fb, cx, cy, CW, CH, t->radius_lg);
 
-    zh_draw_string(&g_fb, "快速设置", cx + 14, cy + 12, t->text_primary, 0);
+    zh_draw_string(&g_fb, "控制中心", cx + 14, cy + 12, t->text_primary, 0);
 
     int y = cy + 46;
     /* 音量行：标签 + 百分比 + 滑块 */
@@ -685,7 +729,92 @@ static int qs_click(int mx, int my) {
     return 1;
 }
 
-/* ---- 开始菜单 logo（textures/startMenuLogo.rgba，加载失败回退字形） ---- */
+/* ============================================================
+ *  关机确认卡片（Apple 菜单"关机…/重新启动…"弹出：关机 / 重启 / 取消）
+ *
+ *  实际动作经 srv.acpi.poweroff / srv.acpi.reboot（acpi.drv 的
+ *  FADT `_S5_` + reset_reg 路径）。服务缺席时 desktop_poweroff 退回
+ *  g_quit，desktop_reboot 退回键盘控制器 + 0xCF9。
+ *
+ *  睡眠（S3）不在本菜单内：ACPI S3 需要设备状态保存/恢复，Deshab 尚无该
+ *  能力，按插桩规约不提供"看起来能用"的假按钮。
+ * ============================================================ */
+
+static int g_pwr_open = 0;
+static int g_pwr_card_rect[4];
+static int g_pwr_off_rect[4];
+static int g_pwr_reboot_rect[4];
+static int g_pwr_cancel_rect[4];
+
+/* 菜单行：悬停为系统蓝圆角底 + 白字 */
+static void pwr_row(int r[4], int x, int y, int w, const char *label,
+                    const wf_theme *t) {
+    int hov;
+    r[0] = x; r[1] = y; r[2] = w; r[3] = 28;
+    hov = tb_hover_state(r) == WF_BTN_HOVER;
+    if (hov) aqua_fill_round_alpha(&g_fb, x, y, w, 28, 5, t->accent, 255);
+    zh_draw_string(&g_fb, label, x + 12, y + 5,
+                   hov ? t->on_accent : t->text_primary, 0);
+}
+
+static void pwr_draw(void) {
+    if (!g_pwr_open) return;
+    const wf_theme *t = tb_theme();
+    int W = (int)g_fb_w;
+    const int CW = 220, CH = 34 + 3 * 30 + 10;
+
+    int cx = g_tb2_pwr_rect[0];
+    if (cx < 8) cx = 8;
+    if (cx + CW > W - 8) cx = W - 8 - CW;
+    int cy = CARD_TOP;
+
+    g_pwr_card_rect[0] = cx; g_pwr_card_rect[1] = cy;
+    g_pwr_card_rect[2] = CW; g_pwr_card_rect[3] = CH;
+    aqua_panel(&g_fb, cx, cy, CW, CH, t->radius_md);
+
+    zh_draw_string(&g_fb, "要关闭这台电脑吗？", cx + 14, cy + 10, t->text_secondary, 0);
+    int y = cy + 34;
+    pwr_row(g_pwr_off_rect, cx + 6, y, CW - 12, "关机", t);
+    y += 30;
+    pwr_row(g_pwr_reboot_rect, cx + 6, y, CW - 12, "重新启动", t);
+    y += 30;
+    pwr_row(g_pwr_cancel_rect, cx + 6, y, CW - 12, "取消", t);
+}
+
+/* 返回 1 = 已消费；点外部收起并放行 */
+static int pwr_click(int mx, int my) {
+    if (!g_pwr_open) return 0;
+    if (!rect_hit(g_pwr_card_rect, mx, my)) {
+        g_pwr_open = 0;
+        return 0;
+    }
+    if (rect_hit(g_pwr_off_rect, mx, my)) {
+        g_pwr_open = 0;
+        slog("[taskbar] power: shut down");
+        desktop_poweroff();
+        return 1;
+    }
+    if (rect_hit(g_pwr_reboot_rect, mx, my)) {
+        g_pwr_open = 0;
+        slog("[taskbar] power: restart");
+        desktop_reboot();
+        return 1;
+    }
+    if (rect_hit(g_pwr_cancel_rect, mx, my)) {
+        g_pwr_open = 0;
+        return 1;
+    }
+    return 1;
+}
+
+/* Esc 收起电源菜单（shell.c handle_key 调用；返回 1 = 已消费） */
+int taskbar_power_menu_key(int sc) {
+    if (!g_pwr_open) return 0;
+    if (sc == 0x01) { g_pwr_open = 0; return 1; }
+    return 0;
+}
+
+/* ---- Apple 菜单 logo（textures/startMenuLogo.rgba） ---- */
 static int g_smlogo_ok = 0;
 
 typedef int (*tb_read_fn)(const char *path, unsigned char *dst,
@@ -701,24 +830,6 @@ int taskbar_init(tb_read_fn read_to) {
     g_smlogo_ok = 1;
     return 0;
 }
-
-/* app_id → Fluent 图标 */
-static wf_icon_id tb_app_icon(int app_id) {
-    if (app_id < 0 || app_id >= g_app_count) return WF_ICON_TERMINAL;
-    const char *n = g_apps[app_id].name;
-    if (!n) return WF_ICON_FOLDER;
-    if (n[0]=='s' && n[1]=='h') return WF_ICON_TERMINAL;      /* shell */
-    if (n[0]=='c' && n[1]=='m' && n[2]=='d') return WF_ICON_TERMINAL;
-    if (n[0]=='e' && n[1]=='d') return WF_ICON_EDITOR;        /* editor */
-    if (n[0]=='p' && n[1]=='r') return WF_ICON_EDITOR;        /* proedit */
-    if (n[0]=='f' && n[1]=='i') return WF_ICON_FOLDER;        /* fileman */
-    if (n[0]=='c' && n[1]=='a') return WF_ICON_CALC;          /* calc */
-    if (n[0]=='b' && n[1]=='r') return WF_ICON_BROWSER;       /* browser */
-    if (n[0]=='s' && n[1]=='e') return WF_ICON_SETTINGS;      /* settings */
-    if (n[0]=='v' || n[0]=='k') return WF_ICON_BROWSER;       /* vscode/kde */
-    return WF_ICON_FOLDER;
-}
-
 static wf_btn_state tb_hover_state(const int r[4]) {
     if (g_mouse_x >= r[0] && g_mouse_x < r[0] + r[2] &&
         g_mouse_y >= r[1] && g_mouse_y < r[1] + r[3])
@@ -726,217 +837,57 @@ static wf_btn_state tb_hover_state(const int r[4]) {
     return WF_BTN_NORMAL;
 }
 
-/* ============================================================
- *  绘制
- * ============================================================ */
+/* 顶栏 Apple 菜单图标（startMenuLogo 纹理缩放到 size×size） */
+void taskbar_logo_draw(int x, int y, int size) {
+    if (!g_smlogo_ok) return;
+    tex_draw_scaled(&g_fb, (const u8 *)SMLOGO_ADDR, SMLOGO_W, SMLOGO_H,
+                    x, y, size, size, 256);
+}
 
-void taskbar_draw(void) {
-    const wf_theme *t = tb_theme();
-    int W = (int)g_fb_w, H = (int)g_fb_h;
-    int by = H - TB_H - TB_BOTTOM_GAP;
-
-    /* ---- 主任务栏内容宽度 ---- */
-    int nbtn = 0;
-    for (int i = 0; i < g_win_count; i++)
-        if (g_windows[i].visible && g_windows[i].ws == g_ws_cur) nbtn++;
-    int content_w = TB_PAD + TB_BTN + 4 + TB_BTN + 6 + nbtn * (TB_APPBTN + 4) + TB_PAD - 4;
-    int bx = (W - content_w) / 2;
-
-    /* ---- 托盘组宽度 ---- */
-    const char *time_s = "00:00";
-    const char *date_s = "0/0";
-    char tbuf[8], dbuf[10];
-    {
-        int yy, mo, dd, hh, mi, ss;
-        rtc_read(&yy, &mo, &dd, &hh, &mi, &ss);
-        tbuf[0] = '0' + hh / 10; tbuf[1] = '0' + hh % 10; tbuf[2] = ':';
-        tbuf[3] = '0' + mi / 10; tbuf[4] = '0' + mi % 10; tbuf[5] = 0;
-        time_s = tbuf;
-        int dl = 0;
-        if (mo >= 10) dbuf[dl++] = '0' + mo / 10;
-        dbuf[dl++] = '0' + mo % 10; dbuf[dl++] = '/';
-        if (dd >= 10) dbuf[dl++] = '0' + dd / 10;
-        dbuf[dl++] = '0' + dd % 10; dbuf[dl] = 0;
-        date_s = dbuf;
-    }
-    int clk_w = zh_string_width(time_s, 0) + 8;
-    int tray_w = TB_PAD + TB_BTN + 2 + TB_BTN + 2 + TB_BTN + 6 + clk_w + TB_PAD;
-    int tx = W - tray_w - 8;
-
-    /* ---- 主任务栏面板 ---- */
-    du_wf_acrylic(&g_fb, bx, by, content_w, TB_H, 216, t->radius_lg, t);
-    int x = bx + TB_PAD;
-
-    /* 开始按钮（logo：用户 textures/startMenuLogo，缺失回退 "D" 字形） */
-    g_tb2_start_rect[0] = x; g_tb2_start_rect[1] = by + (TB_H - TB_BTN) / 2;
-    g_tb2_start_rect[2] = TB_BTN; g_tb2_start_rect[3] = TB_BTN;
-    du_wf_icon_button(&g_fb, x, by + (TB_H - TB_BTN) / 2, TB_BTN, t,
-                      tb_hover_state(g_tb2_start_rect));
-    if (g_smlogo_ok) {
-        tex_draw_scaled(&g_fb, (const u8 *)SMLOGO_ADDR, SMLOGO_W, SMLOGO_H,
-                        x + 6, by + (TB_H - TB_BTN) / 2 + 6, 28, 28, 256);
-    } else {
-        du_draw_string(&g_fb, "D", x + TB_BTN / 2 - 4,
-                       by + (TB_H - TB_BTN) / 2 + TB_BTN / 2 - 8,
-                       t->accent, 0, DU_ASCII_STEP * 2);
-    }
-    x += TB_BTN + 4;
-
-    /* 任务视图按钮 */
-    g_tb2_tv_rect[0] = x; g_tb2_tv_rect[1] = by + (TB_H - TB_BTN) / 2;
-    g_tb2_tv_rect[2] = TB_BTN; g_tb2_tv_rect[3] = TB_BTN;
-    du_wf_icon_button(&g_fb, x, by + (TB_H - TB_BTN) / 2, TB_BTN, t,
-                      tb_hover_state(g_tb2_tv_rect));
-    du_wf_icon(&g_fb, WF_ICON_TASKVIEW, x + (TB_BTN - 20) / 2,
-               by + (TB_H - TB_BTN) / 2 + (TB_BTN - 20) / 2, 20, t->text_primary);
-    x += TB_BTN + 6;
-
-    /* 运行窗口按钮（当前工作区，数组序 = z 序） */
-    for (int i = 0; i < g_win_count; i++) {
-        desktop_window *w = &g_windows[i];
-        if (!w->visible || w->ws != g_ws_cur) {
-            g_tb2_app_rect[i][2] = 0;
-            continue;
-        }
-        int byy = by + (TB_H - TB_APPBTN) / 2;
-        g_tb2_app_rect[i][0] = x; g_tb2_app_rect[i][1] = byy;
-        g_tb2_app_rect[i][2] = TB_APPBTN; g_tb2_app_rect[i][3] = TB_APPBTN;
-        wf_btn_state st = tb_hover_state(g_tb2_app_rect[i]);
-        if (w->focused) du_wf_overlay(&g_fb, x, byy, TB_APPBTN, TB_APPBTN, 0x22000000u);
-        else if (st == WF_BTN_HOVER) du_wf_overlay(&g_fb, x, byy, TB_APPBTN, TB_APPBTN, 0x22000000u);
-        du_wf_icon(&g_fb, tb_app_icon(w->app_id), x + (TB_APPBTN - 22) / 2,
-                   byy + (TB_APPBTN - 22) / 2, 22, t->text_primary);
-        /* 运行指示条：底部 accent，聚焦加宽 */
-        int ind_w = w->focused ? 18 : 12;
-        du_fill_rounded_rect(&g_fb, x + (TB_APPBTN - ind_w) / 2,
-                             byy + TB_APPBTN - 6, ind_w, 3, t->accent, 1);
-        x += TB_APPBTN + 4;
-    }
-
-    /* ---- 托盘组面板 ---- */
-    du_wf_acrylic(&g_fb, tx, by, tray_w, TB_H, 216, t->radius_lg, t);
-    x = tx + TB_PAD;
-    int iy = by + (TB_H - TB_BTN) / 2;
-
-    g_tb2_net_rect[0] = x; g_tb2_net_rect[1] = iy;
-    g_tb2_net_rect[2] = TB_BTN; g_tb2_net_rect[3] = TB_BTN;
-    du_wf_icon_button(&g_fb, x, iy, TB_BTN, t, tb_hover_state(g_tb2_net_rect));
+int taskbar_net_up(void) {
     tray_net_query();
-    {
-        u32 col = g_tray_up > 0 ? t->accent : t->text_dim;
-        int ix = x + (TB_BTN - 20) / 2;
-        int iy2 = iy + (TB_BTN - 20) / 2;
-        du_wf_icon(&g_fb, WF_ICON_NETWORK, ix, iy2, 20, col);
-        if (g_tray_n == 0 || g_tray_up == 0)
-            du_wf_line(&g_fb, ix + 2, iy2 + 18, ix + 18, iy2 + 2, 2, col);
-    }
-    x += TB_BTN + 2;
-
-    g_tb2_vol_rect[0] = x; g_tb2_vol_rect[1] = iy;
-    g_tb2_vol_rect[2] = TB_BTN; g_tb2_vol_rect[3] = TB_BTN;
-    du_wf_icon_button(&g_fb, x, iy, TB_BTN, t, tb_hover_state(g_tb2_vol_rect));
-    du_wf_icon(&g_fb, WF_ICON_VOLUME, x + (TB_BTN - 20) / 2, iy + (TB_BTN - 20) / 2, 20, t->text_primary);
-    x += TB_BTN + 2;
-
-    g_tb2_pwr_rect[0] = x; g_tb2_pwr_rect[1] = iy;
-    g_tb2_pwr_rect[2] = TB_BTN; g_tb2_pwr_rect[3] = TB_BTN;
-    du_wf_icon_button(&g_fb, x, iy, TB_BTN, t, tb_hover_state(g_tb2_pwr_rect));
-    du_wf_icon(&g_fb, WF_ICON_POWER, x + (TB_BTN - 20) / 2, iy + (TB_BTN - 20) / 2, 20, t->text_primary);
-    x += TB_BTN + 6;
-
-    /* 两行时钟（16px 中文位图，行高 18） */
-    g_tb2_clk_rect[0] = x; g_tb2_clk_rect[1] = by;
-    g_tb2_clk_rect[2] = clk_w; g_tb2_clk_rect[3] = TB_H;
-    {
-        int ty1 = by + (TB_H - 36) / 2;
-        zh_draw_string(&g_fb, time_s, x, ty1, t->text_primary, 0);
-        zh_draw_string(&g_fb, date_s, x, ty1 + 18, t->text_dim, 0);
-    }
-    g_tb2_tray_rect[0] = tx; g_tb2_tray_rect[1] = by;
-    g_tb2_tray_rect[2] = tray_w; g_tb2_tray_rect[3] = TB_H;
-
-    /* 快速设置卡片（音量/亮度） */
-    qs_draw();
-    /* WiFi 快捷卡片（最顶） */
-    wifi_draw();
-    /* M3: 开始菜单（叠加在一切之上） */
-    startmenu_draw();
+    return g_tray_up > 0;
 }
 
 /* ============================================================
- *  点击路由（shell.c Fluent 分支调用；返回 1 = 已消费）
+ *  卡片开关 / 绘制 / 点击
  * ============================================================ */
 
-int taskbar_click(int mx, int my) {
-    /* M3: 开始菜单（打开时优先消费；点面板外关闭并放行） */
-    if (g_sm_open) {
-        if (startmenu_click(mx, my)) return 1;
-        if (rect_hit(g_tb2_start_rect, mx, my)) return 1;  /* 已在 click 内关闭 */
-    }
-    /* 主任务栏 */
-    if (rect_hit(g_tb2_start_rect, mx, my)) {
-        startmenu_toggle();
-        return 1;
-    }
-    if (rect_hit(g_tb2_tv_rect, mx, my)) {
-        g_taskview = 1;
-        return 1;
-    }
-    for (int i = 0; i < g_win_count; i++) {
-        if (!g_tb2_app_rect[i][2] || !rect_hit(g_tb2_app_rect[i], mx, my))
-            continue;
-        /* 聚焦窗口；已聚焦则最小化（Win11 行为） */
-        if (g_windows[i].focused && !g_windows[i].minimized) {
-            g_windows[i].minimized = 1;
-            g_focused_win = -1;
-            g_windows[i].focused = 0;
-        } else {
-            g_windows[i].minimized = 0;
-            win_focus(&g_windows[i]);
-        }
-        return 1;
-    }
-    /* WiFi 卡片（打开时优先消费；点外部收起并放行点击） */
-    if (g_wifi_open) wifi_click(mx, my);
-    /* 快速设置卡片（打开时优先消费；点外部收起并放行点击） */
-    if (g_qs_open) qs_click(mx, my);
+int taskbar_cards_open(void) { return g_wifi_open || g_qs_open || g_pwr_open; }
 
-    /* 托盘 */
-    if (rect_hit(g_tb2_pwr_rect, mx, my)) {
-        g_quit = 1;                       /* M7：电源菜单（睡眠/重启/关机） */
-        return 1;
-    }
-    if (rect_hit(g_tb2_net_rect, mx, my)) {
-        /* 网络：弹出/收起 WiFi 快捷卡片（扫描 → 选网 → 密码 → 连接） */
-        g_qs_open = 0;
-        if (g_wifi_open) g_wifi_open = 0;
-        else wifi_card_open();
-        return 1;
-    }
-    if (rect_hit(g_tb2_vol_rect, mx, my)) {
-        /* 音量：弹出/收起快速设置卡片（音量/亮度滑块） */
-        g_wifi_open = 0;
-        if (g_qs_open) g_qs_open = 0;
-        else g_qs_open = 1;
-        return 1;
-    }
-    if (rect_hit(g_tb2_clk_rect, mx, my)) {
-        slog("[taskbar] clock (notification center: M6)");
-        return 1;
-    }
-    /* 命中面板空白处：吞掉点击（不落到桌面） */
-    if (rect_hit(g_tb2_tray_rect, mx, my)) return 1;
-    {
-        int W = (int)g_fb_w, H = (int)g_fb_h;
-        int by = H - TB_H - TB_BOTTOM_GAP;
-        if (my >= by && my < by + TB_H) {
-            int nbtn = 0;
-            for (int i = 0; i < g_win_count; i++)
-                if (g_windows[i].visible && g_windows[i].ws == g_ws_cur) nbtn++;
-            int content_w = TB_PAD + TB_BTN + 4 + TB_BTN + 6 + nbtn * (TB_APPBTN + 4) + TB_PAD - 4;
-            int bx = (W - content_w) / 2;
-            if (mx >= bx && mx < bx + content_w) return 1;
-        }
-    }
+void taskbar_cards_close(void) {
+    g_wifi_open = 0;
+    g_qs_open = 0;
+    g_pwr_open = 0;
+}
+
+void taskbar_wifi_toggle(void) {
+    int was = g_wifi_open;
+    taskbar_cards_close();
+    if (!was) wifi_card_open();
+}
+
+void taskbar_cc_toggle(void) {
+    int was = g_qs_open;
+    taskbar_cards_close();
+    g_qs_open = !was;
+}
+
+void taskbar_power_open(void) {
+    taskbar_cards_close();
+    g_pwr_open = 1;
+}
+
+void taskbar_cards_draw(void) {
+    qs_draw();
+    wifi_draw();
+    pwr_draw();
+}
+
+/* 卡片打开时优先消费；点外部收起并放行 */
+int taskbar_cards_click(int mx, int my) {
+    if (g_wifi_open && wifi_click(mx, my)) return 1;
+    if (g_qs_open && qs_click(mx, my)) return 1;
+    if (g_pwr_open && pwr_click(mx, my)) return 1;
     return 0;
 }

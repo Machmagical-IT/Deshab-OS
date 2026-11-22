@@ -13,8 +13,17 @@
 #define EPTP_WALK_LEN_4  (3ULL << 3)   /* 4 级页表 (3 = 4-1) at bits [5:3] */
 #define EPTP_MEMTYPE_WB  (EPT_MEMORY_TYPE_WB)
 
+struct ept_context {
+    u64 pml4_phys;
+    u64 pml4_virt;
+    int ready;
+};
+
 /* 初始化 EPT：分配 PML4，置零。返回 0 成功。 */
 int ept_init(void);
+int ept_context_init(struct ept_context *context);
+int ept_context_activate(struct ept_context *context);
+struct ept_context *ept_context_active(void);
 
 /* 构造 EPTP 值（用于 VMCS EPT_POINTER 字段）。 */
 u64 ept_get_eptp(void);

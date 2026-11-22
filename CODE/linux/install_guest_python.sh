@@ -13,7 +13,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ROOTFS="${ROOTFS:-/root/arch_rootfs_work/rootfs}"
-HELLO_SRC="$PROJECT_ROOT/SYSTEM/user/python/hello.py"
+HELLO_SRC="$PROJECT_ROOT/SYSTEM/ESP/user/python/hello.py"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "[guest-python] ERROR: must run as root" >&2

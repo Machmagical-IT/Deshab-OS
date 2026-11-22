@@ -3,8 +3,8 @@
 # inside the ESP linux-rootfs.img (/usr/local/lib/xorg-libs + Xorg.good).
 set -uo pipefail
 ROOT=/mnt/d/Code/DEAICUP/Deshab
-EXP=$(md5sum "$ROOT/SYSTEM/boot/utsm.elf" | cut -d' ' -f1)
-echo "expected utsm.elf md5=$EXP size=$(stat -c %s "$ROOT/SYSTEM/boot/utsm.elf")"
+EXP=$(md5sum "$ROOT/SYSTEM/ESP/boot/utsm.elf" | cut -d' ' -f1)
+echo "expected utsm.elf md5=$EXP size=$(stat -c %s "$ROOT/SYSTEM/ESP/boot/utsm.elf")"
 
 check_lib() {
     local f="$1"

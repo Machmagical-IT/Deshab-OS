@@ -1,0 +1,10 @@
+# ZTS 模块清单（Deshab ZTS 子系统）
+# 格式: file|deps|autoload|required
+#   file     : ZTS 目录内文件名（也作为 EFI 引导器预加载 /zts/<file> 的键）
+#   deps     : 逗号分隔的模块名；前缀 ? 表示可选依赖
+#   autoload : 1=开机加载并 init
+#   required : 1=加载失败视为子系统降级（只记日志，不 panic 内核）
+#
+# 运行时热更新会写入 STATEA.CNF / STATEB.CNF 与 MxxxxxxA/B.ZTS 副本；
+# 二者均由 zts.drv 自动维护，不要手工删除。
+0x00000001.zts||1|1

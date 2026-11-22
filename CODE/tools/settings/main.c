@@ -6,6 +6,8 @@
  * 网络页 (NETWORK): 查看/编辑网络配置，全量重写根目录 NETCONF.CNF（netman 读取）。
  * 设备页 (DEVICES): 实时枚举内核 netdev 注册表，选择连接设备，
  *                   WiFi 扫描结果查看与 SSID 选择（选择写入 NETCONF.CNF）。
+ * ZTS 页  (ZTS):    列出/执行 ZTS 热更模块，热替换/回滚/检查点/状态，
+ *                   走服务总线 srv.zts.*（无 zts.drv 时只显示缺席提示）。
  *
  * 快捷键: F1 内核页  F2 网络页  F3 设备页  Tab 切页  F5 保存  F6 重载  Esc 退出
  *         Up/Down 选择字段  Space/Enter/Left/Right 切换布尔/枚举/整数
@@ -122,16 +124,16 @@ static sfield g_nfields[] = {
 /* ---- 全局状态 ---- */
 static da_app_context g_ac;
 static da_cursor g_cursor;
-static da_mouse g_mouse;
 
-static int g_page = 0;          /* 0=kernel 1=network 2=devices */
+static int g_page = 0;          /* 0=kernel 1=network 2=devices 3=zts */
 static int g_sel = 0;           /* 当前页选中字段 */
 static int g_scroll = 0;        /* 当前页滚动偏移 */
-static int g_sel_saved[3] = { 0, 0, 0 };
-static int g_scroll_saved[3] = { 0, 0, 0 };
+static int g_sel_saved[4] = { 0, 0, 0, 0 };
+static int g_scroll_saved[4] = { 0, 0, 0, 0 };
 
 static char g_status[96];       /* 状态栏消息 */
 static u32  g_status_color = DA_SUCCESS;
+static int  g_zts_count;        /* ZTS 页模块数（定义/刷新见 ZTS 段） */
 static int  g_fuck_loaded = 0;  /* FUCK 原文是否读到 */
 static int  g_net_loaded = 0;
 
@@ -423,7 +425,7 @@ static void save_configs(void) {
         }
         set_status(ok_k ? "FUCK saved (reboot to apply)" : "FUCK save FAILED",
                    ok_k ? DA_SUCCESS : DA_ERROR);
-    } else {
+    } else if (g_page == 1 || g_page == 2) {
         /* page 1 (NETWORK) 和 page 2 (DEVICES) 都保存 NETCONF.CNF */
         u32 olen = conf_serialize();
         if (f32_write_root_file("NETCONF CNF", (const u8 *)g_conf_out, olen) == 0) {
@@ -432,6 +434,10 @@ static void save_configs(void) {
         }
         set_status(ok_n ? "NETCONF.CNF saved (reboot to apply)" : "NETCONF save FAILED",
                    ok_n ? DA_SUCCESS : DA_ERROR);
+    } else {
+        /* ZTS 页：F5 语义为刷新模块列表 */
+        extern void zts_refresh(void);
+        zts_refresh();
     }
 }
 
@@ -442,6 +448,7 @@ static int cur_count(void) {
         /* 设备页: 设备数 + 扫描结果数 + 2 按钮 */
         return g_dev_count + g_scan_count + 2;
     }
+    if (g_page == 3) return g_zts_count;
     return g_page == 0 ? (int)KFIELD_COUNT : (int)NFIELD_COUNT;
 }
 
@@ -503,6 +510,81 @@ static void init_net_api(const da_boot_context *ctx) {
     g_net_scan_result  = (net_scan_result_fn)*(u64 *)(net_api + 56);
     g_net_is_wireless  = (net_is_wireless_fn)*(u64 *)(net_api + 64);
     g_net_avail = 1;
+}
+
+/* ============================================================
+ * ZTS 页（srv.zts.* / 服务总线）
+ * ============================================================ */
+typedef int (*zts_list_fn)(char *, u32);
+typedef int (*zts_str_fn)(const char *);
+typedef int (*zts_text_fn)(char *, u32);
+typedef int (*zts_ckpt_create_fn)(const char *);
+
+static zts_list_fn   g_zts_list;
+static zts_str_fn    g_zts_load;
+static zts_str_fn    g_zts_unload;
+static zts_str_fn    g_zts_exec;
+static zts_str_fn    g_zts_update;
+static zts_str_fn    g_zts_rollback;
+static zts_str_fn    g_zts_diff;
+static zts_ckpt_create_fn g_zts_ckpt_create;
+static zts_text_fn   g_zts_state;
+static zts_text_fn   g_zts_stats;
+
+static char g_zts_buf[2048];
+static int  g_zts_avail;
+
+/* dkm_kernel_api.bus 在 ABI 尾部（0xF0）；dkm_bus_api.probe 在 +32。
+ * 与 net API 的裸偏移读取方式一致（shell_abi 契约见 settings 顶部注释）。 */
+static void init_zts_api(const da_boot_context *ctx) {
+    g_zts_avail = 0;
+    u64 api = ctx->dkm_kernel_api;
+    if (!api) return;
+    u64 bus = *(u64 *)(api + 0xF0);
+    if (!bus) return;
+    int (*probe)(const char *, void **, u32 *) =
+        (int (*)(const char *, void **, u32 *))*(u64 *)(bus + 32);
+    if (!probe) return;
+
+    void *fn = 0; u32 ver = 0;
+    if (probe("srv.zts.list", &fn, &ver) == 0) g_zts_list = (zts_list_fn)fn;
+    fn = 0; if (probe("srv.zts.load", &fn, &ver) == 0) g_zts_load = (zts_str_fn)fn;
+    fn = 0; if (probe("srv.zts.unload", &fn, &ver) == 0) g_zts_unload = (zts_str_fn)fn;
+    fn = 0; if (probe("srv.zts.execute", &fn, &ver) == 0) g_zts_exec = (zts_str_fn)fn;
+    fn = 0; if (probe("srv.zts.hotupdate", &fn, &ver) == 0) g_zts_update = (zts_str_fn)fn;
+    fn = 0; if (probe("srv.zts.rollback", &fn, &ver) == 0) g_zts_rollback = (zts_str_fn)fn;
+    fn = 0; if (probe("srv.zts.diff.apply", &fn, &ver) == 0) g_zts_diff = (zts_str_fn)fn;
+    fn = 0; if (probe("srv.zts.checkpoint.create", &fn, &ver) == 0) g_zts_ckpt_create = (zts_ckpt_create_fn)fn;
+    fn = 0; if (probe("srv.zts.state", &fn, &ver) == 0) g_zts_state = (zts_text_fn)fn;
+    fn = 0; if (probe("srv.zts.stats", &fn, &ver) == 0) g_zts_stats = (zts_text_fn)fn;
+
+    g_zts_avail = g_zts_list ? 1 : 0;
+}
+
+void zts_refresh(void) {
+    g_zts_count = 0;
+    g_zts_buf[0] = 0;
+    if (!g_zts_avail || !g_zts_list) {
+        set_status("ZTS subsystem not loaded (zts.drv missing)", DA_WARNING);
+        return;
+    }
+    int n = g_zts_list(g_zts_buf, sizeof(g_zts_buf));
+    g_zts_count = n > 0 ? n : 0;
+    if (g_sel >= g_zts_count) g_sel = g_zts_count ? g_zts_count - 1 : 0;
+    set_status("ZTS modules listed", DA_SUCCESS);
+}
+
+/* 取列表中第 idx 行的首字段（模块名） */
+static const char *zts_line(char *out, int cap, int idx) {
+    const char *p = g_zts_buf;
+    for (int i = 0; i < idx && *p; i++) {
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    int n = 0;
+    while (*p && *p != '\n' && *p != '|' && n + 1 < cap) out[n++] = *p++;
+    out[n] = 0;
+    return out;
 }
 
 /* ---- 设备枚举 ---- */
@@ -607,7 +689,7 @@ static void select_ssid(int idx) {
 }
 
 /* ---- 布局 ---- */
-#define TAB_Y      (DA_TITLEBAR_H + 4)
+#define TAB_Y      (da_chrome_h() + 4)
 #define TAB_H      26
 #define TAB_W      130
 #define FIELD_Y0   (TAB_Y + TAB_H + 10)
@@ -882,6 +964,39 @@ static void draw_button(int x, int y, const char *label, int hot) {
     da_draw_string(&g_ac, label, x + (BTN_W - ll * 12) / 2, y + 4, DA_ACCENT_LIGHT, bg, 12);
 }
 
+static void draw_zts_page(void) {
+    if (!g_zts_avail) {
+        da_draw_string(&g_ac, "ZTS subsystem not loaded (SYSTEM/driver/misc/zts.drv)",
+                       LABEL_X, FIELD_Y0, DA_WARNING, DA_BG_PRIMARY, 12);
+        return;
+    }
+    da_draw_string(&g_ac, "Enter=exec  U=update  R=rollback  C=checkpoint  S=stats",
+                   LABEL_X, FIELD_Y0 - 18, DA_TEXT_DIM, DA_BG_PRIMARY, 12);
+    const char *p = g_zts_buf;
+    int row = 0;
+    int vr = visible_rows();
+    while (*p && row < vr) {
+        const char *e = p;
+        while (*e && *e != '\n') e++;
+        int y = FIELD_Y0 + row * ROW_H;
+        int selected = (g_scroll + row == g_sel);
+        if (selected)
+            da_fill_rect(&g_ac, LABEL_X - 4, y - 2, (i64)g_ac.fb_w - 40, ROW_H, DA_BG_SECONDARY);
+        char line[100];
+        int n = 0;
+        while (p < e && n + 1 < (int)sizeof(line)) line[n++] = *p++;
+        line[n] = 0;
+        da_draw_string(&g_ac, line, LABEL_X, y + 1,
+                       selected ? DA_TEXT_PRIMARY : DA_TEXT_DIM,
+                       selected ? DA_BG_SECONDARY : DA_BG_PRIMARY, 12);
+        row++;
+        if (*p == '\n') p++;
+    }
+    if (!row)
+        da_draw_string(&g_ac, "No ZTS modules loaded",
+                       LABEL_X, FIELD_Y0, DA_WARNING, DA_BG_PRIMARY, 12);
+}
+
 static void redraw_all(void) {
     da_cursor_restore(&g_ac, &g_cursor);
     da_fill_bg(&g_ac, DA_BG_PRIMARY);
@@ -890,6 +1005,7 @@ static void redraw_all(void) {
     draw_tab(0, "KERNEL", 16);
     draw_tab(1, "NETWORK", 16 + TAB_W);
     draw_tab(2, "DEVICES", 16 + 2 * TAB_W);
+    draw_tab(3, "ZTS", 16 + 3 * TAB_W);
 
     if (g_page < 2) {
         /* 字段列表 */
@@ -917,7 +1033,7 @@ static void redraw_all(void) {
             info[ip] = 0;
             da_draw_string(&g_ac, info, (i64)g_ac.fb_w - 120, TAB_Y + 6, DA_TEXT_DIM, DA_BG_PRIMARY, 12);
         }
-    } else {
+    } else if (g_page == 2) {
         /* 设备页 */
         if (!g_net_avail) {
             da_draw_string(&g_ac, "Net API not available (no kernel network support)",
@@ -928,6 +1044,8 @@ static void redraw_all(void) {
         } else {
             draw_device_page();
         }
+    } else {
+        draw_zts_page();
     }
 
     /* 底部按钮 + 状态消息 */
@@ -941,11 +1059,13 @@ static void redraw_all(void) {
     /* 状态栏 */
     const char *hint;
     if (g_page == 0)
-        hint = "F1 Kernel | F2 Network | F3 Devices | F5 Save | F6 Reload | Esc Quit | reboot to apply";
+        hint = "F1 Kernel | F2 Network | F3 Devices | F4 ZTS | F5 Save | F6 Reload | Esc Quit | reboot to apply";
     else if (g_page == 1)
-        hint = "F1 Kernel | F2 Network | F3 Devices | F5 Save | F6 Reload | Esc Quit | netman reads at boot";
+        hint = "F1 Kernel | F2 Network | F3 Devices | F4 ZTS | F5 Save | F6 Reload | Esc Quit | netman reads at boot";
+    else if (g_page == 2)
+        hint = "F1 Kernel | F2 Network | F3 Devices | F4 ZTS | S Scan | Enter Select | F5 Save | Esc Quit";
     else
-        hint = "F1 Kernel | F2 Network | F3 Devices | S Scan | Enter Select | F5 Save | Esc Quit";
+        hint = "F4 ZTS | Enter exec | U update | R rollback | C checkpoint | S stats | F5 refresh | Esc Quit";
     da_draw_statusbar(&g_ac, hint, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
 
     da_cursor_save(&g_ac, &g_cursor);
@@ -970,6 +1090,11 @@ static void handle_click(int mx, int my) {
         if (mx >= 16 && mx < 16 + TAB_W - 8) { switch_page(0); return; }
         if (mx >= 16 + TAB_W && mx < 16 + 2 * TAB_W - 8) { switch_page(1); return; }
         if (mx >= 16 + 2 * TAB_W && mx < 16 + 3 * TAB_W - 8) { switch_page(2); return; }
+        if (mx >= 16 + 3 * TAB_W && mx < 16 + 4 * TAB_W - 8) {
+            switch_page(3);
+            zts_refresh();
+            return;
+        }
     }
 
     if (g_page < 2) {
@@ -985,7 +1110,7 @@ static void handle_click(int mx, int my) {
                 return;
             }
         }
-    } else {
+    } else if (g_page == 2) {
         /* 设备页 */
         if (my >= FIELD_Y0) {
             int row = (my - FIELD_Y0) / ROW_H;
@@ -1007,6 +1132,15 @@ static void handle_click(int mx, int my) {
                 return;
             }
         }
+    } else if (g_page == 3) {
+        if (my >= FIELD_Y0) {
+            int row = (my - FIELD_Y0) / ROW_H;
+            int item = g_scroll + row;
+            if (item >= 0 && item < g_zts_count && row < visible_rows()) {
+                g_sel = item;
+                ensure_visible();
+            }
+        }
     }
 
     /* 按钮区 */
@@ -1024,7 +1158,9 @@ static void handle_click(int mx, int my) {
 /* ---- 主入口 ---- */
 __attribute__((visibility("default")))
 void dsk_entry(const da_boot_context *ctx) {
-    __asm__ volatile("cli");
+    /* P6b：输入走 srv.input.*.poll（IRQ1/IRQ12 由 ps2kbd/ps2mouse 投递），
+     * 必须开中断 —— sti 取代旧的 cli。 */
+    __asm__ volatile("sti");
     da_slog("settings", "boot");
 
     if (!ctx || ctx->magic != DA_BOOT_MAGIC) {
@@ -1043,31 +1179,36 @@ void dsk_entry(const da_boot_context *ctx) {
     init_net_api(ctx);
     if (g_net_avail) query_devices();
 
+    /* 初始化 ZTS 服务（缺席时 ZTS 页只显示提示） */
+    init_zts_api(ctx);
+    if (g_zts_avail) zts_refresh();
+
     g_status[0] = 0;
     load_configs();
 
-    da_mouse_init();
-    g_mouse.idx = 0; g_mouse.has_pkt = 0;
     da_cursor_init(&g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
+    static da_input g_in;
+    if (da_input_open(&g_in, &g_ac) != 0) {
+        da_slog("settings", "input bus missing (INPUT-E01)");
+        return;
+    }
 
     int shift = 0, e0 = 0;
     int prev_btn = 0;
     redraw_all();
 
     for (;;) {
-        /* 鼠标 */
-        if (da_mouse_poll(&g_mouse, &g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
+        /* 鼠标（总线快照绝对坐标） */
+        if (da_input_mouse(&g_in, &g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
             if (g_cursor.btn && !prev_btn)
                 handle_click(g_cursor.mx, g_cursor.my);
             prev_btn = g_cursor.btn;
             redraw_all();
             continue;
         }
-        /* 键盘 */
-        u8 st = inb(0x64);
-        if (!(st & 1)) { __asm__("pause"); continue; }
-        if (st & 0x20) continue;   /* AUX 数据留给鼠标路径 */
-        u8 sc = inb(0x60);
+        /* 键盘（总线 ring） */
+        u8 sc;
+        if (!da_input_kbd(&g_in, &sc)) { __asm__("pause"); continue; }
         if (sc == 0xE0) { e0 = 1; continue; }
         if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
         if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }
@@ -1081,7 +1222,13 @@ void dsk_entry(const da_boot_context *ctx) {
         if (!e0 && sc == 0x3B) { switch_page(0); redraw_all(); continue; }  /* F1 */
         if (!e0 && sc == 0x3C) { switch_page(1); redraw_all(); continue; }  /* F2 */
         if (!e0 && sc == 0x3D) { switch_page(2); redraw_all(); continue; }  /* F3 */
-        if (!e0 && sc == 0x0F) { switch_page((g_page + 1) % 3); redraw_all(); continue; } /* Tab */
+        if (!e0 && sc == 0x3E) { switch_page(3); zts_refresh(); redraw_all(); continue; } /* F4 */
+        if (!e0 && sc == 0x0F) {
+            switch_page((g_page + 1) % 4);
+            if (g_page == 3) zts_refresh();
+            redraw_all();
+            continue;
+        } /* Tab */
         if (!e0 && sc == 0x3F) { save_configs(); redraw_all(); continue; }  /* F5 */
         if (!e0 && sc == 0x40) { load_configs(); if (g_page == 2) query_devices(); redraw_all(); continue; } /* F6 */
 
@@ -1140,6 +1287,47 @@ void dsk_entry(const da_boot_context *ctx) {
                 continue;
             }
             /* 其他键在设备页不处理 */
+            continue;
+        }
+
+        /* ZTS 页特殊键 */
+        if (g_page == 3) {
+            zts_refresh();   /* 先刷新列表（模块数/选中项），随后动作覆盖状态栏 */
+            char name[64];
+            name[0] = 0;
+            zts_line(name, sizeof(name), g_sel);
+            int rc = -1;
+            if (sc == 0x1C || sc == 0x39) {          /* Enter/Space: exec */
+                if (g_zts_exec && name[0]) rc = g_zts_exec(name);
+                set_status(rc == 0 ? "ZTS exec OK" : "ZTS exec FAILED",
+                           rc == 0 ? DA_SUCCESS : DA_ERROR);
+            } else if (sc == 0x16) {                 /* U: hotupdate 到示例 v2 */
+                if (g_zts_update && name[0]) {
+                    char arg[128]; int l = 0;
+                    for (const char *s = name; *s && l < 60; ) arg[l++] = *s++;
+                    arg[l++] = '|';
+                    const char *file = "0x00000002.zts";
+                    for (const char *s = file; *s && l < 120; ) arg[l++] = *s++;
+                    arg[l] = 0;
+                    rc = g_zts_update(arg);
+                }
+                set_status(rc == 0 ? "ZTS hotupdate OK" : "ZTS hotupdate FAILED",
+                           rc == 0 ? DA_SUCCESS : DA_ERROR);
+            } else if (sc == 0x13) {                 /* R: rollback latest ckpt */
+                if (g_zts_rollback && name[0]) rc = g_zts_rollback(name);
+                set_status(rc == 0 ? "ZTS rollback OK" : "ZTS rollback FAILED",
+                           rc == 0 ? DA_SUCCESS : DA_ERROR);
+            } else if (sc == 0x2E) {                 /* C: checkpoint */
+                if (g_zts_ckpt_create) rc = g_zts_ckpt_create("desktop");
+                set_status(rc >= 0 ? "ZTS checkpoint created" : "ZTS checkpoint FAILED",
+                           rc >= 0 ? DA_SUCCESS : DA_ERROR);
+            } else if (sc == 0x1F) {                 /* S: stats */
+                if (g_zts_stats) {
+                    rc = g_zts_stats(g_status, sizeof(g_status) - 1);
+                    if (rc >= 0) g_status_color = DA_SUCCESS;
+                }
+            }
+            redraw_all();
             continue;
         }
 

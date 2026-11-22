@@ -349,18 +349,11 @@ void drr_task_kill_crypto_erase(u32 task_slot) {
                "key_epoch++ erase on task kill: designed, not implemented", 0);
 }
 
-/* segment/system 级回滚入口（R4 遗留）：页级回滚已实现，
- * segment/system 级接口的调用方尚未接线。 */
-void drr_rollback_segment(u32 seg_slot) {
-    (void)seg_slot;
-    panic_full("DRR-E04 SEGMENT ROLLBACK NOT IMPLEMENTED",
-               "segment-level rollback: designed (R4), not verified/implemented", 0);
-}
-
-void drr_rollback_system(void) {
-    panic_full("DRR-E05 SYSTEM ROLLBACK NOT IMPLEMENTED",
-               "system-level rollback: designed (R4), not verified/implemented", 0);
-}
+/* segment/system 级回滚（R4）已实现，见文件尾部 Phase 8 扩展区。
+ * 原骨架 panic（DRR-E04/E05 NOT IMPLEMENTED）由真实现取代：
+ *   - DRR-E04 现语义：segment 回滚的结构前提不成立（无快照区/无
+ *     DIRTY_PAGE checkpoint）即 panic。
+ *   - DRR-E05 现语义：system 回滚升级 reboot 前的留痕日志。 */
 
 /* DKM 驱动 recovery ops（DKM README 设计：quiesce/reset/reinit/dump_state）。
  * 驱动侧从未提供该回调表，DRR 亦未在恢复路径调用。 */
@@ -529,6 +522,18 @@ int drr_checkpoint_finish(void) {
     return 0;
 }
 
+/* R4: 槽位有效性 = magic + version + CRC 三重校验（CRC 字段不参与）。
+ * active 槽额外要求 active 标志；fallback 槽按 CRC 说话（§8.2 "旧 slot
+ * 作为 fallback"——finish 切换时旧槽 active 已清 0，不能作为否定依据）。 */
+static int ckpt_slot_valid(const drr_checkpoint_meta *s, int require_active) {
+    if (s->magic != DRR_CKPT_MAGIC || s->version != DRR_CKPT_VERSION) return 0;
+    if (require_active && s->active != 1) return 0;
+    u64 expected_crc = s->crc;
+    drr_checkpoint_meta tmp = *s;
+    tmp.crc = 0;
+    return drr_crc64(&tmp, sizeof(drr_checkpoint_meta) - sizeof(u64)) == expected_crc;
+}
+
 int drr_checkpoint_recover(drr_checkpoint_meta *out_meta) {
     if (!g_drr.initialized || !out_meta) return -1;
 
@@ -537,31 +542,19 @@ int drr_checkpoint_recover(drr_checkpoint_meta *out_meta) {
         &g_drr.ckpt_a : &g_drr.ckpt_b;
     drr_checkpoint_meta *fallback = (g_drr.active_slot == 0) ?
         &g_drr.ckpt_b : &g_drr.ckpt_a;
+    u32 fallback_slot_id = (g_drr.active_slot == 0) ? 1u : 0u;
 
-    /* 验证 active slot */
-    if (active->magic == DRR_CKPT_MAGIC && active->active == 1) {
-        u64 expected_crc = active->crc;
-        active->crc = 0;
-        u64 actual_crc = drr_crc64(active,
-            sizeof(drr_checkpoint_meta) - sizeof(u64));
-        active->crc = expected_crc;
-        if (actual_crc == expected_crc) {
-            drr_memcpy(out_meta, active, sizeof(drr_checkpoint_meta));
-            return 0;
-        }
+    if (ckpt_slot_valid(active, 1)) {
+        drr_memcpy(out_meta, active, sizeof(drr_checkpoint_meta));
+        return 0;
     }
 
-    /* active 无效，尝试 fallback */
-    if (fallback->magic == DRR_CKPT_MAGIC && fallback->active == 1) {
-        u64 expected_crc = fallback->crc;
-        fallback->crc = 0;
-        u64 actual_crc = drr_crc64(fallback,
-            sizeof(drr_checkpoint_meta) - sizeof(u64));
-        fallback->crc = expected_crc;
-        if (actual_crc == expected_crc) {
-            drr_memcpy(out_meta, fallback, sizeof(drr_checkpoint_meta));
-            return 0;
-        }
+    /* active 无效（CRC 破坏/半写），尝试 fallback（旧稳定点） */
+    if (ckpt_slot_valid(fallback, 0)) {
+        log_warn("[DRR] recover fallback slot");
+        log_hex64("[DRR]   fallback_slot=", fallback_slot_id);
+        drr_memcpy(out_meta, fallback, sizeof(drr_checkpoint_meta));
+        return 0;
     }
 
     /* 双槽都无效 */
@@ -666,15 +659,18 @@ int drr_ckpt_snapshot_dirty(void) {
     return (int)used;
 }
 
-int drr_rollback_pages(void) {
-    if (!g_drr.initialized) return -1;
-    if (!g_snap_ok) return -2;
-    drr_checkpoint_meta meta;
-    if (drr_checkpoint_recover(&meta) != 0) return -3;
-    if (meta.type != DRR_CKPT_DIRTY_PAGE) return -4;
-
+/* R4: 共享恢复核心。seg_slot_filter == DRR_ROLLBACK_ALL_SEGMENTS 表示
+ * 全部段（system 级），否则只恢复该段的快照页。
+ * 前置：caller 已完成 initialized/snap_ok/meta 校验。
+ * 返回恢复页数；*out_failed 置 1 表示任一页 CRC/MAC 校验失败（该段已
+ * POISONED，与页级路径策略一致：数据损坏不 panic，段隔离）。 */
+#define DRR_ROLLBACK_ALL_SEGMENTS 0xFFFFFFFFu
+static int rollback_entries(u32 seg_slot_filter, int *out_failed) {
     drr_snap_header *h = snap_header();
-    if (h->magic != DRR_SNAP_MAGIC || h->version != DRR_SNAP_VERSION) return -5;
+    if (h->magic != DRR_SNAP_MAGIC || h->version != DRR_SNAP_VERSION) {
+        *out_failed = 1;
+        return 0;
+    }
     u32 used = h->used;
     if (used > h->capacity) used = h->capacity;
 
@@ -682,18 +678,22 @@ int drr_rollback_pages(void) {
 
     /* 触碰段先置 RECOVERING */
     for (u32 i = 0; i < used; i++) {
+        if (seg_slot_filter != DRR_ROLLBACK_ALL_SEGMENTS &&
+            entries[i].seg_slot != seg_slot_filter) continue;
         utsm_segment_desc *d = utsm_get_segment(entries[i].seg_slot);
         if (d && d->state == UTSM_SEG_ACTIVE) d->state = UTSM_SEG_RECOVERING;
     }
 
-    int failed = 0;
+    *out_failed = 0;
     u32 restored = 0;
     for (u32 i = 0; i < used; i++) {
         drr_ckpt_page_entry *e = &entries[i];
+        if (seg_slot_filter != DRR_ROLLBACK_ALL_SEGMENTS &&
+            e->seg_slot != seg_slot_filter) continue;
         u8 *snap = snap_page_ptr(e->region_idx);
         utsm_segment_desc *d = utsm_get_segment(e->seg_slot);
         if (drr_crc64(snap, UTSM_PAGE_SIZE) != e->crc) {
-            failed = 1;
+            *out_failed = 1;
             if (d) d->state = UTSM_SEG_POISONED;
             log_error("[DRR] rollback crc fail");
             log_hex64("[DRR]   seg_slot=", e->seg_slot);
@@ -704,7 +704,7 @@ int drr_rollback_pages(void) {
         u64 mac = utsm_page_mac(g_drr.root_key, e->seg_slot, e->page_index,
                                 e->key_epoch, snap);
         if (mac != e->mac) {
-            failed = 1;
+            *out_failed = 1;
             if (d) d->state = UTSM_SEG_POISONED;
             log_error("[DRR] rollback mac fail");
             log_hex64("[DRR]   seg_slot=", e->seg_slot);
@@ -724,10 +724,110 @@ int drr_rollback_pages(void) {
         }
         if (d && d->state == UTSM_SEG_RECOVERING) d->state = UTSM_SEG_ACTIVE;
     }
+    return (int)restored;
+}
+
+int drr_rollback_pages(void) {
+    if (!g_drr.initialized) return -1;
+    if (!g_snap_ok) return -2;
+    drr_checkpoint_meta meta;
+    if (drr_checkpoint_recover(&meta) != 0) return -3;
+    if (meta.type != DRR_CKPT_DIRTY_PAGE) return -4;
+
+    int failed = 0;
+    int restored = rollback_entries(DRR_ROLLBACK_ALL_SEGMENTS, &failed);
+    if (failed) return -2;
 
     log_info("[DRR] rollback done");
-    log_hex64("[DRR]   pages=", restored);
-    return failed ? -2 : (int)restored;
+    log_hex64("[DRR]   pages=", (u64)restored);
+    return restored;
+}
+
+/* ---- R4: segment 级回滚 ---- */
+int drr_rollback_segment(u32 seg_slot) {
+    if (!g_drr.initialized || !g_snap_ok) {
+        panic_full("DRR-E04 SEGMENT ROLLBACK UNAVAILABLE",
+                   "segment rollback requires initialized DRR with snapshot region", 0);
+    }
+    drr_checkpoint_meta meta;
+    if (drr_checkpoint_recover(&meta) != 0) {
+        /* 设计 §8.2：双槽都无效 → system rollback */
+        drr_system_rollback("segment rollback: both slots invalid");
+    }
+    if (meta.type != DRR_CKPT_DIRTY_PAGE) {
+        panic_full("DRR-E04 SEGMENT ROLLBACK UNAVAILABLE",
+                   "no dirty-page checkpoint: no ciphertext snapshot to restore", 0);
+    }
+
+    /* 快照区无该段条目：无法恢复 → 段 POISONED，调用方决定升级 */
+    drr_snap_header *h = snap_header();
+    u32 used = h->used;
+    if (used > h->capacity) used = h->capacity;
+    drr_ckpt_page_entry *entries = snap_entries();
+    int found = 0;
+    for (u32 i = 0; i < used; i++) {
+        if (entries[i].seg_slot == seg_slot) { found = 1; break; }
+    }
+    if (!found) {
+        utsm_segment_desc *d = utsm_get_segment(seg_slot);
+        if (d) d->state = UTSM_SEG_POISONED;
+        log_error("[DRR] segment rollback: no snapshot entries");
+        log_hex64("[DRR]   seg_slot=", seg_slot);
+        return -3;
+    }
+
+    int failed = 0;
+    int restored = rollback_entries(seg_slot, &failed);
+    if (failed) {
+        log_error("[DRR] segment rollback verify failed");
+        log_hex64("[DRR]   seg_slot=", seg_slot);
+        return -2;
+    }
+    log_info("[DRR] segment rollback ok");
+    log_hex64("[DRR]   seg_slot=", seg_slot);
+    log_hex64("[DRR]   pages=", (u64)restored);
+    return restored;
+}
+
+/* ---- R4: system 级回滚（内存内全量恢复；升级路径不返回） ---- */
+int drr_rollback_system(void) {
+    if (!g_drr.initialized || !g_snap_ok) {
+        panic_full("DRR-E05 SYSTEM ROLLBACK UNAVAILABLE",
+                   "system rollback requires initialized DRR with snapshot region", 0);
+    }
+    drr_checkpoint_meta meta;
+    if (drr_checkpoint_recover(&meta) != 0) {
+        /* 设计 §8.2：双槽都无效 → system rollback（8042 复位，不返回） */
+        log_error("[DRR-E05 SYSTEM ROLLBACK ESCALATED]");
+        drr_system_rollback("system rollback: both slots invalid");
+    }
+    if (meta.type != DRR_CKPT_DIRTY_PAGE) {
+        log_error("[DRR-E05 SYSTEM ROLLBACK ESCALATED]");
+        drr_system_rollback("system rollback: no dirty-page checkpoint");
+    }
+
+    int failed = 0;
+    int restored = rollback_entries(DRR_ROLLBACK_ALL_SEGMENTS, &failed);
+    if (failed) {
+        log_error("[DRR-E05 SYSTEM ROLLBACK ESCALATED]");
+        drr_system_rollback("system rollback: page verify failed");
+    }
+    log_info("[DRR] system rollback ok");
+    log_hex64("[DRR]   pages=", (u64)restored);
+    return restored;
+}
+
+/* ---- R4: selftest 专用钩子（非生产路径） ---- */
+void drr_test_corrupt_slot(u32 slot) {
+    if (slot == 0) {
+        g_drr.ckpt_a.crc ^= 1;
+    } else if (slot == 1) {
+        g_drr.ckpt_b.crc ^= 1;
+    }
+}
+
+u32 drr_test_active_slot(void) {
+    return g_drr.active_slot;
 }
 
 void drr_system_rollback(const char *reason) {
@@ -829,7 +929,9 @@ static const drr_recovery_api g_drr_api = {
     .heartbeat_get = drr_heartbeat_get,
     .emergency_alloc = drr_emergency_alloc,
     .ckpt_snapshot_dirty = drr_ckpt_snapshot_dirty,
-    .rollback_pages = drr_rollback_pages
+    .rollback_pages = drr_rollback_pages,
+    .rollback_segment = drr_rollback_segment,   /* R4 尾部追加 */
+    .rollback_system = drr_rollback_system      /* R4 尾部追加 */
 };
 
 const drr_recovery_api *drr_get_recovery_api(void) {

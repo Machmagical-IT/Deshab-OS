@@ -8,8 +8,8 @@
 /* 前向声明：带 FUCK [drivers] 过滤的加载入口（定义见下文） */
 void dsm_load_by_manifest_ex(const ini_config *cfg);
 
-#define DSM_MAX_DRIVERS_PER_STAGE 8
-#define DSM_MAX_STAGES 4
+#define DSM_MAX_DRIVERS_PER_STAGE 12
+#define DSM_MAX_STAGES 6
 #define DSM_MAX_DEPENDS 4
 #define DSM_MAX_PROVIDES 4
 #define DSM_MAX_CAPS 128
@@ -453,6 +453,25 @@ static int dsm_ensure_manifest(void) {
     return 0;
 }
 
+/* P3（万物互联）：模块从文件系统加载——boot module 未命中时的回退源。
+ * 经服务总线取 fat32.drv 的 srv.fs.fat32.read_path（stage2 已加载，stage4
+ * 模块经 FS 加载时可用）。返回 0 成功，out_buf 指向 fat32.drv 的静态缓冲。
+ * 调用方须在下一次读文件前完成本次加载（本加载器单线程、逐个加载，满足）。 */
+static int dsm_read_module_fs(const char *path, const void **out_buf, u64 *out_size) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->bus) return -1;
+    void *fn = 0;
+    if (api->bus->probe("srv.fs.fat32.read_path", &fn, 0) != 0) return -1;
+    int (*read_path)(const char *, u8 **, u32 *) =
+        (int (*)(const char *, u8 **, u32 *))fn;
+    u8 *data = 0;
+    u32 size = 0;
+    if (read_path(path, &data, &size) != 0) return -2;
+    if (out_buf) *out_buf = data;
+    if (out_size) *out_size = (u64)size;
+    return 0;
+}
+
 static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max_stage_id) {
     if (dsm_ensure_manifest() != 0) return;
 
@@ -476,7 +495,8 @@ static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max
 
             for (u32 di = 0; di < stage->driver_count; di++) {
                 dsm_driver_entry *drv = &stage->drivers[di];
-                struct limine_file *f;
+                const void *mod_addr;
+                u64 mod_size;
                 struct dkm_symbol_scan symbols;
                 int result;
 
@@ -499,37 +519,45 @@ static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max
                  * provides 后下一趟重试；整体停滞时统一判罚（零降级）。 */
                 if (!dsm_deps_satisfied(drv, 0)) continue;
 
+                /* 模块源解析（P3）：boot module 命中优先；否则经服务总线
+                 * 从 FAT32 读取（stage≥4 模块不必预置为 boot module）。
+                 * 双源皆无且 required → DKM-E46（零降级）。 */
                 drv->boot_module = dsm_find_boot_module(drv->path);
-                if (!drv->boot_module) {
-                    log_info("[DSM] module not found");
+                if (drv->boot_module) {
+                    mod_addr = drv->boot_module->address;
+                    mod_size = drv->boot_module->size;
+                } else if (dsm_read_module_fs(drv->path, &mod_addr, &mod_size) == 0) {
+                    log_info("[DSM] module from FS");
+                    log_info(drv->name);
+                } else {
+                    log_info("[DSM] module not found (boot module + FS)");
                     log_info(drv->name);
                     drv->resolved = 1;
                     pending--;
                     if (drv->required && stage->required) {
-                        /* 严格错误策略插桩：required 驱动缺模块零降级（DKM-E04） */
-                        panic_full("DKM-E04 REQUIRED DRIVER MODULE MISSING",
-                                   "required driver boot module not found in manifest stage", 0);
+                        /* P3：模块 boot module 与 FS 双源皆无零降级（DKM-E46） */
+                        panic_full("DKM-E46 MODULE SOURCE MISSING",
+                                   "module not found as boot module nor via srv.fs.fat32", 0);
                         break;
                     }
                     continue;
                 }
 
-                f = drv->boot_module;
                 log_info("[DSM] loading driver");
                 log_info(drv->name);
 
-                if (dkm_check_elf64(f->address, f->size) != 0) {
+                if (dkm_check_elf64(mod_addr, mod_size) != 0) {
                     log_error("[DSM] ELF check failed");
                     if (drv->required && stage->required) {
                         panic_full("DKM-E05 REQUIRED DRIVER ELF INVALID",
-                                   "required driver boot module failed ELF64 check", 0);
+                                   "required driver module failed ELF64 check", 0);
                     }
                     drv->resolved = 1;
                     pending--;
                     continue;
                 }
 
-                if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
+                if (dkm_scan_symbols(mod_addr, mod_size, &symbols) != 0) {
                     log_error("[DSM] symbol scan failed");
                     if (drv->required && stage->required) {
                         panic_full("DKM-E06 REQUIRED DRIVER SYMBOL SCAN FAILED",
@@ -540,7 +568,7 @@ static void dsm_load_stage_range(const ini_config *cfg, int limit_stage, u32 max
                     continue;
                 }
 
-                result = dkm_load_elf_rel(f->address, f->size, &symbols);
+                result = dkm_load_elf_rel(mod_addr, mod_size, &symbols);
                 if (result != 0) {
                     log_error("[DSM] load failed");
                     if (drv->required && stage->required) {
@@ -599,7 +627,8 @@ static void dsm_load_named_impl(const ini_config *cfg, const char *name, int str
         dsm_stage_entry *stage = &g_stages[si];
         for (u32 di = 0; di < stage->driver_count; di++) {
             dsm_driver_entry *drv = &stage->drivers[di];
-            struct limine_file *f;
+            const void *mod_addr;
+            u64 mod_size;
             struct dkm_symbol_scan symbols;
             int result;
 
@@ -618,33 +647,39 @@ static void dsm_load_named_impl(const ini_config *cfg, const char *name, int str
                            "dsm_load_named: depends token not provided by any loaded driver", 0);
                 return;
             }
+            /* P3：boot module 优先，回退服务总线 FS 读取。 */
             drv->boot_module = dsm_find_boot_module(drv->path);
-            if (!drv->boot_module) {
-                log_warn("[DSM] named module not found");
+            if (drv->boot_module) {
+                mod_addr = drv->boot_module->address;
+                mod_size = drv->boot_module->size;
+            } else if (dsm_read_module_fs(drv->path, &mod_addr, &mod_size) == 0) {
+                log_info("[DSM] named module from FS");
+                log_info(drv->name);
+            } else {
+                log_warn("[DSM] named module not found (boot module + FS)");
                 log_info(name);
                 /* 严格错误策略插桩：named 驱动缺模块零降级（DKM-E12） */
                 panic_full("DKM-E12 NAMED DRIVER MODULE MISSING",
-                           "dsm_load_named: named driver boot module not found", 0);
+                           "dsm_load_named: named driver not found as boot module nor via FS", 0);
                 return;
             }
-            f = drv->boot_module;
             log_info("[DSM] loading named driver");
             log_info(drv->name);
-            if (dkm_check_elf64(f->address, f->size) != 0) {
+            if (dkm_check_elf64(mod_addr, mod_size) != 0) {
                 log_error("[DSM] ELF check failed");
                 /* 严格错误策略插桩：named 驱动 ELF 校验失败零降级（DKM-E13） */
                 panic_full("DKM-E13 NAMED DRIVER ELF INVALID",
                            "dsm_load_named: named driver failed ELF64 check", 0);
                 return;
             }
-            if (dkm_scan_symbols(f->address, f->size, &symbols) != 0) {
+            if (dkm_scan_symbols(mod_addr, mod_size, &symbols) != 0) {
                 log_error("[DSM] symbol scan failed");
                 /* 严格错误策略插桩：named 驱动符号扫描失败零降级（DKM-E14） */
                 panic_full("DKM-E14 NAMED DRIVER SYMBOL SCAN FAILED",
                            "dsm_load_named: named driver symbol scan failed", 0);
                 return;
             }
-            result = dkm_load_elf_rel(f->address, f->size, &symbols);
+            result = dkm_load_elf_rel(mod_addr, mod_size, &symbols);
             if (result != 0) {
                 log_error("[DSM] load failed");
                 /* 严格错误策略插桩：named 驱动加载失败零降级（DKM-E15） */

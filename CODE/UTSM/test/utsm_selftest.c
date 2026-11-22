@@ -420,5 +420,132 @@ int utsm_selftest_run(void) {
         log_info("[DRR] watchdog selftest done");
     }
 
+    /* ==== DRR-3: segment 级回滚（R4） ====
+     * 写 V1 → 快照 → 写 V2 覆盖 → 按段回滚 → 读回 V1
+     * （真 chacha20 解密 + keyed BLAKE2b 页 MAC 校验路径） */
+    {
+        const char *v1 = "SEG-ROLLBACK-V1-STATE";
+        const char *v2 = "SEG-OVERWRIT-V2-STATE";
+        u64 vlen = strlen(v1) + 1;
+        status = utsm_write(cap, 512, v1, vlen);
+        if (status != UTSM_OK) {
+            log_error("[DRR] selftest seg V1 write failed");
+            panic_full("TST-E39 SEGMENT ROLLBACK FAILED",
+                       "utsm_selftest: segment rollback pre write failed", 0);
+            return status;
+        }
+        int snap = drr_ckpt_snapshot_dirty();
+        if (snap < 1) {
+            log_error("[DRR] selftest seg snapshot failed");
+            panic_full("TST-E39 SEGMENT ROLLBACK FAILED",
+                       "utsm_selftest: segment rollback snapshot failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        status = utsm_write(cap, 512, v2, vlen);
+        if (status != UTSM_OK) {
+            log_error("[DRR] selftest seg V2 write failed");
+            panic_full("TST-E39 SEGMENT ROLLBACK FAILED",
+                       "utsm_selftest: segment rollback overwrite failed", 0);
+            return status;
+        }
+        int rb = drr_rollback_segment(cap.segment_slot);
+        log_hex64("[DRR] segment rollback pages=", (u64)(i64)rb);
+        if (rb < 1) {
+            log_error("[DRR] selftest segment rollback failed");
+            panic_full("TST-E39 SEGMENT ROLLBACK FAILED",
+                       "utsm_selftest: segment-level rollback failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        status = utsm_read(cap, 512, readback, vlen);
+        if (status != UTSM_OK || memcmp(readback, v1, vlen) != 0) {
+            log_error("[DRR] segment rollback verify FAIL");
+            panic_full("TST-E40 SEGMENT ROLLBACK VERIFY FAIL",
+                       "utsm_selftest: segment rollback verify mismatch", 0);
+            return UTSM_ERR_INVALID;
+        }
+        log_info("[DRR] segment rollback verify ok");
+    }
+
+    /* ==== DRR-4: system 级回滚 + A/B 槽破坏 fallback（R4 硬验收） ====
+     * 两次快照（A/B 各一）→ V5 覆盖（未入快照）→ 破坏 active 槽 CRC
+     * → recover 走 fallback 旧槽 → system 级全量回滚 → 读回 V4
+     * → 再写读证明系统继续跑 */
+    {
+        const char *v3 = "SYS-ROLLBACK-V3-STATE";
+        const char *v4 = "SYS-ROLLBACK-V4-STATE";
+        const char *v5 = "SYS-OVERWRIT-V5-STATE";
+        const char *v6 = "SYS-LIVENESS-V6-STATE";
+        u64 vlen = strlen(v3) + 1;
+        status = utsm_write(cap, 512, v3, vlen);
+        if (status != UTSM_OK) {
+            panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
+                       "utsm_selftest: system rollback V3 write failed", 0);
+            return status;
+        }
+        if (drr_ckpt_snapshot_dirty() < 1) {   /* 快照 1（写 inactive 槽） */
+            panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
+                       "utsm_selftest: system rollback snapshot 1 failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        status = utsm_write(cap, 512, v4, vlen);
+        if (status != UTSM_OK) {
+            panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
+                       "utsm_selftest: system rollback V4 write failed", 0);
+            return status;
+        }
+        if (drr_ckpt_snapshot_dirty() < 1) {   /* 快照 2（写另一槽并切换） */
+            panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
+                       "utsm_selftest: system rollback snapshot 2 failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        status = utsm_write(cap, 512, v5, vlen);   /* 覆盖，不入快照 */
+        if (status != UTSM_OK) {
+            panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
+                       "utsm_selftest: system rollback V5 write failed", 0);
+            return status;
+        }
+        /* 人为破坏 active 槽 → recover 必须 fallback 到旧稳定点 */
+        u32 active = drr_test_active_slot();
+        drr_test_corrupt_slot(active);
+        drr_checkpoint_meta meta;
+        if (drr_checkpoint_recover(&meta) != 0) {
+            log_error("[DRR] selftest AB fallback failed");
+            panic_full("TST-E41 AB FALLBACK FAILED",
+                       "utsm_selftest: A/B fallback to old stable slot failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        int rb = drr_rollback_system();
+        log_hex64("[DRR] system rollback pages=", (u64)(i64)rb);
+        if (rb < 1) {
+            log_error("[DRR] selftest system rollback failed");
+            panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
+                       "utsm_selftest: system-level rollback failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        status = utsm_read(cap, 512, readback, vlen);
+        if (status != UTSM_OK || memcmp(readback, v4, vlen) != 0) {
+            log_error("[DRR] system rollback verify FAIL");
+            panic_full("TST-E43 SYSTEM ROLLBACK VERIFY FAIL",
+                       "utsm_selftest: system rollback verify mismatch", 0);
+            return UTSM_ERR_INVALID;
+        }
+        /* 系统继续跑：回滚后正常写读 */
+        status = utsm_write(cap, 512, v6, vlen);
+        if (status != UTSM_OK) {
+            panic_full("TST-E44 POST-ROLLBACK LIVENESS FAIL",
+                       "utsm_selftest: post-rollback write failed", 0);
+            return status;
+        }
+        status = utsm_read(cap, 512, readback, vlen);
+        if (status != UTSM_OK || memcmp(readback, v6, vlen) != 0) {
+            log_error("[DRR] post-rollback liveness FAIL");
+            panic_full("TST-E44 POST-ROLLBACK LIVENESS FAIL",
+                       "utsm_selftest: post-rollback readback mismatch", 0);
+            return UTSM_ERR_INVALID;
+        }
+        log_info("[DRR] system rollback verify ok");
+        log_info("[DRR] post-rollback liveness ok");
+    }
+
     return UTSM_OK;
 }

@@ -320,19 +320,33 @@ int utsm_sched_bootstrap_init(void) {
 int utsm_task_create(u32 process_slot, u32 priority, void (*entry)(void *), void *arg) {
     if (!entry || priority >= UTSM_SCHED_PRIORITY_COUNT) return UTSM_SCHED_ERR_INVALID;
 
+    /* P6b：抢占可能已开启（task_create 供 session 在运行期建长驻任务）。
+     * 建表+入队必须原子，否则 tick 落在半成品 TCB 上会调度到未初始化任务。 */
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+
     u32 slot = UTSM_SCHED_MAX_TASKS;
     for (u32 i = 0; i < UTSM_SCHED_MAX_TASKS; i++) {
         if (g_task_table[i].state == UTSM_SCHED_TASK_UNUSED) { slot = i; break; }
     }
-    if (slot == UTSM_SCHED_MAX_TASKS) return UTSM_SCHED_ERR_NO_TASK;
+    if (slot == UTSM_SCHED_MAX_TASKS) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        return UTSM_SCHED_ERR_NO_TASK;
+    }
 
     void *stack = kmem_alloc_page(4);   /* 16KB 任务栈（arena，非 DMA 资源） */
-    if (!stack) return UTSM_SCHED_ERR_NO_TASK;
+    if (!stack) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        return UTSM_SCHED_ERR_NO_TASK;
+    }
     u64 top = ((u64)stack + 4 * UTSM_PAGE_SIZE) & ~15ULL;
 
     utsm_sched_tcb *t = &g_task_table[slot];
     int rc = utsm_sched_task_init(t, 0x1000ULL + slot, process_slot, priority, ~0ULL);
-    if (rc != UTSM_SCHED_OK) return rc;
+    if (rc != UTSM_SCHED_OK) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        return rc;
+    }
     t->flags = UTSM_SCHED_TASK_F_KERNEL;
 
     /* crypto_context 指针：切换路径唯一触碰的加密状态 */
@@ -360,6 +374,7 @@ int utsm_task_create(u32 process_slot, u32 priority, void (*entry)(void *), void
     g_task_aux[slot].run_start_ns = 0;
 
     rc = utsm_sched_enqueue(0, t);
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
     if (rc != UTSM_SCHED_OK) return rc;
     return (int)slot;
 }
@@ -541,6 +556,7 @@ static int utsm_sched_exc_hook(u64 vector, u64 err, u64 rip) {
 }
 
 int utsm_sched_enable(u32 tick_hz) {
+    if (g_sched_enabled) return 0;   /* 转圈任务在驱动加载前已经打开过 */
     if (tick_hz == 0) tick_hz = g_cfg_tick_hz;
     g_tick_ns = 1000000000ULL / tick_hz;
 

@@ -33,6 +33,10 @@ void ipc_shm_shutdown(void);
 /* Query state */
 int ipc_shm_is_ready(void);
 
+/* Query whether the Linux guest has published its linux_ready flag
+ * (set by the guest driver after it maps the SHM region). */
+int ipc_shm_linux_ready(void);
+
 /* Get the HPA of the shared memory region (for EPT mapping).
  * Returns 0 if not initialized. */
 u64 ipc_shm_get_hpa(void);

@@ -42,7 +42,11 @@
 - [ ] P4e desktop.drv（~20TU ld -r，host SDL #ifdef 隔离，readobj 重定位核对）
 - [ ] P4f cmd.drv + 收尾（DSK 只剩排序骨架）
 - [ ] P5 DSK 退役 + session.drv（删 deshab.elf/dsk_loader.c/dsk_boot_context；dev/release 双过）
-- [ ] P6 常驻调度 + 真 IRQ 输入（sched_enable 常驻 + bootstrap park、desktop 任务化、IRQ1/12 解屏蔽、kbd 事件环）
+- [x] P6 常驻调度 + 真 IRQ 输入（sched_enable 常驻 + bootstrap park、desktop 任务化、IRQ1/12 解屏蔽、kbd 事件环）
+  - ✅ P6a 调度器常驻 + ps2kbd IRQ1 ring + `srv.input.kbd.poll/.snapshot`
+  - ✅ P6b 输入总线化：firstInit/login/shell/cmd/desktop 全部改消费 `srv.input.kbd.poll` / `srv.input.mouse.poll`；`kern.irq.unmask` 解屏蔽 IRQ1/12 + IF=1；业务代码 `inb(0x60)` 归零
+  - ✅ P6b-desktop 任务化：`srv.desktop.spawn` 建任务 slot=1，每帧 `sleep_ms(1)`；session 返回后 bootstrap 转 idle；证据 `p6c_final.log`
+  - 证据 `.build_tmp/p6b_qemu.log` + `.build_tmp/p6c_final.log`：`[session] IF=1 (true IRQ input armed)`、`[firstinit] kbd event via srv.input.kbd.poll`、`[login] password correct`、`[desktop] desktop ready`、`[desktop] kbd event via srv.input.kbd.poll`、`mouse first pkt via srv.input.mouse.poll`
 - [ ] D7 收尾（kapi 静态表退役、kern.block.* 消费者切换、STUB 基线复核）
 
 ## ⏪ 四期：落款（DRR/PCQ）
@@ -51,7 +55,7 @@
 - [x] R2 看门狗（timeout 检出 + 回滚/复位，负向测试 PASS）
 - [x] R3 Emergency Pool（64KB 编译期独立池）
 - [x] R3b `drr_emergency_pool_kb` / `drr_recovery_log_size` FUCK 键接线（运行期钳位到编译期上限）
-- [ ] R4 A/B 回滚收尾（segment/system 级验证，依赖真实加密）
+- [x] R4 A/B 回滚收尾（segment/system 级 ✅，真 BLAKE2b 页 MAC；A/B 槽破坏 fallback 硬验收 PASS，`.build_tmp/qemu_serial_r4ab.log`）
 - [ ] R5 PCQ 多核（per-cpu runqueue 负载均衡；BSP-only 🔶）
 
 ## 🪷 五期：品牌

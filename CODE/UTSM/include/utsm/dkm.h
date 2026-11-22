@@ -140,6 +140,8 @@ typedef struct drr_recovery_api {
     void *(*emergency_alloc)(u64 size, u64 alignment);
     int  (*ckpt_snapshot_dirty)(void);
     int  (*rollback_pages)(void);
+    int  (*rollback_segment)(u32 seg_slot);   /* R4 尾部追加（ABI 兼容） */
+    int  (*rollback_system)(void);            /* R4 尾部追加（ABI 兼容） */
 } drr_recovery_api;
 
 /* SAS-R0-PCQ 调度器服务表（Phase7；驱动经 kernel_api->sched 使用） */

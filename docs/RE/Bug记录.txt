@@ -33,6 +33,87 @@
 
 <!-- 在此追加 bug 条目，最新放在顶部 -->
 
+### BUG-20261117-003 [P1] [desktop/lxc] KDE 启动 exec_async 失败后 DESK-E14 停机
+- 现象: 点 KDE 后桌面停在 `DESK-E14 LINUX EXEC DEAD`，串口有 `kde: exec_async failed`。
+- 复现步骤: dev 镜像进桌面，启动开始菜单里的 KDE（或串口 `2`）。
+- 串口/日志证据: 用户实测日志行 `kde: exec_async failed`，随后 `DESK-E14 LINUX EXEC DEAD`。
+- 根因分析: 2026-11-17 10:57 镜像串口是 `guest ping rc=-1`，然后 `DESK-E14 LINUX EXEC DEAD`。这次是 WHPX，没有嵌套 VMX，Linux guest 起不来。同步 `rm` 已去掉，失败发生在 ping，还没到 exec_async。
+- 修复方案: 启动时 `vmm_enable` 失败已按白名单跳过 guest。开始菜单再点 KDE 时 ping 失败不再 `DESK-E14`，打日志后留在桌面。guest 已在而 exec 失败仍停机。真正打开 KDE 要用 `ISO/run_qemu_kvm.sh`。
+- 状态: [FIXING]
+- 修复提交: 待提交
+- 验证: 2026-11-17 10:57 `ISO/deshab-dev.img`，WHPX，`guest ping rc=-1` → `DESK-E14 LINUX EXEC DEAD`。
+
+### BUG-20261117-002 [P1] [desktop/lxc] 开始菜单 VSCode 没有打开
+- 现象: 点 VSCode 后没有出现 VSCode 窗口，也没有像 KDE 那样停在 `DESK-E14`。
+- 复现步骤: dev 镜像进桌面，开始菜单点 VSCode（`STARTMENU.CNF` 路径 `/opt/vscode/bin/code`）。
+- 串口/日志证据: 本次矩阵只记录「没有打开」，没有附带 `[launch]` / `DESK-E14` 行。
+- 根因分析: 与 KDE 同一次测试。WHPX 无嵌套 VMX，`guest ping rc=-1`，guest 没起来。补 `run_slice` 要等 guest 已经 park 才有用。
+- 修复方案: 与 KDE 相同。guest 不在时开始菜单点 VSCode 只打 `linuxapp: guest absent` 并留在桌面，不再停机。guest 起来之后的 spawn 失败仍是 `DESK-E14`。
+- 状态: [FIXING]
+- 修复提交: 待提交
+- 验证: 2026-11-18 KVM（Accel kvm，guest parked）开始菜单打开 VSCode：ping rc=0，Xfbdev exec rc=0，约 5 秒后 X socket 仍未就绪，`/opt/vscode/bin/code` async spawn pid=84，40 秒无 scanout。Xfbdev 的报错此前被丢掉。已改成异步前台启动并把 `/tmp/Xfbdev.log` 打到串口。
+
+### BUG-20261117-001 [P2] [desktop/pe] Deaicup 进程起来后立刻 ExitProcess(0)，窗口不留下
+- 现象: 点 Deaicup 后进程启动，马上 `ExitProcess(0)`，窗口没有留在桌面上。同一次矩阵里系统信息、时钟、画板、记事本是画出窗口后再退出。
+- 复现步骤: dev 镜像进桌面，开始菜单点 Deaicup（`program/deaicup.exe`）。
+- 串口/日志证据: 用户实测描述为进程起来后马上 `ExitProcess(0)`。本次未附完整串口。
+- 根因分析: 未定位。桌面侧 PE 路径是 `launch_pe_app` → `run_windowed`，`ExitProcess(0)` 来自 exe 自身退出，宿主会拆掉窗口。
+- 修复方案: 10:57 镜像只在 `shim_msg_push` 丢 `WM_CLOSE`。关闭按钮走 `inject_input` → `shim_msg_push_pt`，那条没拦。现改为在 `shim_msg_push_pt` 丢第一帧前的 `WM_CLOSE`，并在每次 PE 启动时清空消息队列。需要新的 utsm.elf 才能再测。
+- 状态: [FIXING]
+- 修复提交: 待提交
+- 验证: 2026-11-17 10:57 `ISO/deshab-dev.img` 仍复现：进程起来后马上 `ExitProcess(0)`，窗口没有留住。
+
+
+### BUG-20261116-002 [P2] [UTSM/panic] 崩溃屏仍是 DEAICUP 莲花，且 logo 源文件散落在仓库根与过期路径
+- 现象: panic 界面绘制 ohMyLogo 莲花；生成脚本默认路径指向 `d:/Code/DEAICUP/Deshab/ohMyLogo.png`，`build.ps1` 在仓库根找 `ohMyLogo.png`，与现用的 `TEXTURES/` 脱节。
+- 复现步骤: 触发任一 `panic_halt`（CPU 异常或 strict panic），观察帧缓冲居中图。
+- 串口/日志证据: 串口行 `[PANIC] panic_full: 莲花崩溃屏`。
+- 根因分析: `panic_logo_data.inc` 由莲花 PNG 生成并内嵌；构建脚本与 `gen_panic_logo.py` 的默认源仍指向旧莲花文件，未使用 `TEXTURES/machmagic.png`。
+- 修复方案:
+  - `TEXTURES/` 按用途拆为 `panic/`、`splash/`、`legacy/`；当时磁盘上仅有 `machmagic.png`，放入 `TEXTURES/panic/`。
+  - `gen_panic_logo.py` 默认源改为该文件，并重新生成 `panic_logo_data.inc`（384×384，背景 RGB(2,0,47)）。
+  - `panic.c` 注释与串口文案改为 machmagic；`build.ps1` 从 `TEXTURES/panic/machmagic.png` 再生。
+- 状态: [FIXED]
+- 修复提交: 待提交
+- 验证: 生成脚本输出 `[gen_panic_logo] 384x384 bg=0xFF02002F`；inc 文件头为 `Auto-generated from machmagic.png`。尚未在 QEMU 上重拍崩溃屏。
+
+### BUG-20261116-001 [P1] [desktop] 桌面图标单击无反应；启动失败只打日志
+- 现象: 桌面上大部分软件点一下没有窗口、也没有进入应用。失败路径（缺 ELF/PE、装载失败、建窗失败、描述符无入口）只 `slog` 后返回，桌面继续画，看起来像点击被吃掉。
+- 复现步骤: 进入桌面页，单击图标一次（不要双击）。
+- 串口/日志证据: 单击无 `app launched` / `launching external elf` / `pe: run_windowed`。失败时仅有 `elf path not found`、`pe: exe not found`、`pe: service unavailable` 等日志，无 fatal。
+- 根因分析: `desktop_click` 要求本次点击是双击且图标已选中才 `launch_app`，单击只改 `selected`。`launch_app` / `launch_pe_app` / `launch_external_elf*` 在无入口或文件缺失时直接 return。
+- 修复方案:
+  - `CODE/desktop/shell.c`：桌面图标单击即 `launch_app`。
+  - `CODE/desktop/launcher.c`：自检仍失败则 `desktop_fatal`：`DESK-E10` 无入口或非法 id，`DESK-E11` ELF 缺失或装载失败，`DESK-E12` PE 服务/exe/surface 失败，`DESK-E13` 窗口创建失败。
+  - `desktop_fatal` 从 `main.c` 的 static 改为对外符号，供 launcher 调用。
+- 状态: [FIXED]
+- 修复提交: 待提交
+- 验证: 2026-11-17 10:57 `ISO/deshab-dev.img`：向导和登录能进桌面。13 个能打开并回到桌面：终端、CMD、浏览器、设置、ProEdit、编辑器、文件管理、计算器、系统信息、时钟、画板、记事本、磁盘工具。Deaicup、VSCode、KDE 见上方三条。
+
+### BUG-20261102-002 [P1] [tools] 全屏 ELF 工具直接轮询 PS/2 端口 0x60，被 ps2kbd/ps2mouse IRQ handler 抢字节 → 鼠标失灵、Esc 无效（磁盘工具进入后鼠标坏掉）
+- 现象: 打开"磁盘工具"（diskinfo.elf）后鼠标完全不动、Esc 也退不出；退出后桌面光标错乱（跳变到上次鼠标位置并大片重绘）。browser/settings/editor 等全屏 ELF 同样。
+- 复现步骤: dev 镜像直达桌面 → 开始菜单点"磁盘工具"（或串口 '7'）→ 移动鼠标/按 Esc。
+- 串口/日志证据: 工具内无任何 kbd/mouse 消费日志；退出后 `[desktop] ps2 包错位` 类光标乱走。根因可由代码确认：工具主循环 `inb(0x64)`/`inb(0x60)` 与 ps2kbd.drv IRQ1 / ps2mouse.drv IRQ12 handler 竞争同一 0x60 端口——P6b 之后 handler 常驻并先读走字节，工具端口轮询必然饿死，且拆包造成半包残留。
+- 根因分析: shell/cmd 早已迁到 `srv.input.kbd.poll` / `srv.input.mouse.poll`（DKM/dkm_input.h），但这些全屏 ELF 工具（diskinfo/browser/editor/fileman/settings/curl/ping/sysinfo）仍沿用旧的端口轮询 helper（SDK dsb_mouse_poll / desktop_app.h da_mouse_poll + 裸 inb），且启动时 `cli` 关中断进一步让总线 ring 收不到事件。
+- 修复方案:
+  - 新增头文件 `CODE/sdk/include/deshab/input_bus.h`（`dsb_input_open/kbd/mouse`，总线客户端，语义同 DKM/dkm_input.h；用驱动快照绝对坐标避免增量漂移），并从 deshab.h 聚合包含。
+  - `CODE/tools/desktop_app.h` 新增 `da_input_open/kbd/mouse`（裸偏移 `api+0xF0`→bus、`bus+32`→probe）。
+  - 各工具迁移：`cli`→`sti`（总线 IRQ 投递前提），`da_mouse_poll`/端口轮询 → `da_input_*` / `dsb_input_*`；kbd 服务缺席时画提示并归还桌面。
+  - build.ps1 `$toolApps` 增加 `diskinfo`（此前不在官方构建列表，ELF 为陈旧预置）。
+- 状态: [FIXED]
+- 修复提交: 工作区（重建 SYSTEM/bin/diskinfo.elf + SYSTEM/system/deshab64/tools/{browser,editor,fileman,settings,curl,ping}.elf 并热补入镜像）
+- 验证: QEMU dev 镜像逐个打开 BROWSER/SETTINGS/EDITOR(elf)/DISKINFO，逐帧差分确认光标跟随到目标点（bbox 含目标坐标）、Esc 均 `external elf returned` 正常退出；退出后桌面鼠标恢复。
+
+### BUG-20261102-001 [P0] [UTSM/idt] PE 原生执行前 idt_install_pe_diag 把 32-255 全换成 halt 桩，P6b 后第一个调度 tick 冻死整机（"点了应用桌面没反应"）
+- 现象: 开始菜单中所有 **PE 应用**（sysinfo/clock/paint/notes/deaicup）点击后桌面整体无响应、不出现窗口；CPU 停在 `cli;hlt` 循环；串口在 `[PE] stack_top=...` 之后戛然而止（无 RegisterClassExW / CreateWindowExW / BitBlt）。
+- 复现步骤: dev 镜像（skip_login=1 直达桌面）点开始菜单任一 PE 项（如 SYSINFO），或串口发 '5'。
+- 串口/日志证据: `.build_tmp/repro/serial.log`：`[PE] stack_top=0x...` 后无后续；QEMU monitor `info registers`：`RIP=0xffffffff80000292 RFL=... HLT=1 CPL=0`（`0x...0292` 即 `isr_halt_stub` 的 `jmp` 指令），RSP 落在 PE 的 1MB 大栈顶端（`0xffffffff82e8cef0`）。
+- 根因分析: `idt_install_pe_diag()` 当时等价 `idt_install_dsk_diag()`，把 vector 32-255 全部置为 `isr_halt_stub`。其前提不变式「DSK 交接后 IF=0、PIC 全 mask，IRQ 不可能到达」在 DSK 时代成立；但万物互联 P6b 之后桌面是调度器常驻任务、`sti` 后 IF=1，LAPIC 调度 tick 使用动态向量 `0x40`（日志 `[LAPIC] vector=0x40`）。PE 一旦开始原生执行，第一个 LAPIC tick 就命中 vector 0x40 的 halt 桩 → `cli;hlt` 永久停机。所有 PE 应用共此路径，故"大部分软件都打不开"。
+- 修复方案: `CODE/UTSM/arch/x86_64/idt.c::idt_install_pe_diag` 改为只重装 vector 0-31 的异常入口（保留完整异常日志语义），**不再触碰 32-255 的 IRQ 向量**，让调度 tick / IRQ1 键盘 / IRQ12 鼠标 / MSI 继续正常投递；新增日志行 `[IDT] PE diag IDT installed (exc 0-31 logged, IRQ vectors kept live)` 便于区分新旧行为。
+- 状态: [FIXED]
+- 修复提交: 工作区（UTSM 重新编译链接 SYSTEM/boot/utsm.elf）
+- 验证: 热补新版 utsm.elf 后重启 dev 镜像，串口单键与开始菜单点击逐一打开 SHELL/CMD/EDITOR/FILEMAN/CALC/SETTINGS/BROWSER/PROEDIT/SYSINFO/CLOCK/PAINT/NOTES/DISKINFO/DEAICUP 全部成功渲染；PE 窗口串口出现 `[shim] RegisterClassExW ok`→`CreateWindowExW ok`→`CreateDIBSection ok`→`BitBlt first frame on screen`；鼠标点关闭按钮与键盘 Esc 均触发 `[PE] ExitProcess code=0` → `[desktop] pe: exited` 并回到桌面。
+
 ### BUG-20260803-009 [P3] [DKM/apic] PIT mode3 方波在 IOAPIC edge 触发下每周期双投递：100Hz 设定实测 200Hz（tick 2x 定论）
 - 现象: apic_route=1 接管验证时，500ms 窗口数到 ~100 ticks（PIT ch0 mode3 设定 100Hz，预期 50）；tick handler 计数恰为 2 倍，且持续投递窗口（sustain）同样双倍。
 - 复现步骤: FUCK [drivers] apic_route=1 启动 → ROUTE VERIFY 阶段计数复现；apic_diag=1 时 HPET 对拍实验自动输出定论。
@@ -401,3 +482,20 @@
 - 状态: [FIXED]
 - 修复文件: CODE/DKM/ahci/ahci.c (L372-386)
 - 验证: QEMU 测试无 TFD ERR 错误，4 次 FAT32 写入成功，里程碑文件正确写入磁盘。
+
+### BUG-20261018-P01 [P0] [desktop/cmd] 开始菜单/桌面程序点击无反应（CMD 跳到 0x87ff000 崩溃停机）
+- 现象: 开始菜单里点 CMD / 桌面快捷方式点应用后看不到窗口、系统不再响应；此前点击的大多应用也一并"失效"。
+- 复现: dev 镜像 QEMU 串口通道 'b'（launch_app_by_name("cmd")），日志 `.build_tmp/mx_cmd.log`：
+  `[desktop] launching external elf` 之后：
+  `[PANIC] err=0x2` / `[PANIC] rip=0x00000000087ff000` / `[PANIC] rax=0xa` / `[PANIC] halt`。
+- 根因: P4f 把 `CODE/cmd/main.c` 改成 DKM 驱动入口（driver_init）时删掉了 `dsk_entry`；同一份源码仍被 Makefile 链接成 `cmd.elf`（desktop 开始菜单按 `dsk_boot_context` ABI 启动）。`ENTRY(dsk_entry)` 找不到符号，ld.lld 只给 warning 并写 e_entry=0；desktop ELF loader 按 `image + (e_entry - min_vaddr)` 计算入口 → `0x8800000 - 0x1000 = 0x87ff000`（字库/logo 之后的垃圾内存），执行随即 #PF → UTSM panic halt。整个桌面停在这一帧，后续点击全部无反应。
+- 修复:
+  1. `CODE/cmd/main.c`：恢复 `dsk_entry`（从 compat ctx 建立 kernel_api/fb/block/PE service 后进入 cmd_run），与 driver_init 双入口共存。
+  2. `CODE/desktop/launcher.c`：ELF loader 增加 entry 必须落在 `[min_vaddr, max_vaddr)` 的校验（rc=-7），并校验 PT_LOAD/PT_DYNAMIC/RELA 的文件偏移边界；坏 ELF 只串口报 `elf load failed rc=`，不再跳到垃圾地址。
+  3. `CODE/desktop/launcher.c`：内置/PE 窗口应用启动前切回 DESKTOP 页（窗口只在页 3 绘制）。此前在 DASHBOARD/IDE 页点开始菜单应用，窗口已创建但永远画不出来。
+  4. `CODE/desktop/lxc.c`：Linux guest 缺席（无 VMX/KVM）时 `guest_gui_launch` 会把 state 归零；此时不再 attach/切 IDE 页，避免用户被带到空白 IDE 页、之后所有窗口应用都"看不到"。
+  5. `CODE/desktop/input.c`：PS/2 配置字节读失败时不再回写 `inb(0x60)` 残留值（残留 ACK 0xFA 的 bit5=1 会禁 AUX 时钟，鼠标全死），回落 0x47 安全基线；增加首包/配置串口留档。
+  6. `CODE/cmd/MAKEFILE`：链接加 `--fatal-warnings`，ENTRY 符号缺失直接炸构建，不再产出 e_entry=0 的二进制。
+- 状态: [FIXED]
+- 验证: 修复后 `readelf -h SYSTEM/system/deshab64/cmd.elf` → `Entry point address: 0x1000`（修复前 0x0）；`dsk_entry` 符号存在（size=512）。矩阵串口验证（修复前镜像）：shell/browser/settings/proedit/diskinfo 均 `launching external elf` 且各自打印 boot；仅 cmd 崩溃，与上述根因一致。
+- 备注: 本次重建期间 `SYSTEM/EFI/BOOT/BOOTX64.EFI` 被并行工作切成 CODE/boot 的新 EFI 引导器（21KB WIP，实测在交接处 #UD 停机），重建产物因此不自举；验证改用把 Limine 307KB BOOTX64.EFI 换回的镜像副本（.build_tmp/verify_limine.img）。该引导器属另一条工作线，未改动。

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Re-sync the ESP boot payload (+ guest scripts / X11 libs) on existing GPT
 # images without recopying the 4GiB extra-rootfs. Then prove the in-image
-# utsm.elf md5 matches SYSTEM/boot/utsm.elf.
+# utsm.elf md5 matches SYSTEM/ESP/boot/utsm.elf.
 set -uo pipefail
 ROOT=/mnt/d/Code/DEAICUP/Deshab
-expected=$(md5sum "$ROOT/SYSTEM/boot/utsm.elf" | cut -d' ' -f1)
+expected=$(md5sum "$ROOT/SYSTEM/ESP/boot/utsm.elf" | cut -d' ' -f1)
 echo "[patch-all] expected utsm.elf md5=$expected"
 
 for img in "$@"; do

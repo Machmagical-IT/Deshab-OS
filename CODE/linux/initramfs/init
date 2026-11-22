@@ -99,7 +99,7 @@ if [ $VDB_OK -eq 1 ]; then
                 if mount -t ext4 -o ro,noload /dev/vdc /mnt/root/mnt/persist-ro || \
                    mount -t ext2 -o ro /dev/vdc /mnt/root/mnt/persist-ro; then
                     klog "[utsm-linux] /dev/vdc mounted ro at persist-ro"
-                    mount -t tmpfs -o mode=755,size=512m tmpfs \
+                    mount -t tmpfs -o mode=755,size=1536m tmpfs \
                         /mnt/root/mnt/persist-ov
                     mkdir -p /mnt/root/mnt/persist-ov/upper \
                              /mnt/root/mnt/persist-ov/work
@@ -122,10 +122,18 @@ if [ $VDB_OK -eq 1 ]; then
                         mkdir -p /mnt/root/mnt/persist-ov/$d/upper \
                                  /mnt/root/mnt/persist-ov/$d/work \
                                  /mnt/root/$d
+                        # /opt also layers the persistent volume so a VSCode
+                        # install baked into /dev/vdc at build time is visible
+                        # without any runtime tarball extraction (330MB push +
+                        # 969MB unpack against guest RAM was unreliable).
+                        LOWER="/mnt/root/$d"
+                        if [ "$d" = "opt" ] && [ -d /mnt/root/mnt/persist-ro/opt ]; then
+                            LOWER="/mnt/root/mnt/persist-ro/opt:/mnt/root/$d"
+                        fi
                         if mount -t overlay overlay \
-                            -o lowerdir=/mnt/root/$d,upperdir=/mnt/root/mnt/persist-ov/$d/upper,workdir=/mnt/root/mnt/persist-ov/$d/work \
+                            -o lowerdir="$LOWER",upperdir=/mnt/root/mnt/persist-ov/$d/upper,workdir=/mnt/root/mnt/persist-ov/$d/work \
                             /mnt/root/$d 2>/dev/null; then
-                            klog "[utsm-linux] overlay: /$d rw (tmpfs)"
+                            klog "[utsm-linux] overlay: /$d rw ($LOWER)"
                         fi
                     done
                     if [ -x /mnt/root/mnt/persist/usr/bin/startplasma-x11 ]; then

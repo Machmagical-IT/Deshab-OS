@@ -167,35 +167,48 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
 ### 3.4 输入 API
 
-**键盘**（轮询模式，scan code set 1）：
+**键盘**（服务总线，scan code set 1）——P6b 之后**必须**这样读，不要直读端口：
 
 ```c
-u8 st = dsb_inb(0x64);
-if (st & 1) {
-    u8 sc = dsb_inb(0x60);
+static dsb_input g_in;
+if (dsb_input_open(&g_in, g_ac.api) != 0) {
+    /* srv.input.kbd.poll 缺席：画提示后退出，不要回退到 inb(0x60) */
+}
+
+/* 主循环中 */
+u8 sc;
+if (dsb_input_kbd(&g_in, &sc)) {
     char ch = dsb_scan_to_ascii(sc, shift_pressed);
     /* sc == 1 为 Esc，sc == 0x36/0x2A 为 Shift */
 }
 ```
 
-**鼠标**（PS/2 轮询模式）：
+> **为什么不能直读 0x60**：ps2kbd.drv 常驻后 IRQ1 handler 先把端口字节读走，
+> 应用再轮询只会饿死（按 Esc 没反应）；残留半包还会让退出后光标错乱。
+> `dsb_input_open` 返回 -1 表示 kbd 服务缺席，此时应提示并退出（零降级）。
+> 鼠标同理走 `dsb_input_mouse(&g_in, &cursor, ac.fb_w, ac.fb_h)`。
+
+**鼠标**（服务总线，跟着上面同一个 `g_in`）：
 
 ```c
-dsb_mouse mouse;
 dsb_cursor cursor;
-dsb_mouse_init();                        /* 初始化 AUX 端口 + 流模式 */
 dsb_cursor_init(&cursor, ac.fb_w, ac.fb_h);
 
 /* 主循环中 */
-if (dsb_mouse_poll(&mouse, &cursor, ac.fb_w, ac.fb_h)) {
-    /* cursor.mx / cursor.my / cursor.btn 已更新 */
+if (dsb_input_mouse(&g_in, &cursor, ac.fb_w, ac.fb_h)) {
+    /* cursor.mx / cursor.my / cursor.btn 已更新（驱动给的绝对坐标，已钳位） */
     dsb_cursor_save(&ac, &cursor);       /* 先恢复旧位置背景 */
     dsb_cursor_restore(&ac, &cursor);    /* （需先 save 过） */
     dsb_cursor_draw(&ac, &cursor, DSB_CURSOR_COLOR);
 }
 ```
 
-> 注意：`dsb_mouse_poll` 先检查 AUX 位（`0x20`）再读数据，避免吞掉键盘扫描码。
+> 鼠标服务缺席时 `dsb_input_mouse` 恒返回 0（键盘仍可用），不需要额外判断。
+>
+> **`dsb_mouse_init` / `dsb_mouse_poll` / `dsb_ps2_drain` 仍然留在 `input.h` 里，
+> 但全仓库已无调用方**：它们是 P6b 之前的端口轮询实现（`inb(0x60)`/`inb(0x64)`），
+> 现在调用会与常驻驱动的 IRQ handler 抢同一个端口。新代码一律用
+> `dsb_input_*`，别再照着旧示例写。
 
 ### 3.5 FAT32 与网络（按需引入）
 

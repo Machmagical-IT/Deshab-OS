@@ -101,16 +101,22 @@ static void log_line(const char *level, const char *msg) {
     log_emit("\n");
 }
 
+/* 初始化画面的转圈挂在日志上：启动期几乎每一步都打日志。 */
+extern void boot_status_pump(void);
+
 void log_info(const char *msg) {
     log_line("[INFO]", msg);
+    boot_status_pump();
 }
 
 void log_warn(const char *msg) {
     log_line("[WARN]", msg);
+    boot_status_pump();
 }
 
 void log_error(const char *msg) {
     log_line("[ERR ]", msg);
+    boot_status_pump();
 }
 
 void log_hex64(const char *prefix, u64 value) {
@@ -124,9 +130,10 @@ void log_hex64(const char *prefix, u64 value) {
     buf[18] = 0;
     if (g_log_color && g_log_color_on) {
         log_emit_colored(g_log_color, prefix, buf, 0);
-        return;
+    } else {
+        log_emit(prefix);
+        log_emit(buf);
+        log_emit("\n");
     }
-    log_emit(prefix);
-    log_emit(buf);
-    log_emit("\n");
+    boot_status_pump();
 }

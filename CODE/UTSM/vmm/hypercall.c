@@ -94,13 +94,15 @@ static long hcall_hello(u64 a0, u64 a1, u64 a2) {
     (void)a0; (void)a1; (void)a2;
     log_info("[HCALL] HELLO from Linux guest");
 
-    /* Linux is announcing itself; the IPC shared memory's linux_ready
-     * flag is set separately when Linux maps the shared memory. */
-    if (ipc_shm_is_ready()) {
-        /* Send a HELLO_ACK message via the shared memory ring */
-        const char *msg = "HELLO from UTSM";
-        ipc_shm_send(UTSM_MSG_HELLO_ACK, msg, 15);
-    }
+    /* Linux announces itself here BEFORE it maps the SHM region and sets its
+     * linux_ready flag (guest driver: HELLO → SHM_INFO → linux_ready=1). The
+     * HELLO_ACK is informational only — the guest driver (utsm_hcall.c) never
+     * consumes UTSM_MSG_HELLO_ACK; the real handshake is the user-space daemon's
+     * EXEC_READY. Previously the ACK was pushed when ipc_shm_linux_ready() read
+     * true, but the guest could clear linux_ready (SHM err path) between that
+     * guard read and the send, tripping the zero-degradation guard in
+     * ipc_shm_send (IPC-E03) during guest bring-up. Defer unconditionally. */
+    log_info("[HCALL] HELLO_ACK deferred to EXEC_READY handshake");
     return UTSM_HCALL_OK;
 }
 
@@ -330,7 +332,7 @@ int hypercall_handle(u64 guest_rax, u64 guest_rdi, u64 guest_rsi, u64 guest_rdx,
         /* Daemon park: return to DSK. Idle HLT must not use this path. */
         g_guest_regs.rax = (u64)UTSM_HCALL_OK;
         vmx_vmcs_write(VMCS_GUEST_RIP, guest_rip + instr_len);
-        g_guest_parked = 1;
+        vm_machine_set_active_state(VM_MACHINE_PARKED);
         log_info("[HCALL] PARK - Linux guest parked");
         return 0;
     case UTSM_HCALL_SHM_INFO:

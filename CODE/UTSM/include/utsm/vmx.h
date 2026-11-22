@@ -343,6 +343,7 @@ void linux_cet_force_guest_off(void);
  * 仅排队；实际在下一次 vmresume 前（guest RFLAGS.IF=1 且无阻塞时）注入，
  * 否则 arm interrupt-window exiting，待 guest 可接收时注入。 */
 void vmx_guest_queue_irq(u32 vector);
+void vmx_guest_irq_reset(void);
 
 /* VMX preemption timer：返回 host polling 周期对应的 timer 计数值。
  * 当前周期为 10ms，避免 nested KVM 在 1ms VM-exit 下失去前进性。 */

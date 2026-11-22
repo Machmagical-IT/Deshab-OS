@@ -7,7 +7,7 @@
 # into an ext4 image exposed to the Linux guest via virtio-blk (/dev/vdb).
 #
 # Output:
-#   SYSTEM/boot/linux-rootfs.img  (ext4 image, ~512MB)
+#   SYSTEM/ESP/boot/linux-rootfs.img  (ext4 image, ~512MB)
 #
 # Performance note:
 #   All intermediate work (extraction, ext4 build) happens on the native
@@ -23,10 +23,11 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/boot"
+OUTPUT_DIR="$PROJECT_ROOT/SYSTEM/ESP/boot"
 OUTPUT_IMG="$OUTPUT_DIR/linux-rootfs.img"
-# 768MB leaves room for distro CPython + stdlib on the virtio-blk rootfs.
-IMG_SIZE_MB=${IMG_SIZE_MB:-768}
+# 1024MB leaves room for distro CPython + WiFi userspace (iw/wpa_supplicant/hostapd)
+# on the virtio-blk rootfs. (Was 768MB before the WiFi backend added tools.)
+IMG_SIZE_MB=${IMG_SIZE_MB:-1024}
 ARCH_INSTALL_PYTHON="${ARCH_INSTALL_PYTHON:-1}"
 
 # Work on native Linux FS for speed (NOT /mnt/d which is 9p — extremely slow).
@@ -110,15 +111,14 @@ Include = /etc/pacman.d/mirrorlist
 
 [extra]
 Include = /etc/pacman.d/mirrorlist
-
-[community]
-Include = /etc/pacman.d/mirrorlist
 PACMANCONF
 
 # 5. Create essential directories and device nodes
 echo "[arch-rootfs] Creating device nodes and directories..."
 mkdir -p "$ROOTFS_DIR"/{dev,proc,sys,tmp,run,mnt,root,home}
-mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/var/log" "$ROOTFS_DIR/var/lib/pacman"
+# var/lib/pacman 在重复构建时可能已是 5.6 留下的 symlink（指向 /tmp/pacman/lib），
+# mkdir -p 会因此失败；这里容错，symlink 依旧可用（构建期会建好其目标目录）。
+mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/var/log" "$ROOTFS_DIR/var/lib/pacman" || true
 
 mknod -m 600 "$ROOTFS_DIR/dev/console" c 5 1 2>/dev/null || true
 mknod -m 666 "$ROOTFS_DIR/dev/null" c 1 3 2>/dev/null || true
@@ -155,9 +155,39 @@ echo "[arch-rootfs]   after:  $(du -sh "$ROOTFS_DIR" | cut -f1)"
 #       /var/cache/pacman → downloaded package cache
 #       /etc/resolv.conf  → DNS config written by /sbin/init
 echo "[arch-rootfs] Redirecting writable paths to /tmp (tmpfs)..."
+# pacman 的 local 数据库（var/lib/pacman/local）记录“系统里装了哪些包”，
+# 是 pacman -S 判断文件冲突的唯一依据。原脚本把它和 var/lib/pacman 一起
+# 换成指向 /tmp 的符号链接，等于把数据库整个丢掉 —— 结果是 pacman 认为
+# 系统是空的，安装 base/core 系依赖时报 "exists in filesystem" 而必定失败。
+#
+# 做法：把 pristine local 库留在只读镜像里（/usr/local/share/deshab），
+# 启动时由 guest 启动脚本复制进 tmpfs 再给 pacman 用。镜像侧仍只读、
+# 不产生 virtio 脏页；pacman 侧拿到一份能写的、内容完整的库。
+PRISTINE_DB="$ROOTFS_DIR/usr/local/share/deshab/pacman-local"
+if [ -d "$ROOTFS_DIR/var/lib/pacman/local" ]; then
+    mkdir -p "$(dirname "$PRISTINE_DB")"
+    rm -rf "$PRISTINE_DB"
+    cp -a "$ROOTFS_DIR/var/lib/pacman/local" "$PRISTINE_DB"
+    echo "[arch-rootfs]   pristine pacman local db: $(find "$PRISTINE_DB" -maxdepth 1 -mindepth 1 -type d | wc -l) pkgs"
+else
+    echo "[arch-rootfs]   WARNING: bootstrap has no pacman local db"
+fi
+
 rm -rf "$ROOTFS_DIR/var/lib/pacman" "$ROOTFS_DIR/var/cache/pacman"
 ln -sfn /tmp/pacman/lib   "$ROOTFS_DIR/var/lib/pacman"
 ln -sfn /tmp/pacman/cache "$ROOTFS_DIR/var/cache/pacman"
+
+# 构建期还要 chroot 进 rootfs 跑 pacman -S（python / wifi 工具）。那些调用
+# 走的是 /var/lib/pacman → /tmp/pacman/lib，所以这里先把母本种进
+# ROOTFS_DIR/tmp/pacman/lib/local，构建期 pacman 才有已装包清单可用。
+# 这份副本只是构建期脚手架：运行期 /tmp 是 tmpfs，启动 wrapper 会从
+# /usr/local/share/deshab/pacman-local 重新种一份，镜像里的副本不可见。
+# （打包前在 7.8 清掉，避免白白多占 4MB 镜像空间。）
+mkdir -p "$ROOTFS_DIR/tmp/pacman/lib/sync" "$ROOTFS_DIR/tmp/pacman/cache/pkg"
+if [ -d "$PRISTINE_DB" ]; then
+    rm -rf "$ROOTFS_DIR/tmp/pacman/lib/local"
+    cp -a "$PRISTINE_DB" "$ROOTFS_DIR/tmp/pacman/lib/local"
+fi
 rm -f "$ROOTFS_DIR/etc/resolv.conf"
 ln -sfn /tmp/resolv.conf  "$ROOTFS_DIR/etc/resolv.conf"
 
@@ -192,6 +222,39 @@ if ip link set eth0 up 2>/dev/null; then
     echo "[arch-utsm] eth0: 10.0.2.15/24 gw 10.0.2.2 (slirp static)"
 else
     echo "[arch-utsm] WARNING: eth0 not found — network unavailable"
+fi
+
+# ===== Deshab guest WiFi (mac80211_hwsim virtual radios) =====
+# The guest kernel builds mac80211_hwsim in, so two radios (wlan0 station /
+# wlan1 AP) appear at boot. hostapd runs a demo AP on wlan1
+# (SSID "Deshab-Net" / WPA2 / password "deshab123") so the Deshab desktop
+# network icon can scan a real SSID, take a password, and perform a genuine
+# 802.11 association + WPA2 4-way handshake. Actual internet backhaul stays
+# on eth0 (slirp) above.
+rfkill unblock all 2>/dev/null
+ip link set wlan0 up 2>/dev/null
+if command -v iw >/dev/null 2>&1 && iw dev 2>/dev/null | grep -q wlan1; then
+    cat > /tmp/hostapd-deshab.conf <<'HAPD'
+interface=wlan1
+driver=nl80211
+ssid=Deshab-Net
+hw_mode=g
+channel=1
+wpa=2
+wpa_passphrase=deshab123
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+HAPD
+    iw dev wlan1 set type __ap 2>/dev/null
+    ip link set wlan1 up 2>/dev/null
+    if command -v hostapd >/dev/null 2>&1 && \
+       hostapd -B /tmp/hostapd-deshab.conf >/tmp/hostapd.log 2>&1; then
+        echo "[arch-utsm] hostapd demo AP up (SSID Deshab-Net)"
+    else
+        echo "[arch-utsm] WARNING: hostapd failed to start (see /tmp/hostapd.log)"
+    fi
+else
+    echo "[arch-utsm] WARNING: no hwsim wlan1 / iw missing — WiFi demo disabled"
 fi
 
 echo "[arch-utsm] Arch Linux rootfs booted"
@@ -273,11 +336,40 @@ IPC_INCLUDE="$PROJECT_ROOT/CODE/utsm-ipc"
 if [ -f "$DAEMON_SRC" ]; then
     echo "[arch-rootfs] Compiling utsm_exec_daemon (static)..."
     mkdir -p "$ROOTFS_DIR/usr/local/bin"
+    # 最小 nl80211 AP 工具（零 OpenSSL；hostapd 因 guest libcrypto 缺陷不可用）
+    AP_SRC="$SCRIPT_DIR/deshab_ap.c"
+    if [ -f "$AP_SRC" ]; then
+        if cc -static -O2 -Wall -Wno-unused-function -o \
+               "$ROOTFS_DIR/usr/local/bin/deshab_ap" "$AP_SRC" 2>"$WORK_DIR/ap_build.log"; then
+            strip "$ROOTFS_DIR/usr/local/bin/deshab_ap" 2>/dev/null || true
+            chmod +x "$ROOTFS_DIR/usr/local/bin/deshab_ap"
+            echo "[arch-rootfs] deshab_ap installed"
+        else
+            echo "[arch-rootfs] WARNING: deshab_ap build failed:"; cat "$WORK_DIR/ap_build.log"
+        fi
+    fi
     if cc -static -O2 -Wall "-I$IPC_INCLUDE" \
            -o "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon" "$DAEMON_SRC" 2>"$WORK_DIR/daemon_build.log"; then
         strip "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon" 2>/dev/null || true
         chmod +x "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon"
-        echo "[arch-rootfs] daemon installed: $(ls -lh "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon" | awk '{print $5}')"
+        # initramfs /init (CODE/linux/initramfs/init) switch_roots STRAIGHT to
+        # this entry — /sbin/init never runs — so guest networking (eth0 uplink
+        # + mac80211_hwsim demo AP for the desktop WiFi card) must be brought up
+        # here, before the vCPU parks for UTSM. Replace the entry with a wrapper
+        # that does the setup then execs the real daemon (keeping it PID 1).
+        mv -f "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon" \
+              "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon.real"
+        # 启动 wrapper 用仓库里的 guest_boot.sh（与 patch_rootfs_pacman.sh 共用同一份，
+        # 避免逻辑两处漂移）。它铺 tmpfs、pacman 可写层、网络与演示 AP，最后 exec 真 daemon。
+        GUEST_BOOT="$SCRIPT_DIR/initramfs/guest_boot.sh"
+        if [ ! -f "$GUEST_BOOT" ]; then
+            echo "[arch-rootfs] ERROR: missing $GUEST_BOOT" >&2
+            exit 1
+        fi
+        sed 's|%DAEMON%|/usr/local/bin/utsm_exec_daemon.real|g' \
+            "$GUEST_BOOT" > "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon"
+        chmod +x "$ROOTFS_DIR/usr/local/bin/utsm_exec_daemon"
+        echo "[arch-rootfs] daemon + boot-wrapper installed (from guest_boot.sh)"
     else
         echo "[arch-rootfs] WARNING: daemon build failed:"
         cat "$WORK_DIR/daemon_build.log"
@@ -287,7 +379,7 @@ else
 fi
 
 # 7.6 Distro CPython for guest userspace (Track C). Keep interpreter and
-# stdlib from the same Arch packages; do not overlay SYSTEM/lib libpython.
+# stdlib from the same Arch packages; do not overlay SYSTEM/ESP/lib libpython.
 if [ "$ARCH_INSTALL_PYTHON" = "1" ]; then
     echo "[arch-rootfs] Installing Arch CPython into staging rootfs..."
     mkdir -p "$ROOTFS_DIR"/{dev,proc,sys,tmp}
@@ -295,11 +387,14 @@ if [ "$ARCH_INSTALL_PYTHON" = "1" ]; then
     mount --bind /proc "$ROOTFS_DIR/proc" 2>/dev/null || true
     mount --bind /sys "$ROOTFS_DIR/sys" 2>/dev/null || true
     printf 'nameserver 1.1.1.1\n' > "$ROOTFS_DIR/tmp/resolv.conf"
+    # 5.6 把 /var/lib/pacman 指到 /tmp/pacman/lib（tmpfs）；构建期需先建好目标目录，
+    # 否则 chroot 内 pacman 报 "could not find or read directory"。
+    mkdir -p "$ROOTFS_DIR/tmp/pacman/lib/sync" "$ROOTFS_DIR/tmp/pacman/cache/pkg"
     if chroot "$ROOTFS_DIR" /usr/bin/pacman -Sy --noconfirm && \
-       chroot "$ROOTFS_DIR" /usr/bin/pacman -S --noconfirm python; then
+       chroot "$ROOTFS_DIR" /usr/bin/pacman -S --noconfirm --overwrite '*' python; then
         mkdir -p "$ROOTFS_DIR/usr/local/share/deshab/python"
-        if [ -f "$PROJECT_ROOT/SYSTEM/user/python/hello.py" ]; then
-            install -m 0644 "$PROJECT_ROOT/SYSTEM/user/python/hello.py" \
+        if [ -f "$PROJECT_ROOT/SYSTEM/ESP/user/python/hello.py" ]; then
+            install -m 0644 "$PROJECT_ROOT/SYSTEM/ESP/user/python/hello.py" \
                 "$ROOTFS_DIR/usr/local/share/deshab/python/hello.py"
         fi
         echo "[arch-rootfs] python: $(chroot "$ROOTFS_DIR" /usr/bin/python3 --version 2>/dev/null || true)"
@@ -310,6 +405,55 @@ if [ "$ARCH_INSTALL_PYTHON" = "1" ]; then
     umount "$ROOTFS_DIR/proc" 2>/dev/null || true
     umount "$ROOTFS_DIR/sys" 2>/dev/null || true
 fi
+
+# 7.7 Wireless userspace tools for the guest WiFi backend (mac80211_hwsim).
+# iw / wpa_supplicant 驱动桌面网络图标经 guest 的扫描+关联；hostapd 起演示 AP。
+if [ "${ARCH_INSTALL_WIFI:-1}" = "1" ]; then
+    echo "[arch-rootfs] Installing guest WiFi tools (iw/wpa_supplicant/hostapd)..."
+    mkdir -p "$ROOTFS_DIR"/{dev,proc,sys,tmp}
+    mount --bind /dev "$ROOTFS_DIR/dev" 2>/dev/null || true
+    mount --bind /proc "$ROOTFS_DIR/proc" 2>/dev/null || true
+    mount --bind /sys "$ROOTFS_DIR/sys" 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\n' > "$ROOTFS_DIR/tmp/resolv.conf"
+    mkdir -p "$ROOTFS_DIR/tmp/pacman/lib/sync" "$ROOTFS_DIR/tmp/pacman/cache/pkg"
+    chroot "$ROOTFS_DIR" /usr/bin/pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    if chroot "$ROOTFS_DIR" /usr/bin/pacman -S --noconfirm --needed --overwrite '*' \
+            iw wpa_supplicant hostapd; then
+        echo "[arch-rootfs] wifi tools: $(chroot "$ROOTFS_DIR" /usr/bin/iw --version 2>/dev/null | head -1)"
+    else
+        echo "[arch-rootfs] WARNING: wifi tools install failed (network or pacman)"
+    fi
+    umount "$ROOTFS_DIR/dev" 2>/dev/null || true
+    umount "$ROOTFS_DIR/proc" 2>/dev/null || true
+    umount "$ROOTFS_DIR/sys" 2>/dev/null || true
+fi
+
+# 7.8 Post-install strip: python/wifi packages bring man/info/doc/locales back;
+# drop them again so the RAM-resident boot-module image stays small.
+echo "[arch-rootfs] Stripping post-install docs..."
+rm -rf "$ROOTFS_DIR/usr/share/man" "$ROOTFS_DIR/usr/share/doc" \
+       "$ROOTFS_DIR/usr/share/info" "$ROOTFS_DIR/usr/share/gtk-doc" \
+       "$ROOTFS_DIR/usr/share/help" "$ROOTFS_DIR/usr/include" 2>/dev/null || true
+if [ -d "$ROOTFS_DIR/usr/share/locale" ]; then
+    find "$ROOTFS_DIR/usr/share/locale" -maxdepth 1 -type d \
+         ! -name 'locale' ! -name 'en*' ! -name 'zh*' ! -name 'C*' \
+         -exec rm -rf {} + 2>/dev/null || true
+fi
+rm -rf "$ROOTFS_DIR/var/cache/pacman/pkg"/* 2>/dev/null || true
+
+# 7.9 pacman 母本库收尾。
+# 7.6/7.7 的 chroot pacman -S 又装了 python 与 wifi 工具，/tmp/pacman/lib/local
+# 是当前最完整的已装包清单。把它写回母本位置，运行期启动 wrapper 才会拿到
+# 包含这些包的正确清单（否则装 python 时会误报文件冲突）。
+if [ -d "$ROOTFS_DIR/tmp/pacman/lib/local" ]; then
+    rm -rf "$PRISTINE_DB"
+    mkdir -p "$(dirname "$PRISTINE_DB")"
+    cp -a "$ROOTFS_DIR/tmp/pacman/lib/local" "$PRISTINE_DB"
+    echo "[arch-rootfs]   pristine pacman local db refreshed: $(find "$PRISTINE_DB" -maxdepth 1 -mindepth 1 -type d | wc -l) pkgs"
+fi
+# 构建期脚手架：/tmp 运行期是 tmpfs，这份副本在 guest 里永远看不到，纯占空间。
+rm -rf "$ROOTFS_DIR/tmp/pacman" 2>/dev/null || true
+echo "[arch-rootfs]   staged size: $(du -sh "$ROOTFS_DIR" | cut -f1)"
 
 # 8. Create ext4 image on native FS, populate, then copy to /mnt/d.
 echo "[arch-rootfs] Creating ext4 image (${IMG_SIZE_MB}MB) on native FS..."

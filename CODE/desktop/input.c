@@ -6,8 +6,6 @@
 int g_mouse_x = 400, g_mouse_y = 300;
 int g_mouse_btn = 0;      /* bit0=左 bit1=右 */
 int g_left_pressed = 0, g_left_released = 0, g_right_pressed = 0;
-static u8  g_mouse_buf[3];
-static int g_mouse_idx = 0;
 static int g_mouse_has_pkt = 0;
 
 /* 光标背景保存 */
@@ -155,118 +153,152 @@ void cursor_draw(int mx, int my) {
 }
 
 /* ============================================================
- *  PS/2 鼠标处理
+ *  输入总线（P6b：srv.input.kbd.poll / srv.input.mouse.poll）
+ *  PS/2 初始化与 IRQ handler 归 ps2kbd.drv / ps2mouse.drv；
+ *  本模块只消费事件（直读 0x60 会与 IRQ handler 抢数据）。
  * ============================================================ */
+#include "../DKM/dkm_shared.h"
+#include "../DKM/dkm_input.h"
 
-static int ps2_wait_write(void) {
-    for (int t = 0; t < 200000; t++) {
-        if (!(inb(0x64) & 0x02)) return 0;
-        __asm__ volatile("pause");
-    }
-    return -1;
+static dkm_input g_input;
+static int g_mouse_seen_pkt = 0;
+
+/* 0 = kbd 就绪；-1 = srv.input.kbd.poll 缺席（调用方 INPUT-E01）。 */
+int dt_input_init(void) {
+    return dkm_input_open(&g_input, (const struct dkm_kernel_api *)g_kernel_api);
 }
 
-static int ps2_wait_read(void) {
-    for (int t = 0; t < 200000; t++) {
-        if (inb(0x64) & 0x01) return 0;
-        __asm__ volatile("pause");
-    }
-    return -1;
+static u8 g_inj[32];
+static int g_inj_r, g_inj_w, g_inj_n;
+
+void dt_kbd_inject(u8 sc) {
+    if (g_inj_n >= 32) return;
+    g_inj[g_inj_w] = sc;
+    g_inj_w = (g_inj_w + 1) & 31;
+    g_inj_n++;
 }
 
-static void ps2_drain(void) {
-    for (int i = 0; i < 16; i++) {
-        if (!(inb(0x64) & 0x01)) break;
-        inb(0x60);
+int dt_kbd_poll(u8 *sc) {
+    if (g_inj_n) {
+        *sc = g_inj[g_inj_r];
+        g_inj_r = (g_inj_r + 1) & 31;
+        g_inj_n--;
+        return 1;
     }
+    return dkm_input_kbd(&g_input, sc);
 }
 
+/* 兼容名：PS/2 已由 ps2mouse.drv 初始化，此处不再碰端口。 */
 void ps2_mouse_init(void) {
-    ps2_drain();
-
-    ps2_wait_write();
-    outb(0x64, 0xA8);
-
-    ps2_wait_write();
-    outb(0x64, 0x20);
-    ps2_wait_read();
-    u8 cfg = inb(0x60);
-
-    cfg &= ~0x20;
-    cfg |= 0x02;
-    cfg |= 0x40;
-
-    ps2_wait_write();
-    outb(0x64, 0x60);
-    ps2_wait_write();
-    outb(0x60, cfg);
-
-    ps2_wait_write();
-    outb(0x64, 0xD4);
-    ps2_wait_write();
-    outb(0x60, 0xFF);
-    for (int i = 0; i < 8; i++) {
-        if (ps2_wait_read() != 0) break;
-        inb(0x60);
-    }
-
-    ps2_wait_write();
-    outb(0x64, 0xD4);
-    ps2_wait_write();
-    outb(0x60, 0xF4);
-    for (int i = 0; i < 4; i++) {
-        if (ps2_wait_read() != 0) break;
-        inb(0x60);
-    }
-
-    ps2_drain();
-
-    g_mouse_idx = 0;
-    g_mouse_has_pkt = 0;
-
-    slog("mouse init ok");
+    if (!g_input.mouse_poll)
+        slog("mouse: srv.input.mouse.poll missing (INPUT-E02, mouse disabled)");
 }
 
+/* 返回 1 = 有新鼠标数据包（相对位移 + 按钮位已更新）。 */
 int ps2_mouse_poll(void) {
-    u8 st = inb(0x64);
-    if (!(st & 1)) return 0;
-    if (!(st & 0x20)) return 0;
-    u8 data = inb(0x60);
+    int dx = 0, dy = 0;
+    u32 btns = 0;
+    if (!dkm_input_mouse_step(&g_input, &dx, &dy, &btns)) return 0;
 
-    g_mouse_buf[g_mouse_idx++] = data;
-    if (g_mouse_idx < 3) return 0;
-    g_mouse_idx = 0;
+    /* 上电后首个有效包留档：串口无此行 = 鼠标数据根本没进来 */
+    if (!g_mouse_seen_pkt) {
+        g_mouse_seen_pkt = 1;
+        slog("mouse first pkt via srv.input.mouse.poll");
+    }
 
-    if (!(g_mouse_buf[0] & 0x08)) return 0;
-
-    int dx = (int)(i8)g_mouse_buf[1];
-    int dy = (int)(i8)g_mouse_buf[2];
-    dy = -dy;
-
-    g_mouse_x += dx;
-    g_mouse_y += dy;
+    if (g_input.mouse_abs) {
+        g_mouse_x = g_input.mouse_x;
+        g_mouse_y = g_input.mouse_y;
+    } else {
+        g_mouse_x += dx;
+        g_mouse_y += dy;
+    }
     if (g_mouse_x < 0) g_mouse_x = 0;
     if (g_mouse_y < 0) g_mouse_y = 0;
     if (g_mouse_x >= (int)g_fb_w - CURSOR_SIZE) g_mouse_x = (int)g_fb_w - CURSOR_SIZE;
     if (g_mouse_y >= (int)g_fb_h - CURSOR_SIZE) g_mouse_y = (int)g_fb_h - CURSOR_SIZE;
 
     int old_btn = g_mouse_btn;
-    g_mouse_btn = g_mouse_buf[0] & 0x03;
+    g_mouse_btn = (int)(btns & 0x03u);
     if ((g_mouse_btn & 1) && !(old_btn & 1)) g_left_pressed = 1;
     if (!(g_mouse_btn & 1) && (old_btn & 1)) g_left_released = 1;
     if ((g_mouse_btn & 2) && !(old_btn & 2)) g_right_pressed = 1;
     if (dx == 0 && dy == 0 && g_mouse_btn == old_btn) return 0;
 
     /* VSCode Phase 2: IDE attached 时把相对位移 + 按钮状态镜像到 Linux guest。
-     * dy 已在上方取反为屏幕坐标系（正=下），与 Linux REL_Y 约定一致；
-     * input_forward_mouse 内部与上次状态比较，仅产生变化按钮事件 + SYN。
-     * 即使宿主光标已抵边界被钳位，原始 dx/dy 仍转发，guest 光标自由移动。 */
+     * dy 为屏幕坐标系（正=下），与 Linux REL_Y 约定一致。 */
     if (g_input_forward_enabled && g_lxc_svc && g_lxc_svc->input_forward_mouse) {
         g_lxc_svc->input_forward_mouse(dx, dy, (u8)g_mouse_btn);
     }
 
     g_mouse_has_pkt = 1;
     return 1;
+}
+
+/* ELF 占用 CPU 时主循环不跑。光标直接画在真实 fb 上；
+ * 客户区里的像素由应用每帧重画，这里恢复时跳过，避免盖住新内容。 */
+static int g_hc_on;
+static int g_hc_x, g_hc_y, g_hc_w, g_hc_h;
+static u32 g_hc_save[CURSOR_SIZE * CURSOR_SIZE];
+static int g_hc_saved, g_hc_ox, g_hc_oy;
+
+static int host_client_pixel(int x, int y) {
+    return g_hc_on && x >= g_hc_x && y >= g_hc_y &&
+           x < g_hc_x + g_hc_w && y < g_hc_y + g_hc_h;
+}
+
+void desktop_host_begin(int x, int y, int w, int h) {
+    g_hc_x = x; g_hc_y = y; g_hc_w = w; g_hc_h = h;
+    g_hc_on = 1;
+    g_hc_saved = 0;
+}
+
+void desktop_host_end(void) {
+    desktop_host_pump();
+    if (g_hc_saved) {
+        for (int r = 0; r < CURSOR_SIZE; r++) {
+            for (int c = 0; c < CURSOR_SIZE; c++) {
+                int x = g_hc_ox + c, y = g_hc_oy + r;
+                if (x < 0 || y < 0 || (u64)x >= g_fb_w || (u64)y >= g_fb_h) continue;
+                ((u32 *)(g_real_fb + (u64)y * g_fb_pitch))[x] = g_hc_save[r * CURSOR_SIZE + c];
+            }
+        }
+    }
+    g_hc_saved = 0;
+    g_hc_on = 0;
+}
+
+void desktop_host_pump(void) {
+    du_u32 *old;
+    if (!g_hc_on || !g_real_fb) return;
+    if (g_hc_saved) {
+        for (int r = 0; r < CURSOR_SIZE; r++) {
+            for (int c = 0; c < CURSOR_SIZE; c++) {
+                int x = g_hc_ox + c, y = g_hc_oy + r;
+                if (x < 0 || y < 0 || (u64)x >= g_fb_w || (u64)y >= g_fb_h) continue;
+                if (host_client_pixel(x, y)) continue;
+                ((u32 *)(g_real_fb + (u64)y * g_fb_pitch))[x] = g_hc_save[r * CURSOR_SIZE + c];
+            }
+        }
+        g_hc_saved = 0;
+    }
+    ps2_mouse_poll();
+    for (int r = 0; r < CURSOR_SIZE; r++) {
+        for (int c = 0; c < CURSOR_SIZE; c++) {
+            int x = g_mouse_x + c, y = g_mouse_y + r;
+            if (x < 0 || y < 0 || (u64)x >= g_fb_w || (u64)y >= g_fb_h)
+                g_hc_save[r * CURSOR_SIZE + c] = 0;
+            else
+                g_hc_save[r * CURSOR_SIZE + c] = ((u32 *)(g_real_fb + (u64)y * g_fb_pitch))[x];
+        }
+    }
+    g_hc_ox = g_mouse_x;
+    g_hc_oy = g_mouse_y;
+    g_hc_saved = 1;
+    old = g_fb.fb;
+    g_fb.fb = (du_u32 *)g_real_fb;
+    cursor_draw(g_mouse_x, g_mouse_y);
+    g_fb.fb = old;
 }
 
 /* ============================================================

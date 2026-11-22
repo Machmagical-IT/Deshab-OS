@@ -156,6 +156,7 @@ struct dkm_block_api {
     u64 (*sector_size)(u32 index);
     const char *(*device_name)(u32 index);
     int (*set_write_fn)(u32 index, dkm_block_write_fn fn);
+    u64 (*sector_count)(u32 index); /* 0x38：尾部追加，与 utsm/block.h 一致；空槽表示未知 */
 };
 
 /* 与 UTSM/include/utsm/paging.h 中的 dkm_mmio_api 布局一致 */
@@ -166,6 +167,70 @@ struct dkm_mmio_api {
     int  (*map_mmio)(u64 phys, u64 size);
     /* 当前 CR3 物理地址（诊断用） */
     u64  (*cr3)(void);
+};
+
+/* ---- SAS-R0-PCQ 调度器服务表（M4/Phase7，与 UTSM/include/utsm/dkm.h 一致） ---- */
+struct utsm_sched_api {
+    u64  (*uptime_ns)(void);
+    void (*yield)(void);
+    u32  (*current_task_slot)(void);
+    int  (*task_create)(u32 process_slot, u32 priority, void (*entry)(void *), void *arg);
+    void (*sleep_ms)(u32 ms);
+};
+
+/* ---- D3: 内核按名导出表（kapi，只读） ---- */
+struct dkm_kapi_entry {
+    const char *name;
+    void *fn;
+};
+struct dkm_kapi_table {
+    u32 magic;
+    u32 version;
+    u32 count;
+    const struct dkm_kapi_entry *entries;
+    int (*lookup)(const char *name, void **out_fn);
+};
+
+/* ---- D6 万物互联: 双向服务总线（dkm_bus，与 UTSM/include/utsm/dkm.h 一致） ----
+ * 模块在 driver_init 里注册 srv.* 服务，任何模块按名消费。 */
+struct dkm_driver_desc;
+#define DKM_BUS_MAGIC    0x53425553u  /* "SBUS" */
+#define DKM_BUS_VERSION  1u
+#define DKM_BUS_MAX_SERVICES 128
+#define DKM_BUS_MAX_NAME 48
+#define DKM_BUS_F_KERNEL    1u
+#define DKM_BUS_F_NO_UNLOAD 2u
+
+struct dkm_bus_service {
+    char name[DKM_BUS_MAX_NAME];
+    u32 version;
+    u32 flags;
+    void *fn;
+    const struct dkm_driver_desc *provider;
+};
+struct dkm_bus_api {
+    u32 magic;
+    u32 version;
+    int (*register_service)(const char *name, u32 version, void *fn);
+    int (*unregister_service)(const char *name);
+    int (*lookup)(const char *name, void **out_fn, u32 *out_version);
+    int (*probe)(const char *name, void **out_fn, u32 *out_version);
+    u32 (*count)(void);
+    const struct dkm_bus_service *(*at)(u32 index);
+};
+
+/* 启动卷定位（srv.fs.fat32.volume_info）。
+ *
+ * 自带 fat32_io.h 的模块（desktop / cmd）直接持有块设备 read/write，
+ * 但 fat32_io.h 把设备索引写死为 0。实机上块设备 0 往往是内置
+ * NVMe/SATA 盘而非启动 U 盘 —— 表现为字体/壁纸等按路径读取全部失败
+ * （DESK-E04）。fat32.drv 在跨设备探测后通过本服务公布实际索引，
+ * 这些模块用包装函数把 index 重定向过去即可。 */
+struct dkm_fat32_volume_info {
+    u32 valid;       /* 1 = 已定位到 FAT32 卷 */
+    u32 dev;         /* 块设备索引 */
+    u32 lba_base;    /* 卷起始 LBA 相对整盘偏移（GPT ESP = 2048） */
+    u32 vol_serial;  /* FAT32 卷序列号 */
 };
 
 /* 与 UTSM/include/utsm/dkm.h 中的 dkm_kernel_api 布局完全一致.
@@ -203,6 +268,12 @@ struct dkm_kernel_api {
     /* B7 阶段3 尾部追加：动态 IDT 向量分配器（MSI/MSI-X），池 0x40-0xDF */
     int  (*irq_vector_alloc)(void);
     void (*irq_vector_free)(int vector);
+    /* M4/Phase7 尾部追加：调度器服务 */
+    const struct utsm_sched_api *sched;
+    /* D3 尾部追加：按名导出表（只读） */
+    const struct dkm_kapi_table *kapi;
+    /* D6 尾部追加：双向服务总线 */
+    const struct dkm_bus_api *bus;
 };
 
 struct dkm_driver_handle;
@@ -269,6 +340,16 @@ static __inline__ void dkm_outb(u16 port, u8 value) {
 static __inline__ u8 dkm_inb(u16 port) {
     u8 value;
     __asm__ volatile ("inb %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
+static __inline__ void dkm_outw(u16 port, u16 value) {
+    __asm__ volatile ("outw %0, %1" :: "a"(value), "Nd"(port));
+}
+
+static __inline__ u16 dkm_inw(u16 port) {
+    u16 value;
+    __asm__ volatile ("inw %1, %0" : "=a"(value) : "Nd"(port));
     return value;
 }
 

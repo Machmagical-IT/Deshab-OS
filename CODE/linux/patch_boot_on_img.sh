@@ -21,12 +21,12 @@ copy_if() {
     fi
 }
 
-copy_if "$ROOT/SYSTEM/boot/linux-bzImage" "$M/boot/linux-bzImage"
-copy_if "$ROOT/SYSTEM/boot/utsm.elf" "$M/boot/utsm.elf"
-copy_if "$ROOT/SYSTEM/boot/linux-initrd.img" "$M/boot/linux-initrd.img"
-copy_if "$ROOT/SYSTEM/limine/limine.conf" "$M/limine.conf"
+copy_if "$ROOT/SYSTEM/ESP/boot/linux-bzImage" "$M/boot/linux-bzImage"
+copy_if "$ROOT/SYSTEM/ESP/boot/utsm.elf" "$M/boot/utsm.elf"
+copy_if "$ROOT/SYSTEM/ESP/boot/linux-initrd.img" "$M/boot/linux-initrd.img"
+copy_if "$ROOT/SYSTEM/ESP/limine/limine.conf" "$M/limine.conf"
 if [[ -d "$M/limine" ]]; then
-    copy_if "$ROOT/SYSTEM/limine/limine.conf" "$M/limine/limine.conf"
+    copy_if "$ROOT/SYSTEM/ESP/limine/limine.conf" "$M/limine/limine.conf"
 fi
 
 DAEMON="${DAEMON:-$ROOT/.build_tmp/utsm_exec_daemon}"
@@ -122,12 +122,12 @@ inject_scripts "$M/boot/linux-rootfs.img"
 # copies itself onto the persist overlay before chroot.
 # KDE wrapper on Arch rootfs is enough for the first hop; --inside uses
 # the overlay copy after chroot.
-copy_if "$ROOT/SYSTEM/system/deshab64/deshab.elf" "$M/system/deshab64/deshab.elf"
-copy_if "$ROOT/SYSTEM/system/deshab64/desktop.elf" "$M/system/deshab64/desktop.elf"
-copy_if "$ROOT/SYSTEM/system/deshab64/FUCK" "$M/system/deshab64/FUCK"
-copy_if "$ROOT/SYSTEM/LINUXAPP.CNF" "$M/LINUXAPP.CNF"
-copy_if "$ROOT/SYSTEM/user/desktop/kde.lnk" "$M/user/desktop/kde.lnk"
-copy_if "$ROOT/SYSTEM/user/desktop/kde.desktop" "$M/user/desktop/kde.desktop"
+copy_if "$ROOT/SYSTEM/ESP/system/deshab64/deshab.elf" "$M/system/deshab64/deshab.elf"
+copy_if "$ROOT/SYSTEM/ESP/system/deshab64/desktop.elf" "$M/system/deshab64/desktop.elf"
+copy_if "$ROOT/SYSTEM/ESP/system/deshab64/FUCK" "$M/system/deshab64/FUCK"
+copy_if "$ROOT/SYSTEM/ESP/LINUXAPP.CNF" "$M/LINUXAPP.CNF"
+copy_if "$ROOT/SYSTEM/ESP/user/desktop/kde.lnk" "$M/user/desktop/kde.lnk"
+copy_if "$ROOT/SYSTEM/ESP/user/desktop/kde.desktop" "$M/user/desktop/kde.desktop"
 
 sync
 umount "$M"

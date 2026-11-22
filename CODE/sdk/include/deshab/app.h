@@ -34,6 +34,7 @@ static inline void dsb_app_init(dsb_app_context *ac, const dsk_boot_context *ctx
     ac->fb_w = ctx->framebuffer_width;
     ac->fb_h = ctx->framebuffer_height;
     ac->fb_pitch = ctx->framebuffer_pitch;
+    dsb_host_bind(ctx);
     ac->api = (const dkm_kernel_api *)ctx->dkm_kernel_api;
     dsb_block_init(&ac->block, ctx->dkm_kernel_api);
 }

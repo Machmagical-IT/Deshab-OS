@@ -3,8 +3,8 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ScriptDir))
 $Source = Join-Path $Root 'CODE\DKM\stub_driver\stub_driver.c'
-$Manifest = Join-Path $Root 'SYSTEM\driver\manifest.json'
-$SystemDriver = Join-Path $Root 'SYSTEM\driver'
+$Manifest = Join-Path $Root 'SYSTEM\ESP\driver\manifest.json'
+$SystemDriver = Join-Path $Root 'SYSTEM\ESP\driver'
 $BuildDir = Join-Path $Root '.build_tmp\drivers'
 
 function Find-Tool($Name, $ExtraNames = @()) {

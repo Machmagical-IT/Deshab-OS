@@ -33,6 +33,7 @@
 #include "fb.h"
 #include "cursor.h"
 #include "input.h"
+#include "input_bus.h"
 #include "ui.h"
 #include "rtc.h"
 /* font.h 需先提供 g_ascii 位图数据源，不在此默认包含：

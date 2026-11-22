@@ -1,0 +1,47 @@
+# Makefile for .zts algorithm modules
+# 
+# 使用方法:
+#   make                    - 编译所有 .zts.c 文件
+#   make example_algorithm.zts - 编译特定模块
+#
+
+CC = gcc
+CFLAGS = -fPIC -O2 -Wall -Wextra
+LDFLAGS = -shared
+
+# ZTS 头文件路径
+ZTS_INCLUDE = ../include
+CFLAGS += -I$(ZTS_INCLUDE)
+
+# 目标文件
+TARGETS = example_algorithm.zts
+
+.PHONY: all clean
+
+all: $(TARGETS)
+
+# .zts 模块编译规则
+%.zts: %.zts.c
+	@echo "  CC      $<"
+	$(CC) $(CFLAGS) -c -o $*.o $<
+	@echo "  LD      $@"
+	$(CC) $(LDFLAGS) -o $@ $*.o
+	@echo "  STRIP   $@"
+	strip $@
+	@rm -f $*.o
+	@echo "Built: $@"
+
+# 清理
+clean:
+	rm -f *.o *.zts
+
+# 显示帮助
+help:
+	@echo "ZTS Algorithm Module Builder"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all              - Build all .zts modules"
+	@echo "  clean            - Remove built files"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make example_algorithm.zts"

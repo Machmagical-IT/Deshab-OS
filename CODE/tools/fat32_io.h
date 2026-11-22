@@ -61,7 +61,7 @@ static inline int f32_neq11(const char *a, const char *b) {
 #define F32_DATA_BYTES 262144
 #endif
 static u8 f32_disk[131072];      /* 256 扇区 BPB+FAT+根目录缓存 */
-static u8 f32_cluster[FAT32_MAX_CLUSTER_BYTES]; /* 单簇缓冲：ESP>=4GiB 时为 32KiB */
+static u8 f32_cluster[FAT32_MAX_CLUSTER_BYTES]; /* 单簇缓冲，最大 64KiB */
 static u8 f32_data[F32_DATA_BYTES]; /* 文件数据缓冲 */
 static int f32_disk_loaded = 0;  /* f32_disk 是否已加载 BPB+FAT */
 static u32 f32_lba_base = 0;     /* GPT ESP start (0 for superfloppy / SATA) */

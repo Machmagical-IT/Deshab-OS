@@ -13,10 +13,14 @@
  * Ring0 原生执行，IOPL 无限制。危险提示：写错端口可能挂机。
  */
 #include <windows.h>
+#include <stdio.h>
 
 typedef unsigned int   u32;
 typedef unsigned char  u8;
 typedef unsigned short u16;
+
+/* -nostdlib 下 g++ 在 main 头部插 __main 调用；无 CRT 即空实现 */
+extern "C" void __main(void) {}
 
 static inline u8 inpb(u16 port) {
     u8 v;

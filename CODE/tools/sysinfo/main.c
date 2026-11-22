@@ -61,6 +61,10 @@ void dsk_entry(const dsk_boot_context *ctx) {
     if (ctx->magic != DSK_BOOT_MAGIC) return;
     dsb_app_init(&g_ac, ctx);
 
+    /* 输入经服务总线（P6b）：端口 0x60 已被 IRQ handler 读走，直接轮询会饿死。 */
+    static dsb_input g_in;
+    int in_ok = (dsb_input_open(&g_in, g_ac.api) == 0);
+
     /* 清屏 + 标题栏 + 状态栏 */
     dsb_fill_bg(&g_ac, DSB_BG_PRIMARY);
     dsb_draw_titlebar(&g_ac, "SysInfo", (i64)g_ac.fb_w);
@@ -139,13 +143,11 @@ void dsk_entry(const dsk_boot_context *ctx) {
     info_ptr("block.read", (const void *)g_ac.block.read);
     info_ptr("block.write", (const void *)g_ac.block.write);
 
-    /* 等待 Esc 退出 */
+    /* 等待 Esc 退出（总线 ring；kbd 服务缺席时直接归还桌面） */
+    if (!in_ok) return;
     for (;;) {
-        u8 st = dsb_inb(0x64);
-        if (st & 1) {
-            u8 sc = dsb_inb(0x60);
-            if (sc == 1) break;  /* Esc make code */
-        }
+        u8 sc;
+        if (dsb_input_kbd(&g_in, &sc) && sc == 1) break;  /* Esc make code */
         __asm__ volatile("pause");
     }
 }

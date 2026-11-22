@@ -5,6 +5,8 @@
 [boot]
 vmm=0
 linux_guest=0
+windows_guest=0
+windows_autostart=0
 xj380_guest=0
 # F4: 分级自检（快速档，不含 UTSM selftest）
 selftest=1
@@ -12,6 +14,11 @@ dev_mode=0
 la57_guard=0
 mcfg_check=0
 max_phys_addr_bits=0
+# GOP 分辨率（0=自动）。引导器只选显存需求 ≤8MiB 的模式（桌面双缓冲上限），
+# 自动优先级 1280x800 > 1280x720 > 1366x768 > 1600x900 > 1600x1200 > 1024x768。
+# 需要固定分辨率时填 gop_width/gop_height（两个都要非 0 才生效）。
+gop_width=0
+gop_height=0
 disk_log=0
 
 [drivers]
@@ -45,6 +52,10 @@ apic_route=1
 apic_route_legacy=1
 nvme_msi=1
 apic_diag=0
+# Intel HDA 音频（srv.audio.play/stop/info）；无控制器时静默就绪
+hda=1
+# hda_selftest=1：init 末尾播 440Hz 0.25s 并打印 rc（无音频环境可用串口判定）
+hda_selftest=0
 
 [utsm]
 max_segments=1024
@@ -72,8 +83,8 @@ watchdog_enabled=1
 #                 （跳过该能力/驱动/页面）；CPU 异常、LA57、DSK 跳转失败仍停机。
 # 非 fallback 的任何值均按 strict 处理。
 [panic]
-# release：关闭 panic（fallback），真机/演示带病看全貌
-mode=fallback
+# release：与 dev 相同，bug 点内核 panic，不走备用路径
+mode=strict
 
 # === SAS-R0 启动期能力证明（attest） ===
 # require_<name>=1（默认）而能力未就绪 → 启动即莲花屏 panic。
@@ -128,8 +139,6 @@ enable=1
 boot_demo_sec=5
 # 使用中自动整蛊间隔（秒），0=关
 interval_sec=120
-# 屏幕压暗 + 特大 FUCK 跟随鼠标后消失
-fuck_cursor=1
 # 假蓝屏（Win 风格）
 fake_bsod=1
 # 全屏反色闪烁
@@ -164,3 +173,16 @@ linux_lib_guest_path=/usr/lib/deshab
 linux_lib_sync=0
 pe_dll_search=1
 
+[zts]
+# ZTS 热更新子系统（srv.zts.*；模块仓库 SYSTEM/zts → ESP /zts）
+enable=1
+autoload=1
+require_signature=0
+selftest=0
+
+[zt5]
+# ZT5 作为 UTSM VMX guest 子系统；运行需要 nested VMX（WSL2+KVM）。
+# enable 由 P3 阶段接通后改为 1。
+enable=0
+mode=headless
+ram_mb=512

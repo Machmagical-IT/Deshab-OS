@@ -35,4 +35,8 @@ void lapic_timer_stop(void);
 /* 直写 LAPIC EOI 寄存器（tick handler 用；未初始化时为空操作） */
 void lapic_timer_eoi(void);
 
+/* guest 执行期间屏蔽(on=1)/恢复(on=0)主机可屏蔽中断（TPR 抬高/归零）。 */
+void lapic_irq_quiesce(int on);
+
+
 #endif /* UTSM_LAPIC_TIMER_H */

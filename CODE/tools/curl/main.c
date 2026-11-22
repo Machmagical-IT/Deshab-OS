@@ -41,7 +41,7 @@ static int term_x, term_y;
 
 static void term_init_layout(void) {
     term_x = 8;
-    term_y = DA_TITLEBAR_H + 4;
+    term_y = da_chrome_h() + 4;
     int avail_w = (int)g_ac.fb_w - 16;
     int avail_h = (int)g_ac.fb_h - term_y - DA_STATUSBAR_H - 8;
     term_w = avail_w / CHAR_STEP;
@@ -312,7 +312,8 @@ static void redraw_input_line(void) {
 /* ---- 主入口 ---- */
 __attribute__((visibility("default")))
 void dsk_entry(const da_boot_context *ctx) {
-    __asm__ volatile("cli");
+    /* P6b：输入走 srv.input.kbd.poll（IRQ1 由 ps2kbd 投递），必须开中断。 */
+    __asm__ volatile("sti");
     da_slog("curl", "boot");
 
     if (!ctx || ctx->magic != DA_BOOT_MAGIC) {
@@ -331,6 +332,12 @@ void dsk_entry(const da_boot_context *ctx) {
     term_puts_color("输入 URL 发送 GET 请求 | 输入 'help' 查看帮助 | Esc 退出\n", DA_TEXT_DIM);
     term_putc('\n');
 
+    static da_input g_in;
+    if (da_input_open(&g_in, &g_ac) != 0) {
+        da_slog("curl", "input bus missing (INPUT-E01)");
+        return;
+    }
+
     redraw_all();
 
     int shift = 0, e0 = 0;
@@ -343,11 +350,8 @@ void dsk_entry(const da_boot_context *ctx) {
 
         int cmd_done = 0;
         while (!cmd_done) {
-            u8 st = inb(0x64);
-            if (!(st & 1)) { __asm__("pause"); continue; }
-            u8 data = inb(0x60);
-            if (st & 0x20) continue;
-            u8 sc = data;
+            u8 sc;
+            if (!da_input_kbd(&g_in, &sc)) { __asm__("pause"); continue; }
             if (sc == 0xE0) { e0 = 1; continue; }
             if (sc == 0x2A || sc == 0x36) { shift = 1; continue; }
             if (sc == 0xAA || sc == 0xB6) { shift = 0; continue; }

@@ -25,11 +25,6 @@ extern void vmx_vm_exit_handler(void);
 extern int vmexit_dispatch(void);
 extern u64 vmexit_get_count(void);
 
-extern u8 g_host_stack[8192];
-
-/* 当前运行的 guest 是否为 XJ380（vmm.h 声明，vmexit.c handle_hlt 检查）。
- * 定义在本模块：XJ380 launch 置 1，guest 终止后清 0。 */
-volatile int g_xj380_guest_active;
 
 /* CR 辅助 */
 static inline u64 read_cr0_local(void) {
@@ -111,7 +106,7 @@ static void xj380_vmcs_setup_host_state(void) {
         vmx_vmcs_write(VMCS_HOST_IA32_EFER, host_efer);
     }
 
-    vmx_vmcs_write(VMCS_HOST_RSP, (u64)&g_host_stack[sizeof(g_host_stack) - 16]);
+    vmx_vmcs_write(VMCS_HOST_RSP, vmm_get_host_stack_top());
     vmx_vmcs_write(VMCS_HOST_RIP, (u64)vmx_vm_exit_handler);
 }
 
@@ -253,6 +248,7 @@ int xj380_launch(void) {
     }
 
     log_info("[XJ380] launch begin");
+    vmm_set_active_profile(VM_PROFILE_XJ380);
 
     /* 真机 EPT TLB 刷新：vmlaunch 前确保 EPT 映射可见 */
     ept_flush_ept();
@@ -260,9 +256,7 @@ int xj380_launch(void) {
     /* 重置 VM-Exit 状态 */
     g_guest_terminated = 0;
     g_last_exit_reason = 0xFFFFFFFFULL;
-    g_linux_guest_active = 0;   /* XJ380 是当前 active guest */
-    g_guest_parked = 0;
-    g_xj380_guest_active = 1;
+    vm_machine_set_active_state(VM_MACHINE_RUNNING);
 
     /* 配置 VMCS */
     xj380_vmcs_setup_guest_state(gi);
@@ -288,9 +282,11 @@ int xj380_launch(void) {
 
     int failed;
     __asm__ volatile(
-        "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"
+        "movq g_active_saved_host_rsp(%%rip), %%rax\n\t"
+        "movq %%rsp, (%%rax)\n\t"
         "leaq 1f(%%rip), %%rax\n\t"
-        "movq %%rax, g_saved_return_rip(%%rip)\n\t"
+        "movq g_active_saved_return_rip(%%rip), %%rcx\n\t"
+        "movq %%rax, (%%rcx)\n\t"
         "movq g_xj380_rdi(%%rip), %%rdi\n\t"
         "movq g_xj380_rsi(%%rip), %%rsi\n\t"
         "movq g_xj380_rdx(%%rip), %%rdx\n\t"
@@ -310,12 +306,12 @@ int xj380_launch(void) {
     if (failed) {
         u64 error = vmx_vmcs_read(VMCS_VMX_INSTRUCTION_ERROR);
         log_hex64("[XJ380] vmlaunch failed, error=", error);
-        g_xj380_guest_active = 0;
+        vm_machine_set_active_state(VM_MACHINE_STOPPED);
         return -3;
     }
 
     /* guest 终止，host 恢复 */
-    g_xj380_guest_active = 0;
+    vm_machine_set_active_state(VM_MACHINE_STOPPED);
     log_info("[XJ380] guest terminated, host resumed");
     log_hex64("[XJ380] last exit reason=", g_last_exit_reason);
     log_hex64("[XJ380] vmexit count=", vmexit_get_count());

@@ -15,7 +15,7 @@ static char g_buf[NOTE_CAP + 1];
 static int  g_len;
 static int  g_view_line;        /* 顶部可见行 */
 
-/* 折行游标走查：返回总行数，*end_line/*end_col 为缓冲末尾（光标）位置 */
+/* 折行游标走查：返回总行数；*end_line 与 *end_col 为缓冲末尾（光标）位置 */
 static int layout_walk(int cols, int *end_line, int *end_col) {
     int line = 0, col = 0;
     for (int i = 0; i < g_len; i++) {

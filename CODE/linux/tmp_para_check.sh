@@ -4,7 +4,7 @@ echo '=== QEMU / ports ==='
 pgrep -af 'qemu-system' | head -3 || echo 'no qemu'
 ss -ltn 2>/dev/null | grep -E '45454|45455' || echo 'ports free'
 echo '=== new kernel 992fa386 markers ==='
-K=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/boot/utsm.elf
+K=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/ESP/boot/utsm.elf
 strings -a "$K" | grep -c 'VGPU. FLUSH_N'
 strings -a "$K" | grep -c 'selftest_irq\|tick 竞态' 2>/dev/null || true
 echo '=== image ESP kernels now ==='

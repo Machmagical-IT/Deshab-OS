@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install Xorg into the Arch extra-rootfs so startplasma-x11 has a server.
 set -Eeuo pipefail
-IMG="${1:-/mnt/d/Code/DEAICUP/Deshab/SYSTEM/boot/linux-extra-rootfs.img}"
+IMG="${1:-/mnt/d/Code/DEAICUP/Deshab/SYSTEM/ESP/boot/linux-extra-rootfs.img}"
 M=$(mktemp -d)
 mount -o loop "$IMG" "$M"
 cleanup() {

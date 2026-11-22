@@ -43,7 +43,11 @@ static void bself_line(bself_ctx *c, const char *name, int fatal, int ok) {
     }
 }
 
-/* IDTR 健全性：limit==4095（256 项）且 base 非零 */
+/* IDTR 健全性：limit 覆盖 256 项（>=4095）且 base 非零。
+ * 注意：任意一次 VM 退出后，CPU 会以固定 limit=0xFFFF 重载 host IDTR
+ * （Intel SDM 25.4.2：host-state 区不含 IDT limit）。因此 Linux guest 跑过
+ * 之后 limit 必为 0xFFFF 而非 4095——旧断言 `limit==4095` 只在 guest 未运行
+ * 时成立，一旦 guest 真实运行（park）就会误报 IDT malformed 并 panic。 */
 static int check_idt(u64 *base_out) {
     /* sidt 写 10 字节：limit(2) + base(8) */
     u8 buf[10] __attribute__((aligned(2)));
@@ -51,7 +55,7 @@ static int check_idt(u64 *base_out) {
     u16 limit = *(u16 *)&buf[0];
     u64 base  = *(u64 *)&buf[2];
     *base_out = base;
-    return (limit == 4095) && (base != 0);
+    return (limit >= 4095) && (base != 0);
 }
 
 static int check_cs_valid(void) {

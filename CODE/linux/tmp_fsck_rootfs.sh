@@ -8,7 +8,7 @@ fsck_one() {
     echo "[fsck] $img"
     e2fsck -fy "$img" || true
 }
-fsck_one "$ROOT/SYSTEM/boot/linux-rootfs.img"
+fsck_one "$ROOT/SYSTEM/ESP/boot/linux-rootfs.img"
 for gpt in "$ROOT/ISO/deshab-dev.img" /home/deshab/deshab-dev.img; do
     [[ -f "$gpt" ]] || continue
     loop=$(losetup --find --show --partscan "$gpt")

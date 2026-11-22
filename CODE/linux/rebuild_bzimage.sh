@@ -6,7 +6,7 @@ set -euo pipefail
 LINUX_SRC="${LINUX_SRC:-/home/deshab/linux-6.6}"
 REPO="${REPO:-/mnt/d/Code/DEAICUP/Deshab}"
 PATCH="$REPO/CODE/linux/patches/utsm_hcall.c"
-OUT="$REPO/SYSTEM/boot/linux-bzImage"
+OUT="$REPO/SYSTEM/ESP/boot/linux-bzImage"
 
 if [[ ! -f "$LINUX_SRC/Makefile" ]]; then
     echo "[build] missing $LINUX_SRC" >&2

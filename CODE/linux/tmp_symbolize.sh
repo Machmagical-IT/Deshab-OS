@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Correctly symbolize GP fault RIP 0xffffffff800353e1 and identify the stub.
 set -uo pipefail
-E=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/boot/utsm.elf
+E=/mnt/d/Code/DEAICUP/Deshab/SYSTEM/ESP/boot/utsm.elf
 nm -n "$E" > /tmp/syms.txt
 python3 - <<'PY'
 t = 0xffffffff800353e1

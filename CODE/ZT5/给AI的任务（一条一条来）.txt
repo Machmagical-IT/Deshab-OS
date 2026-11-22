@@ -1,0 +1,24 @@
+所有问题查看前请先用ISO文件夹下的脚本跑一遍然后查看boot.log日志确定问题
+
+在ZT5系统中安装KDE桌面环境和X11（SYSTEM文件夹下是系统）在登录界面后增加菜单，选择使用KDE桌面还是ZT原生桌面。
+
+FAT32好像无法挂载到硬盘（不清楚，最近文件系统问题比较大）
+RAMFS读取文件返回全零数据（SYS_READ返回的hex全是00，user.cfg内容全零导致解析失败）
+Rsknl监控内核加载失败（WARNING: Rsknl load failed code=-1）
+网络配置文件读取为空（Empty or unreadable config file）
+WiFi网络配置未找到（No network config found）
+AI子系统配置文件未找到（Config file not found: /zrr64/zdonk/AI/APIKey.conf）
+无法显示真实时间日期
+无法播放动态壁纸mp4
+点击桌面上的快捷方式无法打开相应程序和显示程序窗口
+网络图标点不开
+鼠标靠近任务栏下zt5（应用启动器）没有弹出应用启动器
+鼠标初始化在桌面留下小色块
+网络初始化有问题
+无法连接网络，\system\internet\e1w.cfg 有真实的网络名称密码
+e1000网卡未找到（No supported device found）
+未联网状态下也显示联网
+应用启动器弹出后鼠标离开后应用启动器无法关闭
+应用启动器UI太丑
+应用启动器点击软件无法打开
+窗口管理器无法创建窗口

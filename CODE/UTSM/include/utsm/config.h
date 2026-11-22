@@ -12,7 +12,10 @@
 #define UTSM_MAX_SEGMENTS_DEFAULT 1024U
 #define UTSM_MAX_CAPABILITIES_DEFAULT 256U
 #define UTSM_MAX_PCKC_KEYS_DEFAULT 8U
-#define UTSM_ARENA_SIZE_DEFAULT (64ULL * 1024ULL * 1024ULL)
+/* P4 万物互联：arena 是编译期固定数组（arena.c），承载全部 DKM 驱动镜像 +
+ * DSK 镜像。stage4 引入 desktop/firstinit/login/shell/cmd 等大模块后 64MB 不足
+ * （arena out of memory → DSK 装载失败 DSL-E12），上调至 128MB。 */
+#define UTSM_ARENA_SIZE_DEFAULT (128ULL * 1024ULL * 1024ULL)
 #define UTSM_DIRTY_SHARD_PAGES_DEFAULT 1024ULL
 
 /* ---- 运行期配置变量（由 kernel_main 从 FUCK 文件初始化） ---- */

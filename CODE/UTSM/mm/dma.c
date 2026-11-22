@@ -26,6 +26,13 @@ static u64 g_free_pages;
 static u64 g_lowest_free_index;          /* 分配起点提示，减少扫描 */
 static int g_dma_ready;
 
+/* 高内存区（≥4G）bump 分配器。低 4G 池只服务真实设备 DMA（<4G 约束），
+ * 且在 q35 上仅 ~1.1GB 可用；guest RAM 经 EPT 映射，HPA 可位于 4G 以上，
+ * 由这里分配（见 dma_alloc_high_pages / linux_loader.c guest RAM）。 */
+static u64 g_high_start;                 /* 高内存区起点（2MB 对齐） */
+static u64 g_high_end;                   /* 高内存区终点（页对齐） */
+static u64 g_high_next;                  /* bump 指针 */
+
 static u64 align_up(u64 value, u64 alignment) {
     if (alignment < PAGE_SIZE) alignment = PAGE_SIZE;
     return (value + alignment - 1ULL) & ~(alignment - 1ULL);
@@ -92,10 +99,31 @@ void dma_init(void) {
         return;
     }
 
+    /* 登记最大的高内存（≥4G）USABLE 区，作为 guest RAM 的 bump 分配区。
+     * Limine 保证 USABLE 不含 kernel/modules（模块被标为 KERNEL_AND_MODULES）。 */
+    g_high_start = 0; g_high_end = 0; g_high_next = 0;
+    {
+        struct limine_memmap_response *hrsp = g_memmap_request.response;
+        u64 best_base = 0, best_len = 0;
+        for (u64 i = 0; i < hrsp->entry_count; i++) {
+            struct limine_memmap_entry *e = hrsp->entries[i];
+            if (!e || e->type != LIMINE_MEMMAP_USABLE) continue;
+            if (e->base < DMA_LOW_MAX_PHYS) continue;   /* 只看 4G 以上 */
+            if (e->length > best_len) { best_len = e->length; best_base = e->base; }
+        }
+        if (best_len > 0) {
+            u64 hs = align_up(best_base, 2 * 1024 * 1024);
+            u64 he = (best_base + best_len) & ~(PAGE_SIZE - 1);
+            if (he > hs) { g_high_start = hs; g_high_end = he; g_high_next = hs; }
+        }
+    }
+
     g_dma_ready = 1;
     log_info("[DMA] init ok");
     log_hex64("[DMA] free pages=", g_free_pages);
     log_hex64("[DMA] first free phys=", g_lowest_free_index * PAGE_SIZE);
+    log_hex64("[DMA] high region start=", g_high_start);
+    log_hex64("[DMA] high region size=", g_high_end > g_high_start ? g_high_end - g_high_start : 0);
 }
 
 int dma_alloc_pages(u64 page_count, u64 alignment, u64 max_phys, dkm_dma_buffer *out) {
@@ -141,6 +169,33 @@ int dma_alloc_pages(u64 page_count, u64 alignment, u64 max_phys, dkm_dma_buffer 
     panic_full("MM-E22 DMA ALLOC FAILED",
                "dma_alloc_pages: no free pages satisfying request", 0);
     return -2;
+}
+
+/* 从高内存（≥4G）区分配 guest RAM（HPA 可 >4G，经 EPT 映射，非设备 DMA）。
+ * 与 dma_alloc_pages 的区别：① 用高内存 bump 区而非低 4G 位图；② **不 panic**，
+ * 分配失败返回 -2，使 linux_loader 的 1.4G→1G→512M 设计内回退链真正生效。 */
+int dma_alloc_high_pages(u64 page_count, u64 alignment, dkm_dma_buffer *out) {
+    if (!out || page_count == 0) return -1;
+    if (g_high_end <= g_high_start) return -2;   /* 无高内存区可用 */
+    if (alignment < PAGE_SIZE) alignment = PAGE_SIZE;
+
+    u64 next = (g_high_next + alignment - 1ULL) & ~(alignment - 1ULL);
+    u64 end = next + page_count * PAGE_SIZE;
+    if (end < next || end > g_high_end) {
+        log_warn("[DMA] high alloc failed");
+        log_hex64("[DMA] req pages=", page_count);
+        log_hex64("[DMA] high free bytes=", g_high_end - g_high_next);
+        return -2;
+    }
+
+    g_high_next = end;
+    out->phys = next;
+    out->virt = (void *)(g_hhdm_offset + next);
+    out->size = page_count * PAGE_SIZE;
+
+    u8 *p = (u8 *)out->virt;
+    for (u64 i = 0; i < out->size; i++) p[i] = 0;
+    return 0;
 }
 
 static const dkm_dma_api g_dma_api = {

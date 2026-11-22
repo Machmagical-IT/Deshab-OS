@@ -7,6 +7,8 @@
 *.iso
 *.vhd
 *.raw
+*.wim
+*.esd
 *.ppm
 
 target/
@@ -17,13 +19,22 @@ target/
 *.dbf
 *.rgba
 IDEA.md
-SYSTEM/boot/linux-extra-rootfs.img
+SYSTEM/ESP/boot/linux-extra-rootfs.img
+# 启动载荷（>100MB 的构建产物，GitHub 单文件上限）
+SYSTEM/ESP/boot/*.tar.gz
+SYSTEM/ESP/boot/linux-rootfs.img
 *.d
 target/
 # ---- 本地工作区 ----
 .build_tmp/
+SYSTEM/ESP/boot/windows-esp/
+SYSTEM/ESP/boot/windows-vm/
+SYSTEM/windows/
+SYSTEM/WIN/
 .trae/
 docs/workbuddy-planning/
+INSTALL/.build/
+INSTALL/.isotree/
 
 # IDE 配置（JetBrains 自动生成的 .idea/.gitignore 只覆盖了部分文件）
 .idea/*.iml

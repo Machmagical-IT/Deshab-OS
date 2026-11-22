@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 cd /mnt/d/Code/DEAICUP/Deshab
-echo "SYSTEM: $(md5sum SYSTEM/boot/utsm.elf | cut -d' ' -f1)"
+echo "SYSTEM: $(md5sum SYSTEM/ESP/boot/utsm.elf | cut -d' ' -f1)"
 for img in ISO/deshab-dev.img ISO/deshab-release.img ISO/deshab-realtest.img; do
     L=$(losetup --find --show --partscan "$img" 2>/dev/null) || { echo "$img: LOSETUP_FAIL"; continue; }
     sleep 0.3

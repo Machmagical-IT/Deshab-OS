@@ -132,15 +132,20 @@ static int lxc_consume_exec_msgs(char *out_buf, u64 out_cap, u64 *written_inout,
     return got_exit;
 }
 
+/* 每片 linux_resume() = LINUX_HOST_SLICE_TICKS(8) × 10ms 抢占 tick ≈ 80ms。
+ * 默认 256 片 ≈ 20.5s；长任务（VSCode 解包）用 lxc_exec_to 传更大 timeout，
+ * 这里按 timeout 放大片预算，避免 20s 就被判 -4。 */
 #define LXC_MAX_SLICES 256
+#define LXC_SLICE_MS   80
 
 /* linux_resume() may return on a preemption timeslice before the daemon
  * parks. Keep running slices until EXEC_EXIT (or the slice budget). */
 static int lxc_wait_exec_exit(char *out_buf, u64 out_cap, u64 *out_len,
-                              u64 *exit_code) {
+                              u64 *exit_code, int max_slices) {
     u64 written = 0;
     u64 exit_val = 0;
-    for (int slice = 0; slice < LXC_MAX_SLICES; slice++) {
+    if (max_slices <= 0) max_slices = LXC_MAX_SLICES;
+    for (int slice = 0; slice < max_slices; slice++) {
         int r = linux_resume();
         if (r != 0) {
             log_hex64("[LNXC] exec: linux_resume failed=", (u64)(i64)r);
@@ -162,6 +167,7 @@ static int lxc_wait_exec_exit(char *out_buf, u64 out_cap, u64 *out_len,
  * 返回 0 = 收到 EXEC_EXIT（exit_code 已写出），负值失败。 */
 static int lxc_exec_internal(const char *path, int argc,
                              const char *const *argv, u32 flags,
+                             u32 timeout_sec,
                              char *stdout_buf, u64 stdout_cap, u64 *stdout_len,
                              u64 *exit_code) {
     if (!lxc_is_available()) {
@@ -176,6 +182,7 @@ static int lxc_exec_internal(const char *path, int argc,
     my_memzero(&req, sizeof(req));
     req.argc = (u32)argc;
     req.flags = flags;
+    req.timeout_sec = timeout_sec;   /* 0 = daemon 默认 15s */
 
     u64 plen = my_strlen(path);
     if (plen >= UTSM_EXEC_PATH_MAX) plen = UTSM_EXEC_PATH_MAX - 1;
@@ -201,8 +208,13 @@ static int lxc_exec_internal(const char *path, int argc,
         return -2;
     }
 
-    /* 3. 唤醒 Linux guest；timeslice 归还时继续 resume 直到 EXEC_EXIT */
-    int drc = lxc_wait_exec_exit(stdout_buf, stdout_cap, stdout_len, exit_code);
+    /* 3. 唤醒 Linux guest；timeslice 归还时继续 resume 直到 EXEC_EXIT。
+     * 片预算按 timeout 缩放：默认 15s → 256 片；lxc_exec_to 传 600s → ~7500+ 片。 */
+    int max_slices = LXC_MAX_SLICES;
+    if (timeout_sec > 0)
+        max_slices = (int)((u64)timeout_sec * 1000ULL / LXC_SLICE_MS) + 64;
+    int drc = lxc_wait_exec_exit(stdout_buf, stdout_cap, stdout_len, exit_code,
+                                 max_slices);
     if (drc != 0) {
         log_hex64("[LNXC] exec: no EXEC_EXIT after resume rc=", (u64)(i64)drc);
         ipc_shm_dump_stats();
@@ -213,7 +225,16 @@ static int lxc_exec_internal(const char *path, int argc,
 static int lxc_exec(const char *path, int argc, const char *const *argv,
                     char *stdout_buf, u64 stdout_cap, u64 *stdout_len,
                     u64 *exit_code) {
-    return lxc_exec_internal(path, argc, argv, 0,
+    return lxc_exec_internal(path, argc, argv, 0, 0,
+                             stdout_buf, stdout_cap, stdout_len, exit_code);
+}
+
+/* 同 lxc_exec，但覆盖 daemon 侧子进程超时（秒）。用于 VSCode 解包等长任务。 */
+static int lxc_exec_to(const char *path, int argc, const char *const *argv,
+                       u32 timeout_sec,
+                       char *stdout_buf, u64 stdout_cap, u64 *stdout_len,
+                       u64 *exit_code) {
+    return lxc_exec_internal(path, argc, argv, 0, timeout_sec,
                              stdout_buf, stdout_cap, stdout_len, exit_code);
 }
 
@@ -223,7 +244,7 @@ static int lxc_exec(const char *path, int argc, const char *const *argv,
 static int lxc_exec_async(const char *path, int argc,
                           const char *const *argv) {
     u64 exit_code = 1;
-    int rc = lxc_exec_internal(path, argc, argv, UTSM_EXEC_FLAG_ASYNC,
+    int rc = lxc_exec_internal(path, argc, argv, UTSM_EXEC_FLAG_ASYNC, 0,
                                0, 0, 0, &exit_code);
     if (rc != 0) return rc;
     if (exit_code != 0) {
@@ -293,6 +314,7 @@ static int lxc_file_roundtrip(u32 msg_type, const char *path, u64 offset,
         return -2;
     }
 
+    { extern int g_linux_no_irq_inject; g_linux_no_irq_inject = 1; }
     for (int slice = 0; slice < LXC_MAX_SLICES; slice++) {
         int r = linux_resume();
         if (r != 0) {
@@ -309,6 +331,7 @@ static int lxc_file_roundtrip(u32 msg_type, const char *path, u64 offset,
             }
         }
     }
+    { extern int g_linux_no_irq_inject; g_linux_no_irq_inject = 0; }
     return -4;  /* 无响应 */
 }
 
@@ -853,8 +876,9 @@ int lxc_sync_lib_dir(const char *guest_lib_path) {
  * /opt/vscode（/opt 位于 extra-rootfs overlay，持久可写，二次启动经
  * 标记探测直接跳过）。 */
 
-/* guest 内文件可执行性探测：同步 exec /bin/test -e <path>。
- * 返回 1 = 存在，0 = 不存在或探测失败。 */
+/* guest 内文件存在性探测：同步 exec /bin/test -e <path>，依 exit code 判定。
+ * 依赖 guest daemon 正确回报子进程退出码（utsm_exec_daemon.c 已修复：
+ * 不再全局 SIGCHLD=SIG_IGN，同步 waitpid 能拿到真实状态）。 */
 static int lxc_guest_path_exists(const char *path) {
     const char *argv[3];
     argv[0] = "test";
@@ -927,6 +951,7 @@ int lxc_vscode_install(void) {
      *    --strip-components=1 把内容直接落入 /opt/vscode；
      *    若 tarball 是平铺结构（无顶层目录）则回退不解层重试。 */
     int unpacked = 0;
+    static char tar_out[192];
     {
         const char *argv[7];
         argv[0] = "tar";
@@ -937,7 +962,12 @@ int lxc_vscode_install(void) {
         argv[5] = "--strip-components=1";
         argv[6] = 0;
         u64 ec = 1;
-        int rc = lxc_exec("/bin/tar", 6, argv, 0, 0, 0, &ec);
+        for (int i = 0; i < 192; i++) tar_out[i] = 0;
+        int rc = lxc_exec_to("/bin/tar", 6, argv, 600, tar_out, 191, 0, &ec);
+        log_hex64("[LNXC] vscode: extract rc=", (u64)(i64)rc);
+        log_hex64("[LNXC] vscode: extract exit=", ec);
+        log_info("[LNXC] vscode: extract out=");
+        log_info(tar_out[0] ? tar_out : "(empty)");
         if (rc == 0 && ec == 0) unpacked = 1;
     }
     if (!unpacked) {
@@ -949,7 +979,12 @@ int lxc_vscode_install(void) {
         argv[3] = "-C";
         argv[4] = "/opt/vscode";
         u64 ec = 1;
-        int rc = lxc_exec("/bin/tar", 5, argv, 0, 0, 0, &ec);
+        for (int i = 0; i < 192; i++) tar_out[i] = 0;
+        int rc = lxc_exec_to("/bin/tar", 5, argv, 600, tar_out, 191, 0, &ec);
+        log_hex64("[LNXC] vscode: flat extract rc=", (u64)(i64)rc);
+        log_hex64("[LNXC] vscode: flat extract exit=", ec);
+        log_info("[LNXC] vscode: flat extract out=");
+        log_info(tar_out[0] ? tar_out : "(empty)");
         if (rc == 0 && ec == 0) unpacked = 1;
     }
 

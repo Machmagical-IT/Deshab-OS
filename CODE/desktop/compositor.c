@@ -179,7 +179,145 @@ void redraw_all(void) {
     cursor_draw(g_mouse_x, g_mouse_y);
 }
 
-/* M2 Fluent 重绘：壁纸背景（缺失回退深色渐变）+ 页面 + 悬浮任务栏 */
+/* 悬停目标（窗口三钮组 / 菜单项 / Dock 图标 / Launchpad 格子）变化 → 重绘。
+ * 卡片或右键菜单打开时任何移动都重绘（卡片内控件读实时鼠标做悬停）。 */
+int aqua_hover_key(void) {
+    int k;
+    if (!g_fluent) return 0;
+    k = wm_hover_key();
+    k = k * 31 + menubar_hover_key();
+    k = k * 31 + dock_hover_key();
+    k = k * 31 + launchpad_hover_key();
+    if (taskbar_cards_open() || g_ctx_open)
+        k = k * 31 + g_mouse_x * 7 + g_mouse_y * 8191 + 1;
+    return k;
+}
+
+static u32 boot_mix(u32 a, u32 b, int t) {
+    u64 na, tb;
+    u32 r, g, bl;
+    if (t <= 0) return a;
+    if (t >= 256) return b;
+    na = (u64)(256 - t);
+    tb = (u64)t;
+    r = (u32)((((a >> 16) & 0xFF) * na + ((b >> 16) & 0xFF) * tb) >> 8);
+    g = (u32)((((a >> 8) & 0xFF) * na + ((b >> 8) & 0xFF) * tb) >> 8);
+    bl = (u32)(((a & 0xFF) * na + (b & 0xFF) * tb) >> 8);
+    return 0xFF000000u | (r << 16) | (g << 8) | bl;
+}
+
+/* 条带内容下移 d 像素，空出的上沿用壁纸填上。暂存复用 crossfade 之后空闲的 staging。 */
+/* 顶栏带 [0,h)：露出原带底部 vis 行，贴在 y=0；其余行回到壁纸。 */
+static void boot_reveal_top(int h, int vis) {
+    wp_u32 *wp = wallpaper_layer();
+    u32 *fb, *sc;
+    u64 pitch_px, w;
+    int r, hidden;
+    if (!wp || h <= 0) return;
+    if (vis < 0) vis = 0;
+    if (vis > h) vis = h;
+    if ((u64)h > g_fb_h) h = (int)g_fb_h;
+    if ((u64)h * g_fb_w * 4 > (8ULL << 20)) return;
+    hidden = h - vis;
+    fb = (u32 *)g_fb.fb;
+    sc = (u32 *)WALLPAPER_STAGING_ADDR;
+    pitch_px = g_fb_pitch / 4;
+    w = g_fb_w;
+    for (r = 0; r < h; r++) {
+        u32 *s = fb + (u64)r * pitch_px;
+        u32 *drow = sc + (u64)r * w;
+        u64 x;
+        for (x = 0; x < w; x++) drow[x] = s[x];
+    }
+    for (r = 0; r < h; r++) {
+        u32 *dst = fb + (u64)r * pitch_px;
+        u64 x;
+        if (r < vis) {
+            u32 *src = sc + (u64)(r + hidden) * w;
+            for (x = 0; x < w; x++) dst[x] = src[x];
+        } else {
+            const u32 *src = (const u32 *)wp + (u64)r * w;
+            for (x = 0; x < w; x++) dst[x] = src[x];
+        }
+    }
+}
+
+/* Dock 带 [y0,y0+h)：露出原带顶部 vis 行，贴在带的底部；上方回到壁纸。 */
+static void boot_reveal_bottom(int y0, int h, int vis) {
+    wp_u32 *wp = wallpaper_layer();
+    u32 *fb, *sc;
+    u64 pitch_px, w;
+    int r;
+    if (!wp || h <= 0) return;
+    if (y0 < 0) { h += y0; vis += y0; y0 = 0; }
+    if (vis < 0) vis = 0;
+    if (y0 < 0 || (u64)y0 >= g_fb_h) return;
+    if ((u64)(y0 + h) > g_fb_h) h = (int)g_fb_h - y0;
+    if (vis > h) vis = h;
+    if (h <= 0) return;
+    if ((u64)h * g_fb_w * 4 > (8ULL << 20)) return;
+    fb = (u32 *)g_fb.fb;
+    sc = (u32 *)WALLPAPER_STAGING_ADDR;
+    pitch_px = g_fb_pitch / 4;
+    w = g_fb_w;
+    for (r = 0; r < h; r++) {
+        u32 *s = fb + (u64)(y0 + r) * pitch_px;
+        u32 *drow = sc + (u64)r * w;
+        u64 x;
+        for (x = 0; x < w; x++) drow[x] = s[x];
+    }
+    for (r = 0; r < h; r++) {
+        u32 *dst = fb + (u64)(y0 + r) * pitch_px;
+        u64 x;
+        if (r >= h - vis) {
+            u32 *src = sc + (u64)(r - (h - vis)) * w;
+            for (x = 0; x < w; x++) dst[x] = src[x];
+        } else {
+            const u32 *src = (const u32 *)wp + (u64)(y0 + r) * w;
+            for (x = 0; x < w; x++) dst[x] = src[x];
+        }
+    }
+}
+
+static void boot_shift_down(int y0, int h, int d) {
+    wp_u32 *wp = wallpaper_layer();
+    u32 *fb, *sc;
+    u64 pitch_px, w;
+    int r;
+    if (!wp || d <= 0 || h <= 0) return;
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (y0 < 0 || (u64)y0 >= g_fb_h) return;
+    if ((u64)(y0 + h) > g_fb_h) h = (int)g_fb_h - y0;
+    if (h <= 0) return;
+    if (d > h) d = h;
+    if ((u64)h * g_fb_w * 4 > (8ULL << 20)) return;
+    fb = (u32 *)g_fb.fb;
+    sc = (u32 *)WALLPAPER_STAGING_ADDR;
+    pitch_px = g_fb_pitch / 4;
+    w = g_fb_w;
+    for (r = 0; r < h; r++) {
+        u32 *s = fb + (u64)(y0 + r) * pitch_px;
+        u32 *drow = sc + (u64)r * w;
+        u64 x;
+        for (x = 0; x < w; x++) drow[x] = s[x];
+    }
+    for (r = 0; r < h; r++) {
+        u32 *dst = fb + (u64)(y0 + r) * pitch_px;
+        u64 x;
+        if (r < d) {
+            const u32 *src = (const u32 *)wp + (u64)(y0 + r) * w;
+            for (x = 0; x < w; x++) dst[x] = src[x];
+        } else {
+            u32 *src = sc + (u64)(r - d) * w;
+            for (x = 0; x < w; x++) dst[x] = src[x];
+        }
+    }
+}
+
+/* Aqua 重绘顺序：壁纸 → 桌面图标/窗口 → 调度中心/右键菜单 → 顶栏
+ * → Launchpad → Dock → 下拉菜单/卡片 → 亮度/整蛊/光标。
+ * Launchpad 在 Dock 之下，打开时 Dock 的启动台按钮仍可点击关闭它。
+ * g_boot_reveal < 256 时只做进场：0 为纯壁纸，其后图标淡入、顶栏下移、Dock 上移。 */
 static void redraw_all_fluent(void) {
     /* 背景：壁纸层缓存直拷，失败回退渐变 */
     {
@@ -195,7 +333,7 @@ static void redraw_all_fluent(void) {
         }
     }
 
-    /* 页面（无 topbar；DESKTOP 页绘制窗口，任务栏由 taskbar_draw 叠加） */
+    /* 页面（无 topbar；DESKTOP 页绘制图标与窗口） */
     if (g_page == 1) draw_dashboard();
     else if (g_page == 2) draw_ide();
     else if (g_page == 3) draw_desktop_page();
@@ -210,11 +348,24 @@ static void redraw_all_fluent(void) {
     /* 任务视图 overlay */
     if (g_taskview) draw_taskview();
 
-    /* 右键菜单（最顶） */
+    /* 右键菜单 */
     if (g_ctx_open) draw_ctx_menu();
 
-    /* 悬浮任务栏（DESKTOP 页；其他页也显示以保持导航） */
-    taskbar_draw();
+    /* 外壳：顶栏 → Launchpad → Dock → 弹出层 */
+    menubar_draw();
+    launchpad_draw();
+    dock_draw();
+    menubar_draw_menus();
+    taskbar_cards_draw();
+
+    /* 进场：顶栏从屏幕上方滑下，Dock 从下方升起。reveal=0 时这两条带回到壁纸。 */
+    if (g_boot_reveal < 256) {
+        int vis_m = g_boot_reveal * AQUA_MENUBAR_H / 256;
+        int vis_d = g_boot_reveal * AQUA_DOCK_PANEL_H / 256;
+        int py = (int)g_fb_h - AQUA_DOCK_BOTTOM - AQUA_DOCK_PANEL_H;
+        boot_reveal_top(AQUA_MENUBAR_H, vis_m);
+        if (py > 0) boot_reveal_bottom(py, AQUA_DOCK_PANEL_H, vis_d);
+    }
 
     /* 亮度调整 */
     apply_brightness();

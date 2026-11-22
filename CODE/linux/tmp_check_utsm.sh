@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Report which GPT images already carry the current SYSTEM/boot/utsm.elf.
+# Report which GPT images already carry the current SYSTEM/ESP/boot/utsm.elf.
 set -uo pipefail
 ROOT=/mnt/d/Code/DEAICUP/Deshab
-EXP=$(md5sum "$ROOT/SYSTEM/boot/utsm.elf" | cut -d' ' -f1)
-echo "expected utsm.elf md5=$EXP size=$(stat -c %s "$ROOT/SYSTEM/boot/utsm.elf")"
+EXP=$(md5sum "$ROOT/SYSTEM/ESP/boot/utsm.elf" | cut -d' ' -f1)
+echo "expected utsm.elf md5=$EXP size=$(stat -c %s "$ROOT/SYSTEM/ESP/boot/utsm.elf")"
 for img in "$@"; do
     [[ -f "$img" ]] || { echo "$img: missing"; continue; }
     L=$(losetup --find --show --partscan "$img")

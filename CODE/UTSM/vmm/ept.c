@@ -4,6 +4,7 @@
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/dma.h>
+#include <utsm/vm_machine.h>
 #include "../arch/x86_64/limine.h"
 
 extern volatile struct limine_hhdm_request g_hhdm_request;
@@ -26,9 +27,35 @@ extern volatile struct limine_hhdm_request g_hhdm_request;
  *   bits [51:12] physical address (page-aligned)
  */
 
-static u64 g_ept_pml4_phys;
-static u64 g_ept_pml4_virt;
-static int g_ept_ready;
+static struct ept_context *g_active_ept;
+
+#define g_ept_pml4_phys (g_active_ept->pml4_phys)
+#define g_ept_pml4_virt (g_active_ept->pml4_virt)
+#define g_ept_ready     (g_active_ept->ready)
+
+/* 最高物理地址（memmap 上界）。软件页表 walk 用它校验 EPT 翻译出的 HPA：
+ * guest RAM 由 dma_alloc_high_pages 分配，HPA 故意位于 4G 以上（见 dma.c），
+ * 旧代码在 ept_gpa_to_hpa 里写死 `hpa >= 0x100000000` → 高内存 guest RAM 的
+ * 每一页都翻译失败 → hypercall(SHM_INFO)/virtio/取指全断，Linux guest 无法
+ * park。用真实 RAM 上界既放行高内存，又能挡住"残留 RAM 被当作 PTE"的垃圾项。 */
+extern volatile struct limine_memmap_request g_memmap_request;
+static u64 ept_phys_ceiling(void) {
+    static u64 cached = 0;
+    if (cached) return cached;
+    u64 max = 0;
+    if (g_memmap_request.response) {
+        struct limine_memmap_response *r = g_memmap_request.response;
+        for (u64 i = 0; i < r->entry_count; i++) {
+            struct limine_memmap_entry *e = r->entries[i];
+            if (!e) continue;
+            u64 end = e->base + e->length;
+            if (end > max) max = end;
+        }
+    }
+    if (max < 0x200000000ULL) max = 0x200000000ULL;  /* 兜底 8G，覆盖高内存 guest RAM */
+    cached = max;
+    return max;
+}
 
 /* 物理地址 → 虚拟地址（HHDM 直映射） */
 static void *phys_to_virt(u64 phys) {
@@ -49,16 +76,58 @@ static u64 ept_alloc_page(void) {
     return buf.phys;
 }
 
+int ept_context_init(struct ept_context *context) {
+    if (!context) {
+        panic_full("EPT-E05 NULL EPT CONTEXT",
+                   "ept_context_init received a null context", 0);
+        return -1;
+    }
+    context->pml4_phys = ept_alloc_page();
+    context->pml4_virt = 0;
+    context->ready = 0;
+    if (context->pml4_phys == 0) {
+        log_error("[EPT] failed to alloc PML4");
+        panic_full("EPT-E02 ALLOC PML4 FAILED", "ept root pml4 page allocation failed", 0);
+        return -1;
+    }
+    context->pml4_virt = (u64)phys_to_virt(context->pml4_phys);
+    context->ready = 1;
+    g_active_ept = context;
+    log_hex64("[EPT] PML4 phys=", context->pml4_phys);
+    log_info("[EPT] context init ok");
+    return 0;
+}
+
+int ept_context_activate(struct ept_context *context) {
+    if (!context || !context->ready || !context->pml4_phys ||
+        !context->pml4_virt) {
+        panic_full("EPT-E06 INVALID EPT CONTEXT",
+                   "attempted to activate an uninitialized ept context", 0);
+        return -1;
+    }
+    g_active_ept = context;
+    return 0;
+}
+
+struct ept_context *ept_context_active(void) {
+    return g_active_ept;
+}
+
 int ept_init(void) {
-    g_ept_pml4_phys = ept_alloc_page();
+    struct vm_machine *machine = vm_machine_active();
+    if (!machine) {
+        panic_full("EPT-E07 NO ACTIVE MACHINE",
+                   "ept_init requires an active vm machine", 0);
+        return -1;
+    }
+    struct ept_context *context = &machine->ept;
+    if (ept_context_init(context) != 0) return -1;
+    g_ept_pml4_phys = context->pml4_phys;
     if (g_ept_pml4_phys == 0) {
         log_error("[EPT] failed to alloc PML4");
         panic_full("EPT-E02 ALLOC PML4 FAILED", "ept root pml4 page allocation failed", 0);
         return -1;
     }
-    g_ept_pml4_virt = (u64)phys_to_virt(g_ept_pml4_phys);
-    g_ept_ready = 1;
-    log_hex64("[EPT] PML4 phys=", g_ept_pml4_phys);
     log_info("[EPT] init ok");
     return 0;
 }
@@ -343,7 +412,7 @@ u64 ept_gpa_to_hpa(u64 gpa) {
     entry = table[pt_idx];
     if (!(entry & EPT_READ)) return 0;
     u64 hpa = entry & 0x000FFFFFFFFFF000ULL;
-    if (hpa == 0 || hpa >= 0x100000000ULL) return 0;
+    if (hpa == 0 || hpa >= ept_phys_ceiling()) return 0;
     return hpa + offset;
 }
 
@@ -401,8 +470,15 @@ int ept_repair_leaf(u64 gpa, u64 flags) {
         u64 hpa = entry & 0x000FFFFFFFFFF000ULL;
         /* DMA pool is low 4G. A 4K leaf with PS, execute-only, or an
          * out-of-range HPA is leftover RAM interpreted as a PTE — keeping
-         * that HPA (0xa5000008000 on the last boot) loops EPT misconfig. */
-        if ((entry & EPT_LARGE_PAGE) || hpa == 0 || hpa >= 0x100000000ULL ||
+         * that HPA (0xa5000008000 on the last boot) loops EPT misconfig.
+         *
+         * HPA 上界用真实 memmap 上界（ept_phys_ceiling），不能用 4G：guest RAM
+         * 经 dma_alloc_high_pages 分配，HPA 故意 >4G。写死 4G 会让"guest RAM 页
+         * 上发生 EPT misconfig"时 repair 失败 → 调用方退回 ept_map_guest_ram_page
+         * 分配全新零页 → **guest 该页数据被静默丢弃**。这正是动态程序在 guest 里
+         * 段错误（ld-linux 读到清零的 link_map → DT_STRTAB 为 NULL）的根因：
+         * 静态程序页少不易踩到，动态程序 mmap 大量库页则频繁命中。 */
+        if ((entry & EPT_LARGE_PAGE) || hpa == 0 || hpa >= ept_phys_ceiling() ||
             (entry & 7ULL) == EPT_EXECUTE)
             return -1;
         table[pt_idx] = ept_make_leaf(hpa, flags, EPT_MEMORY_TYPE_WB);

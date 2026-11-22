@@ -1,6 +1,18 @@
 /* wm.c — 窗口管理（win_*）+ 窗口装饰绘制（M0 自 main.c 平移）
+ * Aqua：红黄绿三钮、按呈现矩形绘制、开/关/最小化/恢复/缩放动画。
  */
 #include "desktop.h"
+
+/* freestanding：大结构体赋值会被 clang 降成 memcpy。 */
+void *memcpy(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned long i;
+    for (i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+#include "aqua_draw.h"
+#include "zhfont.h"
 
 /* ---- 全局状态 ---- */
 desktop_window g_windows[MAX_WINDOWS];
@@ -28,6 +40,7 @@ desktop_window *win_find_at(int mx, int my) {
     for (int i = g_win_count - 1; i >= 0; i--) {
         desktop_window *w = &g_windows[i];
         if (!w->visible || w->minimized) continue;
+        if (w->anim == WIN_ANIM_CLOSE || w->anim == WIN_ANIM_MIN) continue;
         if (w->ws != g_ws_cur) continue;
         if (mx >= w->x && mx < w->x + w->w && my >= w->y && my < w->y + w->h) {
             return w;
@@ -55,7 +68,13 @@ void win_focus(desktop_window *w) {
     for (int i = 0; i < g_win_count; i++)
         g_windows[i].focused = (g_windows[i].id == id);
     g_focused_win = id;
-    if (g_win_count > 0) g_windows[g_win_count - 1].minimized = 0;
+    if (g_win_count > 0) {
+        desktop_window *f = &g_windows[g_win_count - 1];
+        if (f->minimized || f->anim == WIN_ANIM_MIN) {
+            f->minimized = 0;
+            if (g_fluent) win_anim_restore(f);
+        }
+    }
 }
 
 desktop_window *win_create(int app_id, const char *title, int x, int y, int w, int h) {
@@ -72,11 +91,181 @@ desktop_window *win_create(int app_id, const char *title, int x, int y, int w, i
     win->closing = 0;
     win->dirty = 1;
     win->ws = g_ws_cur;
+    win->anim = WIN_ANIM_NONE;
+    win->zoomed = 0;
+    win->zx = win->zy = win->zw = win->zh = 0;
     for (int i = 0; i < 47 && title[i]; i++) win->title[i] = title[i];
     win->title[47] = 0;
     for (int i = 0; i < g_win_count - 1; i++) g_windows[i].focused = 0;
     g_focused_win = id;
+    win_present_sync(win);
+    if (g_fluent) win_anim_open(win);
     return win;
+}
+
+void win_present_sync(desktop_window *w) {
+    if (!w) return;
+    motion_bind(&w->present_x, w->x);
+    motion_bind(&w->present_y, w->y);
+    motion_bind(&w->present_w, w->w);
+    motion_bind(&w->present_h, w->h);
+    motion_bind(&w->present_opacity, 255);
+}
+
+void win_present_rect(const desktop_window *w, int *x, int *y, int *ww, int *hh, int *opacity) {
+    if (!w) return;
+    if (x) *x = motion_px(&w->present_x);
+    if (y) *y = motion_px(&w->present_y);
+    if (ww) *ww = motion_px(&w->present_w);
+    if (hh) *hh = motion_px(&w->present_h);
+    if (opacity) *opacity = motion_px(&w->present_opacity);
+}
+
+void win_present_animate_to(desktop_window *w) {
+    if (!w) return;
+    motion_spring_to(&w->present_x, w->x);
+    motion_spring_to(&w->present_y, w->y);
+    motion_spring_to(&w->present_w, w->w);
+    motion_spring_to(&w->present_h, w->h);
+    motion_spring_to(&w->present_opacity, 255);
+}
+
+int win_present_settled(const desktop_window *w) {
+    if (!w) return 1;
+    return !w->present_x.active && !w->present_y.active &&
+           !w->present_w.active && !w->present_h.active &&
+           !w->present_opacity.active;
+}
+
+/* ============================================================
+ *  Aqua 窗口动画（开 / 关 / 最小化 / 恢复 / 缩放）
+ * ============================================================ */
+
+/* 呈现轨道吸附到逻辑矩形绕中心缩放 num/256 的位置 */
+static void present_bind_scaled(desktop_window *w, int num, int opacity) {
+    int sw = w->w * num / 256, sh = w->h * num / 256;
+    motion_bind(&w->present_x, w->x + (w->w - sw) / 2);
+    motion_bind(&w->present_y, w->y + (w->h - sh) / 2);
+    motion_bind(&w->present_w, sw);
+    motion_bind(&w->present_h, sh);
+    motion_bind(&w->present_opacity, opacity);
+}
+
+static void present_spring_rect(desktop_window *w, int x, int y, int ww, int hh) {
+    motion_spring_to(&w->present_x, x);
+    motion_spring_to(&w->present_y, y);
+    motion_spring_to(&w->present_w, ww);
+    motion_spring_to(&w->present_h, hh);
+}
+
+/* 焦点移交给 w 之外最上层的可交互窗口 */
+static void focus_next_excluding(int id) {
+    int i;
+    for (i = 0; i < g_win_count; i++)
+        if (g_windows[i].id == id) g_windows[i].focused = 0;
+    if (g_focused_win != id) return;
+    g_focused_win = -1;
+    for (i = g_win_count - 1; i >= 0; i--) {
+        desktop_window *o = &g_windows[i];
+        if (o->id == id || o->ws != g_ws_cur || !o->visible || o->minimized) continue;
+        if (o->anim == WIN_ANIM_CLOSE || o->anim == WIN_ANIM_MIN) continue;
+        o->focused = 1;
+        g_focused_win = o->id;
+        break;
+    }
+}
+
+void win_anim_open(desktop_window *w) {
+    present_bind_scaled(w, 236, 0);
+    present_spring_rect(w, w->x, w->y, w->w, w->h);
+    motion_ease_to(&w->present_opacity, 255, 160);
+    w->anim = WIN_ANIM_OPEN;
+}
+
+void win_anim_close(desktop_window *w) {
+    int sw, sh;
+    if (!w) return;
+    if (!g_fluent) { win_destroy(w); return; }
+    if (w->anim == WIN_ANIM_CLOSE) return;
+    sw = w->w * 230 / 256;
+    sh = w->h * 230 / 256;
+    motion_ease_to(&w->present_x, w->x + (w->w - sw) / 2, 160);
+    motion_ease_to(&w->present_y, w->y + (w->h - sh) / 2, 160);
+    motion_ease_to(&w->present_w, sw, 160);
+    motion_ease_to(&w->present_h, sh, 160);
+    motion_ease_to(&w->present_opacity, 0, 160);
+    w->anim = WIN_ANIM_CLOSE;
+    focus_next_excluding(w->id);
+}
+
+void win_anim_minimize(desktop_window *w) {
+    int r[4];
+    if (!w || w->minimized || w->anim == WIN_ANIM_CLOSE) return;
+    if (!g_fluent) {
+        w->minimized = 1;
+        focus_next_excluding(w->id);
+        return;
+    }
+    dock_icon_rect(w->app_id, r);
+    present_spring_rect(w, r[0], r[1], r[2], r[3]);
+    motion_ease_to(&w->present_opacity, 0, 260);
+    w->anim = WIN_ANIM_MIN;
+    focus_next_excluding(w->id);
+}
+
+void win_anim_restore(desktop_window *w) {
+    int r[4];
+    if (!w) return;
+    if (w->anim != WIN_ANIM_MIN) {
+        dock_icon_rect(w->app_id, r);
+        motion_bind(&w->present_x, r[0]);
+        motion_bind(&w->present_y, r[1]);
+        motion_bind(&w->present_w, r[2]);
+        motion_bind(&w->present_h, r[3]);
+        motion_bind(&w->present_opacity, 0);
+    }
+    present_spring_rect(w, w->x, w->y, w->w, w->h);
+    motion_ease_to(&w->present_opacity, 255, 200);
+    w->anim = WIN_ANIM_RESTORE;
+}
+
+void win_zoom_toggle(desktop_window *w) {
+    if (!w) return;
+    if (w->zoomed) {
+        w->x = w->zx; w->y = w->zy; w->w = w->zw; w->h = w->zh;
+        w->zoomed = 0;
+    } else {
+        w->zx = w->x; w->zy = w->y; w->zw = w->w; w->zh = w->h;
+        w->x = 4;
+        w->y = AQUA_MENUBAR_H + 4;
+        w->w = (int)g_fb_w - 8;
+        w->h = (int)g_fb_h - AQUA_MENUBAR_H - AQUA_DOCK_RESERVE - 4;
+        w->zoomed = 1;
+    }
+    if (g_fluent) {
+        win_present_animate_to(w);
+        w->anim = WIN_ANIM_ZOOM;
+    } else {
+        win_present_sync(w);
+    }
+}
+
+void wm_anim_settle(void) {
+    int i;
+    for (i = g_win_count - 1; i >= 0; i--) {
+        desktop_window *w = &g_windows[i];
+        if (w->anim == WIN_ANIM_NONE || !win_present_settled(w)) continue;
+        if (w->anim == WIN_ANIM_CLOSE) {
+            w->anim = WIN_ANIM_NONE;
+            win_destroy(w);
+        } else if (w->anim == WIN_ANIM_MIN) {
+            w->anim = WIN_ANIM_NONE;
+            w->minimized = 1;
+            win_present_sync(w);
+        } else {
+            w->anim = WIN_ANIM_NONE;
+        }
+    }
 }
 
 void win_destroy(desktop_window *w) {
@@ -87,7 +276,7 @@ void win_destroy(desktop_window *w) {
     }
     if (idx < 0) return;
 
-    /* 直接隐藏窗口（去掉关闭动画以避免卡顿和闪屏） */
+    /* Aqua 关闭动画已在 win_anim_close 播完；这里直接摘除 */
     w->visible = 0;
 
     if (w->app_id >= 0 && w->app_id < g_app_count && g_apps[w->app_id].on_destroy && w->app_state) {
@@ -108,9 +297,9 @@ void win_destroy(desktop_window *w) {
     }
 }
 
-/* 窗口标题栏高度（M2：Fluent 36px / KATE 28px） */
+/* 窗口标题栏高度：Aqua 与 KATE 都是 28px */
 int win_titlebar_h(void) {
-    return g_fluent ? 36 : KATE_TITLEBAR_H;
+    return g_fluent ? AQUA_TITLEBAR_H : KATE_TITLEBAR_H;
 }
 
 /* P5d: 关闭请求。运行中的 PE 窗口不能直接 win_destroy（run_windowed 阻塞中，
@@ -121,7 +310,7 @@ void win_close_request(desktop_window *w) {
         g_pe_svc->inject_input(PE_WM_CLOSE, 0, 0, 0, 0);
         return;
     }
-    win_destroy(w);
+    win_anim_close(w);
 }
 
 int ws_win_count(int ws) {
@@ -135,23 +324,33 @@ int ws_win_count(int ws) {
  *  窗口装饰绘制
  * ============================================================ */
 
-/* M2：Fluent 窗口框架 —— 圆角 8、36px 标题栏、右上三钮、投影。
- * 窗口按钮命中区（WM_FLUENT_TB=36px 标题栏，三钮各 46×36）。 */
-#define WM_FLUENT_TB   36
-#define WM_BTN_W       46
+/* Aqua 窗口框架：圆角 12、28px 标题栏、左上红黄绿三钮、柔和投影。
+ * 绘制读呈现矩形；三钮命中读逻辑矩形（交互时两者已吸附一致）。 */
+#define AQ_TB      AQUA_TITLEBAR_H
+#define AQ_BTN_HIT 10            /* 每钮命中半宽 */
 
-static int wm_fluent_hit_btn(desktop_window *w, int mx, int my, int btn) {
-    int bx = w->x + w->w - WM_BTN_W * btn;
-    return mx >= bx && mx < bx + WM_BTN_W &&
-           my >= w->y && my < w->y + WM_FLUENT_TB;
+static int aq_btn_cx(int x, int btn, int s256) {
+    int d = g_aqua_theme.traffic, gap = g_aqua_theme.traffic_gap;
+    return x + (g_aqua_theme.traffic_inset_x + d / 2 + btn * (d + gap)) * s256 / 256;
 }
 
-/* 静态状态：正在操作的三钮（0=无 1=min 2=max 3=close） */
-static int g_wm_btn_hover = 0;
+/* btn：0=关闭 1=最小化 2=缩放 */
+static int aq_hit_btn(desktop_window *w, int mx, int my, int btn) {
+    int cx = aq_btn_cx(w->x, btn, 256);
+    return mx >= cx - AQ_BTN_HIT && mx < cx + AQ_BTN_HIT &&
+           my >= w->y && my < w->y + AQ_TB;
+}
+
+/* 鼠标在三钮组上（显示 × − + 符号） */
+static int aq_group_hover(const desktop_window *w) {
+    int x0 = aq_btn_cx(w->x, 0, 256) - AQ_BTN_HIT;
+    int x1 = aq_btn_cx(w->x, 2, 256) + AQ_BTN_HIT;
+    return g_mouse_x >= x0 && g_mouse_x < x1 &&
+           g_mouse_y >= w->y && g_mouse_y < w->y + AQ_TB;
+}
 
 int win_hit_close_btn(desktop_window *w, int mx, int my) {
-    /* 绘制顺序是 min=*3、max=*2、close=*1（最右）。命中必须跟绘制同一序号。 */
-    if (g_fluent) return wm_fluent_hit_btn(w, mx, my, 1);
+    if (g_fluent) return aq_hit_btn(w, mx, my, 0);
     int bx = w->x + w->w - CLOSE_BTN_OFFSET;
     int by = w->y + (KATE_TITLEBAR_H - CLOSE_BTN_SIZE) / 2;
     return mx >= bx && mx < bx + CLOSE_BTN_SIZE &&
@@ -159,63 +358,15 @@ int win_hit_close_btn(desktop_window *w, int mx, int my) {
 }
 
 int win_hit_min_btn(desktop_window *w, int mx, int my) {
-    return g_fluent ? wm_fluent_hit_btn(w, mx, my, 3) : 0;
+    return g_fluent ? aq_hit_btn(w, mx, my, 1) : 0;
 }
 
 int win_hit_max_btn(desktop_window *w, int mx, int my) {
-    return g_fluent ? wm_fluent_hit_btn(w, mx, my, 2) : 0;
-}
-
-static void draw_window_frame_fluent(desktop_window *w) {
-    /* 投影 + 亚克力底（窗口主体用不透明深色，性能优先） */
-    du_rect_outline(&g_fb, w->x - 2, w->y - 2, w->w + 4, w->h + 4,
-                    du_blend(du_pixel_read(&g_fb, w->x - 2, w->y - 2), 0xFF000000u, 70), 10);
-    du_fill_rounded_rect(&g_fb, w->x, w->y, w->w, w->h, 0xFF2B2B2Bu, 8);
-    du_rect_outline(&g_fb, w->x, w->y, w->w, w->h,
-                    w->focused ? 0xFF4A4A4Au : 0xFF3F3F3Fu, 8);
-
-    /* 标题栏（36px，无强调色，仅底部分隔线） */
-    du_fill_rect(&g_fb, w->x + 1, w->y + 1, w->w - 2, WM_FLUENT_TB - 1, 0xFF2B2B2Bu);
-    du_divider_h(&g_fb, w->x + 1, w->y + WM_FLUENT_TB, w->w - 2, 0xFF3A3A3Au);
-    du_draw_string(&g_fb, w->title,
-                   w->x + 14,
-                   w->y + (WM_FLUENT_TB - (i64)DU_ASCII_LINE_H) / 2,
-                   w->focused ? 0xFFFFFFFFu : 0xFFC8C8C8u, 0xFF2B2B2Bu, DU_ASCII_STEP);
-
-    /* 右上三钮：最小化 / 最大化 / 关闭（hover：前两钮浅灰，关闭钮红） */
-    int by = w->y;
-    int iy = by + WM_FLUENT_TB / 2;
-    /* min */
-    {
-        int bx = w->x + w->w - WM_BTN_W * 3;
-        if (g_wm_btn_hover == 1)
-            du_fill_rect(&g_fb, bx, by, WM_BTN_W, WM_FLUENT_TB, 0xFF3A3A3Au);
-        du_fill_rect(&g_fb, bx + 16, iy, 14, 2, 0xFFFFFFFFu);
-    }
-    /* max */
-    {
-        int bx = w->x + w->w - WM_BTN_W * 2;
-        if (g_wm_btn_hover == 2)
-            du_fill_rect(&g_fb, bx, by, WM_BTN_W, WM_FLUENT_TB, 0xFF3A3A3Au);
-        du_rect_outline(&g_fb, bx + 17, iy - 7, 13, 13, 0xFFFFFFFFu, 1);
-    }
-    /* close：hover 红 #E81123 */
-    {
-        int bx = w->x + w->w - WM_BTN_W;
-        if (g_wm_btn_hover == 3)
-            du_fill_rect(&g_fb, bx, by, WM_BTN_W, WM_FLUENT_TB, 0xFFC42B1Cu);
-        /* × 用两条 2px 对角线 */
-        for (int i = 0; i < 11; i++) {
-            du_pixel(&g_fb, bx + 18 + i, iy - 5 + i, 0xFFFFFFFFu);
-            du_pixel(&g_fb, bx + 19 + i, iy - 5 + i, 0xFFFFFFFFu);
-            du_pixel(&g_fb, bx + 18 + i, iy + 5 - i, 0xFFFFFFFFu);
-            du_pixel(&g_fb, bx + 19 + i, iy + 5 - i, 0xFFFFFFFFu);
-        }
-    }
+    return g_fluent ? aq_hit_btn(w, mx, my, 2) : 0;
 }
 
 int win_hit_titlebar(desktop_window *w, int mx, int my) {
-    int tb = g_fluent ? WM_FLUENT_TB : KATE_TITLEBAR_H;
+    int tb = g_fluent ? AQ_TB : KATE_TITLEBAR_H;
     if (g_fluent && (win_hit_close_btn(w, mx, my) || win_hit_max_btn(w, mx, my) ||
                      win_hit_min_btn(w, mx, my)))
         return 0;   /* 三钮区域不算标题栏拖拽 */
@@ -223,23 +374,135 @@ int win_hit_titlebar(desktop_window *w, int mx, int my) {
            my >= w->y && my < w->y + tb;
 }
 
-/* 窗口按钮 hover 状态跟踪（绘制前调用；btn 0=无） */
-void wm_set_btn_hover(int btn) { g_wm_btn_hover = btn; }
+/* 悬停在某窗口三钮组上时返回非零键（变化触发重绘） */
+int wm_hover_key(void) {
+    desktop_window *w;
+    if (!g_fluent) return 0;
+    w = win_find_at(g_mouse_x, g_mouse_y);
+    if (!w || !aq_group_hover(w)) return 0;
+    return (w->id << 1) | 1;
+}
 
-/* 当前鼠标悬停的窗口按钮（0=无 1=min 2=max 3=close），-1=不在窗口上 */
-int wm_detect_btn_hover(desktop_window *w, int mx, int my) {
-    if (!w) return 0;
-    if (win_hit_close_btn(w, mx, my)) return 3;
-    if (win_hit_max_btn(w, mx, my)) return 2;
-    if (win_hit_min_btn(w, mx, my)) return 1;
-    return 0;
+static void aq_glyph(int cx, int cy, int btn, du_u32 c) {
+    int i;
+    for (i = -3; i <= 3; i++) {
+        if (btn == 0) {
+            du_pixel(&g_fb, cx + i, cy + i, c);
+            du_pixel(&g_fb, cx + i, cy - i, c);
+        } else if (btn == 1) {
+            du_pixel(&g_fb, cx + i, cy, c);
+        } else {
+            du_pixel(&g_fb, cx + i, cy, c);
+            du_pixel(&g_fb, cx, cy + i, c);
+        }
+    }
+}
+
+/* 应用 on_draw 会画满客户区的方角；先存底部两角的底图，之后按覆盖率回填 */
+#define AQ_CORNER_MAX 16
+static du_u32 g_corner_bg[2][AQ_CORNER_MAX * AQ_CORNER_MAX];
+static int g_corner_x, g_corner_y, g_corner_w, g_corner_h, g_corner_r, g_corner_ok;
+
+static void corner_save(int x, int y, int w, int h, int r) {
+    int i, j;
+    g_corner_ok = 0;
+    if (r <= 0 || r > AQ_CORNER_MAX) return;
+    for (j = 0; j < r; j++) {
+        for (i = 0; i < r; i++) {
+            g_corner_bg[0][j * r + i] = du_pixel_read(&g_fb, x + i, y + h - r + j);
+            g_corner_bg[1][j * r + i] = du_pixel_read(&g_fb, x + w - r + i, y + h - r + j);
+        }
+    }
+    g_corner_x = x; g_corner_y = y; g_corner_w = w; g_corner_h = h; g_corner_r = r;
+    g_corner_ok = 1;
+}
+
+static void corner_restore(void) {
+    int i, j, k;
+    int r = g_corner_r;
+    if (!g_corner_ok) return;
+    for (k = 0; k < 2; k++) {
+        int bx = k ? g_corner_x + g_corner_w - r : g_corner_x;
+        int by = g_corner_y + g_corner_h - r;
+        for (j = 0; j < r; j++) {
+            for (i = 0; i < r; i++) {
+                int col = (k ? g_corner_w - r : 0) + i;
+                int cv = aqua_round_cov(col, g_corner_h - r + j, g_corner_w, g_corner_h, r);
+                du_u32 cur, bg;
+                if (cv >= 16) continue;
+                bg = g_corner_bg[k][j * r + i];
+                cur = du_pixel_read(&g_fb, bx + i, by + j);
+                du_pixel(&g_fb, bx + i, by + j, aqua_mix(bg, cur, cv * 16));
+            }
+        }
+    }
+    g_corner_ok = 0;
+}
+
+static void draw_window_frame_aqua(desktop_window *w) {
+    int x, y, ww, hh, op, r, tb, s256, b, hover;
+    const aqua_theme *t = &g_aqua_theme;
+    static const du_u32 glyph_c[3] = { 0xFF7A0A06u, 0xFF8F5A0Au, 0xFF0A5E14u };
+    du_u32 btn_c[3];
+    win_present_rect(w, &x, &y, &ww, &hh, &op);
+    g_corner_ok = 0;
+    if (op > 255) op = 255;
+    if (op <= 0 || ww < 16 || hh < 16) return;
+    r = t->radius_window;
+    s256 = w->w > 0 ? ww * 256 / w->w : 256;
+    tb = AQ_TB * s256 / 256;
+    if (tb < 6) tb = 6;
+
+    aqua_shadow(&g_fb, x, y, ww, hh, r,
+                (w->focused ? 120 : 64) * op / 255, w->focused ? 14 : 8);
+    if (w->anim == WIN_ANIM_NONE && win_present_settled(w))
+        corner_save(x, y, ww, hh, r);
+    aqua_fill_round_alpha(&g_fb, x, y, ww, hh, r, t->window, op);
+    aqua_fill_round_rows(&g_fb, x, y, ww, hh, r,
+                         w->focused ? 0xFFE8E8EAu : 0xFFF2F2F4u, op, 0, tb);
+    aqua_fill_round_rows(&g_fb, x, y, ww, hh, r, 0xFFD4D4D6u, op, tb - 1, tb);
+
+    hover = (w->anim == WIN_ANIM_NONE) && aq_group_hover(w);
+    btn_c[0] = t->traffic_close;
+    btn_c[1] = t->traffic_min;
+    btn_c[2] = t->traffic_zoom;
+    for (b = 0; b < 3; b++) {
+        int d = t->traffic * s256 / 256;
+        int cx = aq_btn_cx(x, b, s256);
+        int cy = y + (t->traffic_inset_y + t->traffic / 2) * s256 / 256;
+        du_u32 c = (w->focused || hover) ? btn_c[b] : 0xFFCDCDCFu;
+        if (d < 4) d = 4;
+        aqua_disc(&g_fb, cx - d / 2, cy - d / 2, d, aqua_mix(c, 0xFF000000u, 40), op);
+        aqua_disc(&g_fb, cx - d / 2 + 1, cy - d / 2 + 1, d - 2, c, op);
+        if (hover) aq_glyph(cx, cy, b, glyph_c[b]);
+    }
+
+    if (op >= 250 && tb >= 20) {
+        int tw = zh_string_width(w->title, 0);
+        int tx = x + (ww - tw) / 2;
+        int min_x = aq_btn_cx(x, 2, 256) + AQ_BTN_HIT + 8;
+        if (tx < min_x) tx = min_x;
+        zh_draw_string(&g_fb, w->title, tx, y + (tb - zh_line_height(0)) / 2 + 1,
+                       w->focused ? 0xFF3C3C3Eu : 0xFFA1A1A6u, 0);
+    }
+}
+
+void draw_window_post(desktop_window *w) {
+    int x, y, ww, hh, op;
+    if (!g_fluent || !w->visible || w->minimized) return;
+    win_present_rect(w, &x, &y, &ww, &hh, &op);
+    if (op > 255) op = 255;
+    if (op <= 0 || ww < 16 || hh < 16) return;
+    corner_restore();
+    aqua_round_band(&g_fb, x, y, ww, hh, g_aqua_theme.radius_window, 0xFF000000u,
+                    (w->focused ? 46 : 30) * op / 255);
 }
 
 void draw_window_frame(desktop_window *w) {
     if (!w->visible || w->minimized) return;
 
     if (g_fluent) {
-        draw_window_frame_fluent(w);
+        draw_window_frame_aqua(w);
         return;
     }
 

@@ -240,12 +240,10 @@ static int ide_click(int mx, int my, int dbl) {
 
 /* ---- 4·DESKTOP 点击 ---- */
 static int desktop_click(int mx, int my, int dbl) {
-    /* M2 Fluent：悬浮任务栏 + 托盘优先路由 */
-    if (g_fluent && taskbar_click(mx, my)) return 1;
+    (void)dbl;
+    int tb_y = (int)g_fb_h - KATE_TASKBAR_H;
 
-    int tb_y = (int)g_fb_h - (g_fluent ? 56 : KATE_TASKBAR_H);
-
-    /* 任务栏（仅 KATE 回退路径；Fluent 已由 taskbar_click 消费） */
+    /* 任务栏（仅 KATE 回退路径；Aqua 的顶栏 / Dock 已在 on_left_press 路由） */
     if (!g_fluent && my >= tb_y) {
         if (rect_hit(g_tb_quit_rect, mx, my)) { g_quit = 1; return 1; }
         if (rect_hit(g_tb_adopt_rect, mx, my)) {
@@ -275,26 +273,11 @@ static int desktop_click(int mx, int my, int dbl) {
         win_focus(w);
         w = win_find(wid);   /* focus 重排后重新定位 */
         if (!w) return 1;
-        /* M2 Fluent：右上三钮（关闭/最大化/最小化） */
+        /* Aqua：左上红黄绿（关闭 / 最小化到 Dock / 缩放） */
         if (g_fluent) {
             if (win_hit_close_btn(w, mx, my)) { win_close_request(w); return 1; }
-            if (win_hit_max_btn(w, mx, my)) {
-                /* 最大化/还原：铺满桌面区（顶部 0 到任务栏上方） */
-                if (w->w >= (int)g_fb_w - 8 && w->h >= (int)g_fb_h - 64) {
-                    w->x = 60; w->y = 40; w->w = 720; w->h = 500;   /* 还原 */
-                } else {
-                    w->x = 0; w->y = 0;
-                    w->w = (int)g_fb_w;
-                    w->h = (int)g_fb_h - 56;   /* 任务栏悬浮区预留 */
-                }
-                return 1;
-            }
-            if (win_hit_min_btn(w, mx, my)) {
-                w->minimized = 1;
-                w->focused = 0;
-                g_focused_win = -1;
-                return 1;
-            }
+            if (win_hit_max_btn(w, mx, my)) { win_zoom_toggle(w); return 1; }
+            if (win_hit_min_btn(w, mx, my)) { win_anim_minimize(w); return 1; }
         } else if (win_hit_close_btn(w, mx, my)) { win_close_request(w); return 1; }
         if (win_hit_titlebar(w, mx, my)) {
             g_dragging = 1;
@@ -322,12 +305,10 @@ static int desktop_click(int mx, int my, int dbl) {
     for (int i = 0; i < g_icon_count; i++) {
         int ix = g_icons[i].x, iy = g_icons[i].y;
         if (mx >= ix && mx < ix + ICON_W && my >= iy && my < iy + ICON_H) {
-            if (dbl && g_icons[i].selected) {
-                launch_app(g_icons[i].app_id);
-            } else {
-                for (int j = 0; j < g_icon_count; j++) g_icons[j].selected = 0;
-                g_icons[i].selected = 1;
-            }
+            /* 单击即启动。双击门槛会让桌面图标第一次点击只选中、看起来无反应。 */
+            for (int j = 0; j < g_icon_count; j++) g_icons[j].selected = 0;
+            g_icons[i].selected = 1;
+            launch_app(g_icons[i].app_id);
             return 1;
         }
     }
@@ -343,6 +324,14 @@ int on_left_press(void) {
     int dbl = dbl_check(mx, my);
     g_last_click_tsc = rdtsc();
     g_last_click_x = mx; g_last_click_y = my;
+
+    /* Aqua 外壳：Launchpad（模态，Dock 仍可点）→ 卡片 → 顶栏菜单 → Dock */
+    if (g_fluent) {
+        if (launchpad_click(mx, my)) return 1;
+        if (taskbar_cards_click(mx, my)) return 1;
+        if (menubar_click(mx, my)) return 1;
+        if (dock_click(mx, my)) return 1;
+    }
 
     /* 任务视图 overlay（模态） */
     if (g_taskview) {
@@ -423,10 +412,15 @@ int on_right_press(void) {
 
     if (g_taskview) { g_taskview = 0; return 1; }
     if (g_ctx_open) { g_ctx_open = 0; return 1; }
+    if (g_fluent && (g_lp_open || menubar_menu_open())) {
+        launchpad_close();
+        menubar_close_menus();
+        return 1;
+    }
     if (g_page != 3) return 0;
 
     int tb_y = (int)g_fb_h - KATE_TASKBAR_H;
-    if (my >= tb_y) {
+    if (!g_fluent && my >= tb_y) {
         for (int i = 0; i < g_win_count; i++) {
             if (!g_tb_rect[i][2] || !rect_hit(g_tb_rect[i], mx, my)) continue;
             int lmap[MAX_WS];
@@ -478,11 +472,20 @@ int handle_key(u8 sc) {
     if (sc == 0xB8) { g_alt = 0; return 0; }
     if (sc & 0x80) { g_e0 = 0; return 0; }   /* 其他释放码忽略 */
 
-    /* M3 开始菜单（模态：Esc 关闭 / 搜索输入 / Enter 启动） */
-    if (g_sm_open) return startmenu_key(sc, g_shift);
+    /* Launchpad（模态：Esc 关闭 / 搜索输入 / 方向键 / Enter 启动） */
+    if (g_lp_open) return launchpad_key(sc, g_shift);
 
-    /* 快速设置卡片（Esc 收起） */
+    /* F4 = Launchpad（macOS 同键） */
+    if (g_fluent && sc == 0x3E) { launchpad_toggle(); return 1; }
+
+    /* 顶栏下拉菜单（Esc 收起，打开期间吞键） */
+    if (menubar_key(sc)) return 1;
+
+    /* 控制中心卡片（Esc 收起） */
     if (g_qs_open && sc == 0x01) { g_qs_open = 0; return 1; }
+
+    /* 电源菜单（Esc 收起） */
+    if (taskbar_power_menu_key(sc)) return 1;
 
     /* WiFi 快捷卡片（模态：Esc 收起 / 密码模式接管输入） */
     if (g_wifi_open) return wifi_key(sc, g_shift);

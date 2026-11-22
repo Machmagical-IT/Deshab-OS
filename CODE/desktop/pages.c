@@ -6,6 +6,7 @@
  */
 #include "desktop.h"
 #include "zhfont.h"       /* M2: 桌面图标中文标签 */
+#include "aqua_draw.h"    /* Aqua 桌面图标 / 右键菜单 */
 
 /* ============================================================
  *  顶栏（brand + WorkspaceSwitcher + PageSwitcher + PG 时钟）
@@ -276,16 +277,25 @@ static void draw_desktop_icons(void) {
     for (int i = 0; i < g_icon_count; i++) {
         desktop_icon *ic = &g_icons[i];
         if (g_fluent) {
-            /* M2 Fluent：图标 + 中文标签（zh 字库，缺失自动回退 ASCII） */
-            du_kate_desktop_icon(&g_fb, ic->x, ic->y, "", ic->selected);
-            int ix = ic->x + (KATE_ICON_W - KATE_ICON_IMG) / 2;
-            int iy = ic->y + 10;
-            draw_app_icon(&g_fb, ic->app_id, ix, iy);
+            /* Aqua：52px 圆角图标 + 白字带投影标签；选中 = 灰底 + 蓝色标签胶囊 */
+            const int sz = 52;
+            int ix = ic->x + (KATE_ICON_W - sz) / 2;
+            int iy = ic->y + 4;
             int lw = zh_string_width(ic->label, 0);
-            zh_draw_string(&g_fb, ic->label,
-                           ic->x + (KATE_ICON_W - lw) / 2,
-                           ic->y + KATE_ICON_IMG + 16,
-                           ic->selected ? 0xFFFFFFFFu : 0xFFE8E8E8u, 0);
+            int lx = ic->x + (KATE_ICON_W - lw) / 2;
+            int ly = iy + sz + 6;
+            if (g_boot_reveal >= 160 && ic->selected) {
+                aqua_fill_round_alpha(&g_fb, ix - 6, iy - 4, sz + 12, sz + 8, 8,
+                                      0xFF000000u, 60);
+                aqua_fill_round_alpha(&g_fb, lx - 6, ly - 1, lw + 12, 20, 6,
+                                      0xFF0A64D8u, 255);
+            }
+            aqua_app_icon(&g_fb, ic->app_id, ix, iy, sz, g_boot_reveal);
+            if (g_boot_reveal >= 160) {
+                if (!ic->selected)
+                    zh_draw_string(&g_fb, ic->label, lx + 1, ly + 1, 0xFF000000u, 0);
+                zh_draw_string(&g_fb, ic->label, lx, ly, 0xFFFFFFFFu, 0);
+            }
         } else {
             du_kate_desktop_icon(&g_fb, ic->x, ic->y, ic->label, ic->selected);
             int ix = ic->x + (KATE_ICON_W - KATE_ICON_IMG) / 2;
@@ -577,20 +587,23 @@ void draw_desktop_page(void) {
 
         draw_window_frame(w);
 
-        if (w->app_id >= 0 && w->app_id < g_app_count &&
+        /* Aqua 动画期间只画框：应用内容按逻辑矩形绘制，与缩放中的框对不上 */
+        if ((!g_fluent || (w->anim == WIN_ANIM_NONE && win_present_settled(w))) &&
+            w->app_id >= 0 && w->app_id < g_app_count &&
             g_apps[w->app_id].on_draw && w->app_state) {
             app_ctx ctx;
             fill_app_ctx(&ctx, w);
             g_apps[w->app_id].on_draw(w->app_state, &ctx);
         }
 
-        if (!g_fluent) {   /* KATE 扫描线特效；Fluent 窗口干净背景 */
+        if (!g_fluent) {   /* KATE 扫描线特效；Aqua 窗口干净背景 */
             du_kate_scanlines(&g_fb, w->x + 1, w->y + KATE_TITLEBAR_H,
                               w->w - 2, w->h - KATE_TITLEBAR_H - 1);
         }
+        draw_window_post(w);
     }
 
-    /* M2 Fluent：悬浮任务栏由 compositor（redraw_all_fluent）统一叠加，
+    /* Aqua：顶栏 / Dock 由 compositor（redraw_all_fluent）统一叠加，
      * 此处跳过旧 40px 任务栏。 */
     if (g_fluent) return;
 
@@ -835,6 +848,52 @@ void draw_ctx_menu(void) {
     if (y + mh > (int)g_fb_h) y = (int)g_fb_h - mh - 4;
     g_ctx_rect[0] = x; g_ctx_rect[1] = y;
     g_ctx_rect[2] = mw; g_ctx_rect[3] = mh;
+
+    if (g_fluent) {
+        /* Aqua：毛玻璃面板 圆角 8，悬停行 = 系统蓝底白字 */
+        const wf_theme *t = &g_wf_aqua;
+        int ty = (22 - zh_line_height(0)) / 2 + 1;
+        aqua_panel(&g_fb, x, y, mw, mh, 8);
+        zh_draw_string(&g_fb, "移到工作区", x + 12, y + 4 + ty, t->text_secondary, 0);
+        int iy = y + 26, row = 0;
+        if (ln == 0) {
+            zh_draw_string(&g_fb, "没有其他工作区", x + 12, iy + ty, 0xFFB0B0B5u, 0);
+            g_ctx_item[0][2] = 0;
+            g_ctx_item_ws[0] = -2;
+            iy += 22;
+            row = 1;
+        }
+        for (int r = 0; r < ln; r++) {
+            int wi = lmap[r];
+            int hov = g_mouse_x >= x && g_mouse_x < x + mw &&
+                      g_mouse_y >= iy && g_mouse_y < iy + 22;
+            char cn[4];
+            if (hov) aqua_fill_round_alpha(&g_fb, x + 5, iy, mw - 10, 22, 4, t->accent, 255);
+            zh_draw_string(&g_fb, g_ws[wi].name, x + 14, iy + ty,
+                           hov ? t->on_accent : t->text_primary, 0);
+            cn[0] = '0' + (char)(ws_win_count(wi) % 10); cn[1] = 0;
+            zh_draw_string(&g_fb, cn, x + mw - 26, iy + ty,
+                           hov ? t->on_accent : t->text_secondary, 0);
+            g_ctx_item[row][0] = x; g_ctx_item[row][1] = iy;
+            g_ctx_item[row][2] = mw; g_ctx_item[row][3] = 22;
+            g_ctx_item_ws[row] = wi;
+            iy += 22;
+            row++;
+        }
+        aqua_fill_round_alpha(&g_fb, x + 10, iy, mw - 20, 1, 0, 0xFF000000u, 30);
+        {
+            int hov = g_mouse_x >= x && g_mouse_x < x + mw &&
+                      g_mouse_y >= iy + 2 && g_mouse_y < iy + 24;
+            if (hov) aqua_fill_round_alpha(&g_fb, x + 5, iy + 2, mw - 10, 22, 4, t->accent, 255);
+            zh_draw_string(&g_fb, "新建工作区", x + 14, iy + 2 + ty,
+                           hov ? t->on_accent : t->text_primary, 0);
+        }
+        g_ctx_item[row][0] = x; g_ctx_item[row][1] = iy;
+        g_ctx_item[row][2] = mw; g_ctx_item[row][3] = 24;
+        g_ctx_item_ws[row] = -1;
+        for (int r = row + 1; r <= MAX_WS; r++) g_ctx_item[r][2] = 0;
+        return;
+    }
 
     du_fill_rect(&g_fb, x, y, mw, mh, KS_BG_SECONDARY);
     du_rect_outline(&g_fb, x, y, mw, mh, KS_ACCENT, 1);

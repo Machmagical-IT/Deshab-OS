@@ -20,6 +20,7 @@
 #include <utsm/block.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
+#include <utsm/ext4_blkmap.h>
 #include "../../tools/fat32_lfn.h"
 #include "../../tools/fat32_part.h"
 
@@ -526,12 +527,18 @@ static u64 g_xrootfs_size;
 static u64 g_xrootfs_capacity;
 static u16 g_xrootfs_last_avail;
 
-#define XROOTFS_MAX_CLUSTERS 131072u
+#define XROOTFS_MAX_RUNS     8192u
 #define XROOTFS_FATWIN_SECS  256u
+
+/* extra-rootfs 的 ESP FAT 链按「连续簇 run」压缩存贮：新打包的 ESP 文件几乎
+ * 总是连续一段，而 3.9GB / 2KiB 簇 ≈ 200 万簇——逐簇 LBA 表需 ~8MB 静态内存，
+ * 故改为 run 编码（clus0/lba0/nclus）。碎片超过 XROOTFS_MAX_RUNS 才 panic。 */
+struct xrootfs_run { u32 clus0; u32 lba0; u32 nclus; };
 
 static u32 g_xrootfs_spc;
 static u32 g_xrootfs_nclus;
-static u32 g_xrootfs_clus_lba[XROOTFS_MAX_CLUSTERS];
+static struct xrootfs_run g_xrootfs_runs[XROOTFS_MAX_RUNS];
+static u32 g_xrootfs_nruns;
 static u8  g_xrootfs_dirbuf[FAT32_MAX_CLUSTER_BYTES] __attribute__((aligned(16)));
 static u8  g_xrootfs_fatwin[XROOTFS_FATWIN_SECS * 512u] __attribute__((aligned(16)));
 static u32 g_xrootfs_fat_abs;
@@ -643,16 +650,56 @@ static int xrootfs_find_in_dir(u32 vol_lba, u32 data_start, u32 start_clus,
     return -4;
 }
 
+/* 追加一个连续 run（超限即 VVB-E10 panic）。 */
+static int xrootfs_push_run(u32 clus0, u32 lba0, u32 nclus) {
+    if (g_xrootfs_nruns >= XROOTFS_MAX_RUNS) {
+        log_error("[VBLK] extra-rootfs cluster map too fragmented");
+        log_hex64("[VBLK] runs=", g_xrootfs_nruns);
+        panic_full("VVB-E10 EXTRA ROOTFS CLUSTER MAP TOO LARGE",
+                   "extra rootfs image cluster runs exceed the static map limit", 0);
+        return -1;
+    }
+    g_xrootfs_runs[g_xrootfs_nruns].clus0 = clus0;
+    g_xrootfs_runs[g_xrootfs_nruns].lba0  = lba0;
+    g_xrootfs_runs[g_xrootfs_nruns].nclus = nclus;
+    g_xrootfs_nruns++;
+    return 0;
+}
+
+/* 查 run 序号（runs 按 clus0 升序，二分）。ci 必须 < g_xrootfs_nclus。 */
+static u32 xrootfs_run_of(u32 ci) {
+    u32 lo = 0, hi = g_xrootfs_nruns;
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+        if (ci < g_xrootfs_runs[mid].clus0) hi = mid;
+        else if (ci >= g_xrootfs_runs[mid].clus0 + g_xrootfs_runs[mid].nclus) lo = mid + 1;
+        else return mid;
+    }
+    return 0;
+}
+
+/* 持久卷的两种装载方式：
+ *   1) ext4 路径（首选）：DATA 分区（p2）里的一个文件，用 extent 映射成
+ *      扇区表。ext4 无 4GiB 单文件限制，卷可以做多大。
+ *   2) FAT32 路径（回退）：ESP（p1）里的一个文件，按簇链映射。
+ *
+ * 两者都只读元数据，正文按需读写；写会直接落到文件正文区域。 */
+static int xrootfs_map_ext4_file(void);
+
 static int xrootfs_map_esp_file(void) {
     const dkm_block_api *blk = block_get_api();
     u8 bpbsec[512] __attribute__((aligned(16)));
     u64 vol;
-    u32 rsvd, fc, spf, spc, root, data_start, file_clus, file_size, nclus, i, fc_cur;
+    u32 rsvd, fc, spf, spc, root, data_start, file_clus, file_size, nclus, fc_cur;
     u32 boot_clus, dummy;
     if (!blk || blk->device_count() == 0 || blk->sector_size(0) != 512) {
         log_warn("[VBLK] extra-rootfs ESP map needs AHCI first");
         return -1;
     }
+
+    /* 首选：DATA 分区里的 ext4 文件（无 4GiB 限制） */
+    if (xrootfs_map_ext4_file() == 0) return 0;
+
     vol = fat32_part_probe(xrootfs_blk_rw, 0);
     if (blk->read(0, vol, 1, bpbsec) != 0) return -2;
     if (!fat32_part_bpb_ok(bpbsec)) return -3;
@@ -663,7 +710,7 @@ static int xrootfs_map_esp_file(void) {
           ((u32)bpbsec[38] << 16) | ((u32)bpbsec[39] << 24);
     root = (u32)bpbsec[44] | ((u32)bpbsec[45] << 8) |
            ((u32)bpbsec[46] << 16) | ((u32)bpbsec[47] << 24);
-    if (spc == 0 || spc > 64 || spf == 0 || root < 2) return -4;
+    if (spc == 0 || spc > 128 || spf == 0 || root < 2) return -4;
     g_xrootfs_spc = spc;
     g_xrootfs_spf = spf;
     g_xrootfs_fat_abs = (u32)vol + rsvd;
@@ -688,22 +735,34 @@ static int xrootfs_map_esp_file(void) {
     }
 
     nclus = (file_size + (spc * 512u) - 1u) / (spc * 512u);
-    if (nclus == 0 || nclus > XROOTFS_MAX_CLUSTERS) {
-        log_error("[VBLK] extra-rootfs cluster map too large");
-        log_hex64("[VBLK] nclus=", nclus);
-        panic_full("VVB-E10 EXTRA ROOTFS CLUSTER MAP TOO LARGE", "extra rootfs image cluster count exceeds the static map limit", 0);
-        return -7;
-    }
+    if (nclus == 0) return -7;
 
-    fc_cur = file_clus;
-    for (i = 0; i < nclus; i++) {
-        if (fc_cur < 2 || fc_cur >= 0x0FFFFFF8u) {
-            log_error("[VBLK] extra-rootfs FAT chain short");
-            panic_full("VVB-E11 EXTRA ROOTFS FAT CHAIN SHORT", "fat chain of the extra rootfs image ended before covering the file", 0);
-            return -8;
+    /* 走一遍 FAT 链，把连续簇压成 run。 */
+    {
+        u32 seen = 0, run_start = 0, run_lba = 0, run_len = 0, prev_lba = 0;
+        g_xrootfs_nruns = 0;
+        fc_cur = file_clus;
+        while (seen < nclus) {
+            u32 clus_lba;
+            if (fc_cur < 2 || fc_cur >= 0x0FFFFFF8u) {
+                log_error("[VBLK] extra-rootfs FAT chain short");
+                panic_full("VVB-E11 EXTRA ROOTFS FAT CHAIN SHORT", "fat chain of the extra rootfs image ended before covering the file", 0);
+                return -8;
+            }
+            clus_lba = (u32)vol + data_start + (fc_cur - 2u) * spc;
+            if (run_len == 0) {
+                run_start = seen; run_lba = clus_lba; run_len = 1;
+            } else if (clus_lba == prev_lba + spc) {
+                run_len++;
+            } else {
+                if (xrootfs_push_run(run_start, run_lba, run_len) != 0) return -7;
+                run_start = seen; run_lba = clus_lba; run_len = 1;
+            }
+            prev_lba = clus_lba;
+            seen++;
+            fc_cur = xrootfs_fat_next(fc_cur) & 0x0FFFFFFFu;
         }
-        g_xrootfs_clus_lba[i] = (u32)vol + data_start + (fc_cur - 2u) * spc;
-        fc_cur = xrootfs_fat_next(fc_cur) & 0x0FFFFFFFu;
+        if (run_len && xrootfs_push_run(run_start, run_lba, run_len) != 0) return -7;
     }
 
     g_xrootfs_nclus = nclus;
@@ -714,31 +773,115 @@ static int xrootfs_map_esp_file(void) {
     log_info("[VBLK] extra-rootfs-blk backend bound (esp file)");
     log_hex64("[VBLK] extra-rootfs size=", file_size);
     log_hex64("[VBLK] extra-rootfs nclus=", nclus);
-    log_hex64("[VBLK] extra-rootfs first_lba=", g_xrootfs_clus_lba[0]);
+    log_hex64("[VBLK] extra-rootfs runs=", g_xrootfs_nruns);
+    log_hex64("[VBLK] extra-rootfs first_lba=", g_xrootfs_runs[0].lba0);
+    return 0;
+}
+
+/* ext4 映射模式：卷扇区 → ext4 分区扇区，按 run 表查找。
+ * 卷内的块边界与 ext4 块边界无关，所以按扇区逐段推进到 run 结束。 */
+static int g_xrootfs_ext4;   /* 1 = 当前映射来自 ext4（DATA 分区） */
+
+static int xrootfs_map_ext4_file(void) {
+    const dkm_block_api *blk = block_get_api();
+    u64 capacity = 0;
+    if (!blk || blk->device_count() == 0) return -1;
+
+    /* DATA 分区是 GPT p2。用同样的分区探测拿到它的起始扇区。 */
+    u64 p2 = 0;
+    {
+        /* fat32_part_probe 返回 p1 起始。这里需要 p2，直接解析 GPT。 */
+        u8 hdr[512];
+        if (blk->read(0, 1, 1, hdr) != 0) return -2;
+        if (!(hdr[0] == 'E' && hdr[1] == 'F' && hdr[2] == 'I' && hdr[3] == ' ')) return -3;
+        u64 ent_lba = (u64)hdr[72] | ((u64)hdr[73] << 8) |
+                      ((u64)hdr[74] << 16) | ((u64)hdr[75] << 24) |
+                      ((u64)hdr[76] << 32) | ((u64)hdr[77] << 40) |
+                      ((u64)hdr[78] << 48) | ((u64)hdr[79] << 56);
+        u32 num = (u32)hdr[80] | ((u32)hdr[81] << 8) |
+                  ((u32)hdr[82] << 16) | ((u32)hdr[83] << 24);
+        if (num < 2) return -4;
+        u8 ents[512];
+        /* 条目是 128B，p2 在第二项：扇区 ent_lba 的前 256 字节 */
+        if (blk->read(0, ent_lba, 1, ents) != 0) return -5;
+        const u8 *e2 = ents + 128;
+        p2 = (u64)e2[32] | ((u64)e2[33] << 8) | ((u64)e2[34] << 16) |
+             ((u64)e2[35] << 24) | ((u64)e2[36] << 32) | ((u64)e2[37] << 40) |
+             ((u64)e2[38] << 48) | ((u64)e2[39] << 56);
+        if (p2 == 0) return -6;
+    }
+
+    int rc = ext4_blkmap_open(0, p2, "/persist/deshab-persist.img", &capacity);
+    if (rc != 0) {
+        /* 没有 ext4 持久卷是正常情况（首次构建/旧布局），退到 FAT32 路径 */
+        log_hex64("[VBLK] ext4 persist open rc=", (u64)(i64)rc);
+        return -7;
+    }
+    g_xrootfs_ext4 = 1;
+    g_xrootfs_data = 0;
+    g_xrootfs_nclus = 0;
+    g_xrootfs_nruns = 0;
+    g_xrootfs_spc = 0;
+    g_xrootfs_size = capacity;
+    g_xrootfs_capacity = capacity / 512u;
+    if (capacity % 512u) g_xrootfs_capacity++;
+    log_info("[VBLK] extra-rootfs-blk backend bound (ext4 DATA file)");
+    log_hex64("[VBLK] extra-rootfs size=", capacity);
+    log_hex64("[VBLK] extra-rootfs runs=", ext4_blkmap_run_count());
     return 0;
 }
 
 static int xrootfs_disk_xfer(u64 img_sector, u32 nsec, u8 *buf, int is_write) {
     const dkm_block_api *blk = block_get_api();
     u32 spc = g_xrootfs_spc;
+
+    /* ext4 映射：按扇区查 run，逐段落到分区扇区。
+     * lookup 返回 1 表示空洞/未初始化段——ext4 语义为读零，
+     * 写则无实际承载位置，明确报错而不是静默丢弃。 */
+    if (g_xrootfs_ext4) {
+        if (!blk || !buf || nsec == 0) return -1;
+        u32 blk_sectors = 8u;   /* ext4 块 4096B / 512B */
+        while (nsec) {
+            u64 part_sector = 0;
+            u64 file_blk = img_sector / blk_sectors;
+            u32 in_blk = (u32)(img_sector % blk_sectors);
+            int lk = ext4_blkmap_lookup(file_blk, &part_sector);
+            u32 chunk = blk_sectors - in_blk;
+            if (chunk > nsec) chunk = nsec;
+            if (lk == 1) {
+                /* 空洞：读按零，写无归宿 */
+                if (is_write) return -4;
+                for (u32 b = 0; b < chunk * 512u; b++) buf[b] = 0;
+            } else if (lk == 0) {
+                u64 disk = part_sector + in_blk;
+                if (is_write) {
+                    if (xrootfs_blk_ww(0, disk, chunk, buf) != 0) return -3;
+                } else {
+                    if (xrootfs_blk_rw(0, disk, chunk, buf) != 0) return -3;
+                }
+            } else {
+                return -2;
+            }
+            buf += chunk * 512u;
+            img_sector += chunk;
+            nsec -= chunk;
+        }
+        return 0;
+    }
+
     if (!blk || !buf || nsec == 0 || spc == 0) return -1;
     while (nsec) {
-        u32 ci, off, chunk, c;
+        u32 ci, off, chunk, avail;
         u64 disk;
+        const struct xrootfs_run *run;
         if (img_sector / spc >= g_xrootfs_nclus) return -2;
         ci = (u32)(img_sector / spc);
         off = (u32)(img_sector % spc);
-        disk = g_xrootfs_clus_lba[ci] + off;
-        chunk = spc - off;
-        if (chunk > nsec) chunk = nsec;
-        c = ci;
-        while (chunk < nsec && (c + 1u) < g_xrootfs_nclus &&
-               g_xrootfs_clus_lba[c + 1u] == g_xrootfs_clus_lba[c] + spc) {
-            u32 add = spc;
-            if (add > nsec - chunk) add = nsec - chunk;
-            chunk += add;
-            c++;
-        }
+        run = &g_xrootfs_runs[xrootfs_run_of(ci)];
+        disk = (u64)run->lba0 + (u64)(ci - run->clus0) * spc + off;
+        /* 本 run 内从当前位置起还有多少扇区 */
+        avail = (run->clus0 + run->nclus - ci) * spc - off;
+        chunk = avail < nsec ? avail : nsec;
         if (is_write) {
             if (xrootfs_blk_ww(0, disk, chunk, buf) != 0) return -3;
         } else {
@@ -930,6 +1073,7 @@ void virtio_extra_rootfs_blk_init(void) {
     void *img = linux_find_extra_rootfs_module(&size);
 
     g_xrootfs_nclus = 0;
+    g_xrootfs_nruns = 0;
     g_xrootfs_data = 0;
     g_xrootfs_size = 0;
     g_xrootfs_capacity = 0;

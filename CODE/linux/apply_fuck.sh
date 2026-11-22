@@ -3,7 +3,7 @@
 # images. ESP path is /system/deshab64/FUCK. Readback verified by md5.
 set -Eeuo pipefail
 ROOT=/mnt/d/Code/DEAICUP/Deshab
-SRC="$ROOT/SYSTEM/system/deshab64/FUCK"
+SRC="$ROOT/SYSTEM/ESP/system/deshab64/FUCK"
 [[ -f "$SRC" ]] || { echo "missing $SRC"; exit 2; }
 EXP=$(md5sum "$SRC" | cut -d' ' -f1)
 echo "source FUCK md5=$EXP"

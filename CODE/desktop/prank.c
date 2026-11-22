@@ -4,7 +4,6 @@
  * 制造"这系统是不是坏了"的错觉，随后若无其事地消失。
  *
  * 已实现整蛊（全部由 FUCK [prank] 段控制，见 build/configs/<variant>/FUCK）：
- *   PK_FUCK     — 屏幕压暗，特大 "FUCK" 跟着鼠标走，最后淡出（用户点名要的）
  *   PK_BSOD     — 假蓝屏（Win 风格 + 哭泣脸 + 伪造 Stop code）
  *   PK_INVERT   — 全屏反色闪烁
  *   PK_HANG     — 假"程序未响应"对话框（带等待点点动画）
@@ -30,7 +29,6 @@
 int g_prank_enabled   = 1;   /* 总开关，enable=0 关闭 */
 int g_prank_boot_demo = 5;   /* 进桌面后演示秒数，0=关 */
 int g_prank_interval  = 60;  /* 使用中自动整蛊间隔（秒），0=关 */
-int g_prank_fuck      = 1;   /* FUCK 跟随鼠标遮屏 */
 int g_prank_bsod      = 1;   /* 假蓝屏 */
 int g_prank_invert    = 1;   /* 反色闪屏 */
 int g_prank_hang      = 1;   /* 假"未响应"对话框 */
@@ -41,12 +39,11 @@ int g_prank_shutdown  = 1;   /* 假"系统即将关机"倒计时 */
 /* ============================================================
  *  运行时状态
  * ============================================================ */
-enum { PK_NONE = 0, PK_FUCK, PK_BSOD, PK_INVERT, PK_HANG,
+enum { PK_NONE = 0, PK_BSOD, PK_INVERT, PK_HANG,
        PK_GARBLE, PK_FLY, PK_SHUTDOWN };
 
-#define PK_KIND_MAX  7
+#define PK_KIND_MAX  6
 
-#define PK_MS_FUCK      2600u
 #define PK_MS_BSOD      3000u
 #define PK_MS_INVERT    1500u
 #define PK_MS_HANG      2600u
@@ -101,7 +98,6 @@ static int parse_int(const char *s, int len) {
 
 static u32 kind_ms(int k) {
     switch (k) {
-    case PK_FUCK:     return PK_MS_FUCK;
     case PK_BSOD:     return PK_MS_BSOD;
     case PK_INVERT:   return PK_MS_INVERT;
     case PK_HANG:     return PK_MS_HANG;
@@ -138,7 +134,6 @@ void prank_config_line(const char *line, int len) {
     if      (key_is(k, kl, "enable"))        g_prank_enabled   = val ? 1 : 0;
     else if (key_is(k, kl, "boot_demo_sec")) g_prank_boot_demo = val;
     else if (key_is(k, kl, "interval_sec"))  g_prank_interval  = val;
-    else if (key_is(k, kl, "fuck_cursor"))   g_prank_fuck      = val ? 1 : 0;
     else if (key_is(k, kl, "fake_bsod"))     g_prank_bsod      = val ? 1 : 0;
     else if (key_is(k, kl, "invert_flash"))  g_prank_invert    = val ? 1 : 0;
     else if (key_is(k, kl, "fake_hang"))     g_prank_hang      = val ? 1 : 0;
@@ -154,7 +149,6 @@ void prank_config_line(const char *line, int len) {
 /* 收集当前启用的整蛊种类（写入 out，返回个数，≤ PK_KIND_MAX）。 */
 static int collect_kinds(int *out) {
     int n = 0;
-    if (g_prank_fuck)     out[n++] = PK_FUCK;
     if (g_prank_bsod)     out[n++] = PK_BSOD;
     if (g_prank_invert)   out[n++] = PK_INVERT;
     if (g_prank_hang)     out[n++] = PK_HANG;
@@ -331,25 +325,6 @@ static void draw_scale_text(du_context *ctx, const char *s, int cx, int cy,
  *  各整蛊的绘制
  * ============================================================ */
 
-/* PK_FUCK — 屏幕压暗 + 特大 "FUCK" 跟着鼠标 + 淡出 */
-static void draw_fuck(du_context *ctx, int pct) {
-    int a;
-    if (pct < 15)      a = pct * 170 / 15;         /* 淡入压暗 */
-    else if (pct > 85) a = (100 - pct) * 170 / 15; /* 淡出解除 */
-    else               a = 170;
-    if (a < 0) a = 0;
-    blend_dark(ctx, (u32)a);
-
-    int alpha = 255;
-    if (pct < 10)      alpha = pct * 255 / 10;
-    else if (pct > 85) alpha = (100 - pct) * 255 / 15;
-    if (alpha < 0) alpha = 0;
-
-    /* 阴影 + 主体：中心跟随鼠标 */
-    draw_scale_text(ctx, "FUCK", g_mouse_x + 7, g_mouse_y + 7, 8, 0xFF000000u, alpha / 2);
-    draw_scale_text(ctx, "FUCK", g_mouse_x, g_mouse_y, 8, 0xFFFF1744u, alpha);
-}
-
 /* PK_BSOD — 假蓝屏 */
 static void draw_bsod(du_context *ctx, int pct) {
     int W = (int)ctx->width, H = (int)ctx->height;
@@ -512,7 +487,6 @@ void prank_draw(du_context *ctx) {
     if (pct > 100) pct = 100;
 
     switch (s_kind) {
-    case PK_FUCK:     draw_fuck(ctx, pct);     break;
     case PK_BSOD:     draw_bsod(ctx, pct);     break;
     case PK_INVERT:   draw_invert(ctx);        break;
     case PK_HANG:     draw_hang(ctx, pct);     break;

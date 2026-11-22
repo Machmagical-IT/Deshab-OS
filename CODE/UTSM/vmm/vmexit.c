@@ -9,8 +9,10 @@
 #include <utsm/dma.h>
 #include <utsm/linux_loader.h>
 #include <utsm/linux_xsave.h>
+#include <utsm/windows_guest.h>
 #include <utsm/virtio_mmio.h>
 #include <utsm/instr.h>
+#include <utsm/lapic_timer.h>
 #include "../arch/x86_64/limine.h"
 
 /* VM-Exit 处理器：从 VMCS 读取 exit reason 与 guest 状态，分发处理。
@@ -68,16 +70,104 @@ static void log_exit_diagnostics(u64 reason, u64 qualification, u64 rip, u64 len
  * - Linux guest idle：推进 RIP 并留在 guest，等 PIT/virtio IRQ。
  *   daemon PARK 走 UTSM_HCALL_PARK，不再用 HLT（idle=poll 会在
  *   cpu_idle_poll 里把 current 读成 NULL 并 panic）。 */
+static int guest_fetch(u64 gva, u8 *buf, u64 len);
+
 static int handle_hlt(u64 rip, u64 instr_len, int *out_resume) {
     *out_resume = 0;   /* 三种情况默认 exit-to-host */
-    if (g_linux_guest_active) {
+    if (vm_machine_profile_active(VM_PROFILE_LINUX)) {
         vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
         *out_resume = 1;
         return 0;
-    } else if (g_xj380_guest_active) {
+    } else if (vm_machine_profile_active(VM_PROFILE_XJ380)) {
         /* OpenXJ380 guest: 推进 RIP 并立即继续执行（不 park 不 terminate） */
         vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
         *out_resume = 1;
+    } else if (vm_machine_profile_active(VM_PROFILE_ZT5)) {
+        /* ZT5 guest: idle HLT 推进 RIP 并继续；PIT tick 由 resume 前注入。 */
+        vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
+        *out_resume = 1;
+    } else if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+        static int logged;
+        if (logged < 4) {
+            logged++;
+            u8 insn[8];
+            log_hex64("[WIN] hlt rip=", rip);
+            log_hex64("[WIN] hlt rflags=", vmx_vmcs_read(VMCS_GUEST_RFLAGS));
+            {
+                u64 rsp = vmx_vmcs_read(VMCS_GUEST_RSP);
+                u64 hhdm = g_hhdm_request.response ?
+                           g_hhdm_request.response->offset : 0;
+                u64 hpa = ept_gpa_to_hpa(rsp);
+                u64 caller = 0;
+                if (hpa && hhdm && logged == 1) {
+                    caller = *(u64 *)(hhdm + hpa);
+                    log_hex64("[WIN] hlt caller=", caller);
+                    if ((rsp & 0xFFF) <= 0xFE8) {
+                        log_hex64("[WIN] hlt ret2=", *(u64 *)(hhdm + hpa + 8));
+                        log_hex64("[WIN] hlt ret3=", *(u64 *)(hhdm + hpa + 16));
+                    }
+                    u64 fh = ept_gpa_to_hpa(0x3FF69000ULL);
+                    if (fh) {
+                        u8 *f = (u8 *)(hhdm + fh);
+                        u64 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                        for (int i = 0; i < 8; i++) {
+                            w0 |= (u64)f[i] << (i * 8);
+                            w1 |= (u64)f[8 + i] << (i * 8);
+                            w2 |= (u64)f[16 + i] << (i * 8);
+                            w3 |= (u64)f[24 + i] << (i * 8);
+                        }
+                        log_hex64("[WIN] fn0=", w0);
+                        log_hex64("[WIN] fn8=", w1);
+                        log_hex64("[WIN] fn16=", w2);
+                        log_hex64("[WIN] fn24=", w3);
+                    }
+                }
+                if (caller > 8 && logged == 1) {
+                    u64 ch = ept_gpa_to_hpa(caller - 8);
+                    if (ch && hhdm) {
+                        u8 *b = (u8 *)(hhdm + ch);
+                        u64 w = 0;
+                        for (int i = 0; i < 8; i++) w |= (u64)b[i] << (i * 8);
+                        log_hex64("[WIN] hlt site=", w);
+                    }
+                }
+            }
+            if (guest_fetch(rip, insn, sizeof(insn)) == 0) {
+                u64 word = 0;
+                for (int i = 0; i < 8; i++) word |= (u64)insn[i] << (i * 8);
+                log_hex64("[WIN] hlt bytes=", word);
+            }
+        }
+        {
+            u64 rflags = vmx_vmcs_read(VMCS_GUEST_RFLAGS);
+            static u64 late_hlt;
+            u64 apic = windows_platform_apic_base_read();
+            u64 tag = rip ^ (apic & 0x100);
+            if (logged >= 4 && late_hlt != tag) {
+                late_hlt = tag;
+                log_hex64("[WIN] hlt late rip=", rip);
+                log_hex64("[WIN] hlt late rflags=", rflags);
+                log_hex64("[WIN] hlt late apic=", apic);
+                u64 hhdm = g_hhdm_request.response ?
+                           g_hhdm_request.response->offset : 0;
+                u64 ih = ept_gpa_to_hpa(rip);
+                if (ih && hhdm) {
+                    u8 *b = (u8 *)(hhdm + ih);
+                    u64 w = 0;
+                    for (int i = 0; i < 8; i++) w |= (u64)b[i] << (i * 8);
+                    log_hex64("[WIN] hlt late bytes=", w);
+                }
+                u64 rsp = vmx_vmcs_read(VMCS_GUEST_RSP);
+                u64 sh = ept_gpa_to_hpa(rsp);
+                if (sh && hhdm)
+                    log_hex64("[WIN] hlt late ret=", *(u64 *)(hhdm + sh));
+            }
+            if (rflags & 0x200)
+                windows_platform_arm_irq();
+        }
+        vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
+        *out_resume = 1;
+        windows_vcpu_on_resume(1);
     } else {
         /* self-test guest: 终止 */
         log_info("[VMEXIT] HLT - guest halted");
@@ -138,6 +228,11 @@ static u32 g_irq_inject_logs;
 #define GUEST_INTR_STI   (1ULL << 0)
 #define GUEST_INTR_MOVSS (1ULL << 1)
 
+void vmx_guest_irq_reset(void) {
+    g_pending_head = 0;
+    g_pending_tail = 0;
+}
+
 void vmx_guest_queue_irq(u32 vector) {
     /* 合并连续相同向量（PIT tick 合并 / COM1 RX 去重） */
     if (g_pending_tail != g_pending_head) {
@@ -150,7 +245,10 @@ void vmx_guest_queue_irq(u32 vector) {
     g_pending_tail = next;
 }
 
+int g_linux_no_irq_inject;   /* 临时诊断：file 操作期间禁止向 guest 注入中断 */
+
 static void maybe_inject_irq(void) {
+    if (g_linux_no_irq_inject) return;
     if (g_pending_head == g_pending_tail) return;
 
     u8 vec = g_pending_vectors[g_pending_head];
@@ -177,7 +275,12 @@ static void maybe_inject_irq(void) {
     /* External IRQ may be injected while virtual-NMI blocking is set.
      * Only STI-shadow and MOV-SS-shadow must delay delivery. Requiring
      * interruptibility==0 froze PIT after park: nanosleep never woke. */
+    if (vm_machine_profile_active(VM_PROFILE_WINDOWS) &&
+        !windows_platform_irq_allowed(vec))
+        return;
     if ((rflags & 0x200) && !(intr_st & (GUEST_INTR_STI | GUEST_INTR_MOVSS))) {
+        if (vm_machine_profile_active(VM_PROFILE_WINDOWS))
+            windows_platform_irq_accepted(vec);
         vmx_vmcs_write(VMCS_VM_ENTRY_INTERRUPT_INFO,
                        VM_ENTRY_INTR_INFO_VALID |
                        (VM_ENTRY_INTR_TYPE_HW_IRQ << 8) | vec);
@@ -221,6 +324,8 @@ static int g_rx_head, g_rx_tail;
 static u8 g_com1_dll, g_com1_dlm, g_com1_ier, g_com1_fcr;
 static u8 g_com1_lcr, g_com1_mcr, g_com1_scr;
 
+static int g_win_trace_arm;
+
 static u64 com1_io(u32 port, int is_in, u64 value) {
     u32 reg = port - 0x3F8;
     int dlab = (g_com1_lcr & 0x80) != 0;
@@ -254,6 +359,8 @@ static u64 com1_io(u32 port, int is_in, u64 value) {
             /* Direct host UART write. serial_putc() waits on the same
              * COM1 LSR and can stall guest printk under file-backed serial. */
             char c = (char)(value & 0xFF);
+            if (c == 'M' && windows_platform_disk_reads() >= 15)
+                g_win_trace_arm = 1;
             if (c == '\n') {
                 for (int i = 0; i < 10000 && !(inb(0x3F8 + 5) & 0x20); i++) {}
                 outb(0x3F8, '\r');
@@ -401,6 +508,13 @@ static u64 misc_io(u32 port, int is_in, u64 value, int *out_terminate) {
         return is_in ? 0xFF : 0;
     }
 
+    /* ZT5 guest: ATA 状态端口返回 ERR(0x01)，让 50M 次轮询立即失败退出。
+     * 否则 status=0（!BSY 但无 DRQ）会让 ata_wait_data 空转 5000 万次 IO exit。 */
+    if (vm_machine_profile_active(VM_PROFILE_ZT5) &&
+        (port == 0x1F7 || port == 0x177)) {
+        return is_in ? 0x01 : 0;
+    }
+
     /* 其余端口（0x80 delay、0x61 NMI、0x92 A20、0xB2 APM、0xF0-0xFF FPU
      * error、0xED delay、ACPI 等）：读 0，写吞掉 */
     return is_in ? 0 : 0;
@@ -430,10 +544,105 @@ static int handle_io(u64 qualification, u64 rip, u64 instr_len, int *out_resume)
         else value &= 0xFFFFFFFFULL;
     }
 
-    u64 result;
-    if (port >= 0x3F8 && port <= 0x3FF) {
+    u64 result = 0;
+    int handled = 0;
+    if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+        static u64 last_rip;
+        static u32 same;
+        static u32 stuck_logs;
+        static u32 io_logs;
+        if (io_logs < 24) {
+            io_logs++;
+            log_hex64("[WIN] io n=", io_logs);
+            log_hex64("[WIN] io port=", port);
+            log_hex64("[WIN] io rip=", rip);
+            log_hex64("[WIN] io in=", (u64)is_in);
+            log_hex64("[WIN] io rax=", g_guest_regs.rax);
+            log_hex64("[WIN] io rdx=", g_guest_regs.rdx);
+        }
+        if (rip == last_rip) same++;
+        else { last_rip = rip; same = 0; }
+        if (same == 64 && stuck_logs < 8) {
+            stuck_logs++;
+            log_hex64("[WIN] io spin rip=", rip);
+            log_hex64("[WIN] io spin port=", port);
+            log_hex64("[WIN] io spin in=", (u64)is_in);
+            log_hex64("[WIN] io spin rax=", g_guest_regs.rax);
+            log_hex64("[WIN] io spin rdx=", g_guest_regs.rdx);
+            log_hex64("[WIN] io spin qual=", qualification);
+            log_hex64("[WIN] io spin cs=", vmx_vmcs_read(VMCS_GUEST_CS_ACCESS));
+            {
+                u64 rsp = vmx_vmcs_read(VMCS_GUEST_RSP);
+                u64 sp_hpa = ept_gpa_to_hpa(rsp & ~0xFFFULL);
+                u64 sp_hhdm = g_hhdm_request.response ?
+                              g_hhdm_request.response->offset : 0;
+                log_hex64("[WIN] io spin rsp=", rsp);
+                if (sp_hpa && sp_hhdm && (rsp & 0xFFF) <= 0xFF8) {
+                    u64 slot = *(u64 *)(sp_hhdm + sp_hpa + (rsp & 0xFFF));
+                    log_hex64("[WIN] io spin ret=", slot);
+                    u64 caller = (u32)slot;
+                    u64 cpage = caller & ~0xFFFULL;
+                    u64 chpa = ept_gpa_to_hpa(cpage);
+                    if (chpa && (caller & 0xFFF) >= 16) {
+                        u8 *cb = (u8 *)(sp_hhdm + chpa + (caller & 0xFFF) - 16);
+                        u64 word = 0;
+                        for (int i = 0; i < 8; i++) word |= (u64)cb[i] << (i * 8);
+                        log_hex64("[WIN] io caller-16=", word);
+                        word = 0;
+                        for (int i = 0; i < 8; i++) word |= (u64)cb[8 + i] << (i * 8);
+                        log_hex64("[WIN] io caller-8=", word);
+                        if ((caller & 0xFFF) <= 0xFE0) {
+                            u8 *next = (u8 *)(sp_hhdm + chpa + (caller & 0xFFF));
+                            word = 0;
+                            for (int i = 0; i < 8; i++) word |= (u64)next[i] << (i * 8);
+                            log_hex64("[WIN] io caller+0=", word);
+                            word = 0;
+                            for (int i = 0; i < 8; i++) word |= (u64)next[8 + i] << (i * 8);
+                            log_hex64("[WIN] io caller+8=", word);
+                            word = 0;
+                            for (int i = 0; i < 8; i++) word |= (u64)next[16 + i] << (i * 8);
+                            log_hex64("[WIN] io caller+16=", word);
+                        }
+                    }
+                }
+            }
+            u64 page = rip & ~0xFFFULL;
+            u64 hpa = ept_gpa_to_hpa(page);
+            u64 hhdm = g_hhdm_request.response ?
+                       g_hhdm_request.response->offset : 0;
+            if (hpa && hhdm && (rip & 0xFFF) <= 0xFF0) {
+                u8 *bytes = (u8 *)(hhdm + hpa + (rip & 0xFFF));
+                u64 word = 0;
+                for (int i = 0; i < 8; i++) word |= (u64)bytes[i] << (i * 8);
+                log_hex64("[WIN] io spin bytes=", word);
+            }
+        }
+        int string_io = ((qualification >> 4) & 1) && port == 0x511;
+        if (string_io) {
+            u64 rflags = vmx_vmcs_read(VMCS_GUEST_RFLAGS);
+            u64 count = ((qualification >> 5) & 1) ? g_guest_regs.rcx : 1;
+            u64 linear = is_in ? g_guest_regs.rdi : g_guest_regs.rsi;
+            if (windows_platform_string_io((u16)port, is_in, size, count,
+                                           linear, (rflags >> 10) & 1) != 0) {
+                panic_full("WIN-E39 FW CFG STRING IO FAILED",
+                           "rep ins/outs could not be completed for OVMF fw_cfg", 0);
+                *out_resume = 0;
+                return -1;
+            }
+            u64 step = count * size;
+            if ((rflags >> 10) & 1) step = ~step + 1;
+            if (is_in) g_guest_regs.rdi += step;
+            else g_guest_regs.rsi += step;
+            if ((qualification >> 5) & 1) g_guest_regs.rcx = 0;
+            handled = 1;
+        } else {
+            handled = windows_platform_io((u16)port, is_in, size, value,
+                                          &result, &terminate);
+        }
+    }
+    if (!handled && port >= 0x3F8 && port <= 0x3FF) {
         result = com1_io(port, is_in, value);
-    } else {
+    } else if (!handled) {
         result = misc_io(port, is_in, value, &terminate);
     }
 
@@ -489,9 +698,27 @@ static int handle_cpuid(u64 rip, u64 instr_len, int *out_resume) {
         oc &= ~(1u << 12);  /* FMA: requires AVX */
         oc &= ~(1u << 29);  /* F16C */
         oc &= ~(1u << 31);  /* hypervisor present */
+        if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+            struct vm_vcpu *vcpu = vm_vcpu_active();
+            u32 apic = vcpu ? vcpu->apic_id : 0;
+            ob = (ob & ~(0xFFu << 16)) | (WINDOWS_VCPU_COUNT << 16);
+            ob = (ob & 0x00FFFFFFu) | (apic << 24);
+            oc &= ~(1u << 21); /* force xAPIC MMIO; x2APIC MSRs are not exposed */
+            od |= 1u << 28;  /* HTT: more than one logical processor */
+        }
     }
     linux_xsave_adjust_cpuid(a, c, &oa, &ob, &oc, &od,
                              vmx_vmcs_read(VMCS_GUEST_CR4));
+    if (vm_machine_profile_active(VM_PROFILE_WINDOWS) && a == 0x0B) {
+        /* The AP trampoline treats a non-zero leaf-0xB EBX as x2APIC and
+         * then looks the host's x2APIC id up in the MADT. Report no
+         * topology level so it uses the per-vCPU leaf-1 id instead. */
+        struct vm_vcpu *vcpu = vm_vcpu_active();
+        oa = 0;
+        ob = 0;
+        oc = c;
+        od = vcpu ? vcpu->apic_id : 0;
+    }
     if (a == 7 && c != 0) {
         /* Hide CET_SSS and other 7.1+ bits; Linux 6.6 probes subleaf 1. */
         oa = 0;
@@ -570,7 +797,11 @@ static void pit_tick_update(void) {
     int n = 0;
     while (g_pit_accum >= g_pit_period_tsc && n < 8) {
         g_pit_accum -= g_pit_period_tsc;
-        vmx_guest_queue_irq(g_pic_vec_base);  /* PIT = IRQ0 */
+        /* ZT5 调度 tick 挂在 APIC_TIMER_VECTOR=48（main.c apic_timer_handler
+         * → scheduler_tick）；guest 内 APIC 被拦截，由 host 用 PIT 周期合成
+         * vector 48。Linux noapic 继续用 PIC 基址（0x30）。 */
+        vmx_guest_queue_irq(vm_machine_profile_active(VM_PROFILE_ZT5) ?
+                            48 : g_pic_vec_base);
         n++;
     }
     if (g_pit_accum >= g_pit_period_tsc) g_pit_accum = 0;  /* 防积压 */
@@ -642,7 +873,27 @@ static void write_cr2_local(u64 v) {
 }
 
 static void vmexit_before_resume(void) {
-    if (!g_linux_guest_active) return;
+    if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+        if (g_pf_need_cr2) {
+            write_cr2_local(g_pf_cr2);
+            g_pf_need_cr2 = 0;
+        }
+        vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum());
+        windows_platform_tick();
+        if (windows_platform_irq_armed())
+            maybe_inject_irq();
+        windows_vcpu_on_resume(0);
+        return;
+    }
+    if (vm_machine_profile_active(VM_PROFILE_ZT5)) {
+        /* ZT5: 只做 preemption timer / PIT tick；串口由 guest 轮询 COM1，
+         * 不注入 IRQ4（ZT5 的 IDT 没有对应串口中断处理）。 */
+        vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum());
+        pit_tick_update();
+        maybe_inject_irq();
+        return;
+    }
+    if (!vm_machine_profile_active(VM_PROFILE_LINUX)) return;
     if (g_pf_need_cr2) {
         write_cr2_local(g_pf_cr2);
         g_pf_need_cr2 = 0;
@@ -652,8 +903,10 @@ static void vmexit_before_resume(void) {
     linux_cet_force_guest_off();
     vmx_vmcs_write(VMCS_GUEST_PREEMPTION_TIMER, vmx_preemption_quantum());
     poll_host_serial_to_guest();
-    virtio_net_poll();
-    virtio_input_poll();   /* VSCode Phase 2: drain pending kbd/mouse events */
+    if (!g_linux_no_irq_inject) {
+        virtio_net_poll();
+        virtio_input_poll();   /* VSCode Phase 2: drain pending kbd/mouse events */
+    }
     pit_tick_update();
     maybe_inject_irq();
 }
@@ -1123,6 +1376,34 @@ static int handle_virtio_mmio_access(u64 gpa, u64 rip, int *out_resume) {
     return 0;
 }
 
+static int handle_windows_mmio_access(u64 gpa, u64 rip, int *out_resume) {
+    int is_write, width, reg;
+    u64 insn_len = decode_mmio_insn(rip, &is_write, &width, &reg);
+    if (insn_len == 0) {
+        panic_full("WIN-E18 CANNOT DECODE PLATFORM MMIO",
+                   "instruction decode failed for Windows platform MMIO", 0);
+        *out_resume = 0;
+        return -1;
+    }
+    if (is_write) {
+        u64 raw = *gpr_ptr(reg);
+        u64 value = width == 1 ? raw & 0xFF :
+                    width == 2 ? raw & 0xFFFF :
+                    width == 4 ? raw & 0xFFFFFFFFULL : raw;
+        windows_platform_mmio_write(gpa, value, (u32)width);
+    } else {
+        u64 value = windows_platform_mmio_read(gpa, (u32)width);
+        u64 *dst = gpr_ptr(reg);
+        if (width == 1) *dst = (*dst & ~0xFFULL) | (value & 0xFF);
+        else if (width == 2) *dst = (*dst & ~0xFFFFULL) | (value & 0xFFFF);
+        else if (width == 4) *dst = value & 0xFFFFFFFFULL;
+        else *dst = value;
+    }
+    vmx_vmcs_write(VMCS_GUEST_RIP, rip + insn_len);
+    *out_resume = 1;
+    return 0;
+}
+
 /* 处理 EPT violation：区分 guest RAM（按需分配）与 virtio-mmio（设备模拟）。
  *
  * exit qualification bits:
@@ -1132,6 +1413,11 @@ static int handle_virtio_mmio_access(u64 gpa, u64 rip, int *out_resume) {
 static int handle_ept_violation(u64 qualification, u64 rip, int *out_resume) {
     (void)qualification;  /* virtio-mmio 判定只看 GPA，不看访问类型 */
     u64 gpa = vmx_vmcs_read(VMCS_GUEST_PHYSICAL_ADDR);
+
+    if (vm_machine_profile_active(VM_PROFILE_WINDOWS) &&
+        windows_platform_is_mmio(gpa)) {
+        return handle_windows_mmio_access(gpa, rip, out_resume);
+    }
 
     /* virtio-mmio 设备区：路由到设备模拟，绝不映射真实内存 */
     if (IS_VIRTIO_MMIO_GPA(gpa)) {
@@ -1211,6 +1497,19 @@ static int handle_cr_access(u64 qualification, u64 rip, u64 instr_len,
     u32 type = (u32)((qualification >> 4) & 3);
     u32 reg = (u32)((qualification >> 8) & 0xF);
     static u32 logs;
+    static u32 probe;
+
+    /* DIAG: log the first N CR accesses verbatim so the real intercept cause
+     * is visible (cr / type / reg / RIP / qualification). */
+    if (probe < 16) {
+        log_hex64("[CRACC] qual=", qualification);
+        log_hex64("[CRACC] cr=", cr);
+        log_hex64("[CRACC] type=", type);
+        log_hex64("[CRACC] reg=", reg);
+        log_hex64("[CRACC] rip=", rip);
+        log_hex64("[CRACC] ilen=", instr_len);
+        probe++;
+    }
 
     if (cr == 3 && type == 0) {
         u64 val = read_gpr_full((int)reg);
@@ -1221,6 +1520,83 @@ static int handle_cr_access(u64 qualification, u64 rip, u64 instr_len,
         }
     } else if (cr == 3 && type == 1) {
         write_gpr_full((int)reg, guest_current_cr3());
+    } else if (cr == 0 && type == 0) {
+        /* MOV to CR0 intercepted by the fixed-bit host mask (PG/NE/PE).
+         * Emulate it: VMCS guest CR0 = (value | FIXED0) & FIXED1, and the read
+         * shadow mirrors what the guest wrote so a MOV FROM CR0 returns it.
+         * Without the shadow update the guest read back the OLD value, its
+         * kernel (native_write_cr0) concluded the write failed and retried
+         * forever — 8k+ exits at one RIP during VSCode extraction. */
+        u64 val = read_gpr_full((int)reg);
+        u64 fixed0 = vmx_read_msr(IA32_VMX_CR0_FIXED0) & 0xFFFFFFFFULL;
+        u64 fixed1 = vmx_read_msr(IA32_VMX_CR0_FIXED1) & 0xFFFFFFFFULL;
+        if (vm_machine_profile_active(VM_PROFILE_WINDOWS))
+            fixed0 &= ~(CR0_PE | CR0_PG);
+        u64 new_cr0 = (val | fixed0) & fixed1;
+        if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+            u64 efer = vmx_vmcs_read(VMCS_GUEST_IA32_EFER);
+            u64 cr4 = vmx_vmcs_read(VMCS_GUEST_CR4);
+            u64 entry = vmx_vmcs_read(VMCS_VM_ENTRY_CONTROLS);
+            if ((new_cr0 & CR0_PG) && (efer & EFER_LME)) {
+                if (!(cr4 & CR4_PAE)) {
+                    panic_full("WIN-E37 LONG MODE WITHOUT PAE",
+                               "Windows guest enabled paging with EFER.LME but CR4.PAE clear", 0);
+                    *out_resume = 0;
+                    return -1;
+                }
+                efer |= EFER_LMA;
+                entry |= VM_ENTRY_IA32E_MODE_GUEST;
+            } else {
+                efer &= ~EFER_LMA;
+                entry &= ~VM_ENTRY_IA32E_MODE_GUEST;
+            }
+            vmx_vmcs_write(VMCS_GUEST_IA32_EFER, efer);
+            vmx_vmcs_write(VMCS_VM_ENTRY_CONTROLS, entry);
+        }
+        vmx_vmcs_write(VMCS_GUEST_CR0, new_cr0);
+        vmx_vmcs_write(VMCS_CR0_READ_SHADOW, val);
+        if (logs < 12) {
+            log_hex64("[VMEXIT] MOV CR0=", val);
+            log_hex64("[VMEXIT]  ->vmcs=", new_cr0);
+            if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+                log_hex64("[WIN] exc bitmap=",
+                          vmx_vmcs_read(VMCS_EXCEPTION_BITMAP));
+                u64 hhdm = g_hhdm_request.response ?
+                           g_hhdm_request.response->offset : 0;
+                u64 hpa = ept_gpa_to_hpa(0x3FD53066ULL);
+                if (hpa && hhdm) {
+                    u8 *b = (u8 *)(hhdm + hpa);
+                    u64 w = 0;
+                    for (int i = 0; i < 8; i++) w |= (u64)b[i] << (i * 8);
+                    log_hex64("[WIN] longmode=", w);
+                }
+            }
+            logs++;
+        }
+    } else if (cr == 8 &&
+               vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+        /* CR8 is the LAPIC TPR. Injecting while it is raised runs a
+         * timer handler inside a DXE critical section and poisons lists. */
+        if (type == 0) {
+            u64 val = read_gpr_full((int)reg) & 0xF;
+            windows_platform_mmio_write(WINDOWS_LAPIC_BASE + 0x80,
+                                        val << 4, 4);
+        } else if (type == 1) {
+            u64 tpr = windows_platform_mmio_read(WINDOWS_LAPIC_BASE + 0x80, 4);
+            write_gpr_full((int)reg, tpr >> 4);
+        }
+    } else if (cr == 4 && type == 0) {
+        u64 val = read_gpr_full((int)reg);
+        u64 fixed0 = vmx_read_msr(IA32_VMX_CR4_FIXED0) & 0xFFFFFFFFULL;
+        u64 fixed1 = vmx_read_msr(IA32_VMX_CR4_FIXED1) & 0xFFFFFFFFULL;
+        u64 new_cr4 = (val | fixed0) & fixed1;
+        vmx_vmcs_write(VMCS_GUEST_CR4, new_cr4);
+        vmx_vmcs_write(VMCS_CR4_READ_SHADOW, val);
+        if (logs < 12) {
+            log_hex64("[VMEXIT] MOV CR4=", val);
+            log_hex64("[VMEXIT]  ->vmcs=", new_cr4);
+            logs++;
+        }
     }
     vmx_vmcs_write(VMCS_GUEST_RIP, rip + (instr_len ? instr_len : 3));
     *out_resume = 1;
@@ -1266,7 +1642,8 @@ static int handle_exception(u64 qualification, u64 rip, int *out_resume) {
             log_guest_page_walk(qualification);
         }
     }
-    if (g_linux_guest_active && user_rip && g_user_exc_logs < 16) {
+    if (vm_machine_profile_active(VM_PROFILE_LINUX) &&
+        user_rip && g_user_exc_logs < 16) {
         u8 insn[8];
         g_user_exc_logs++;
         log_hex64("[VMEXIT] user-exc vec=", intr_info & 0xFF);
@@ -1331,7 +1708,7 @@ static int handle_exception(u64 qualification, u64 rip, int *out_resume) {
         panic_full("VMX-E15 GUEST DOUBLE FAULT", "guest took a double fault which will not be reinjected", 0);
         return 0;
     }
-    if (g_linux_guest_active) {
+    if (vm_machine_profile_active(VM_PROFILE_LINUX)) {
         u32 vec = (u32)(intr_info & 0xFF);
         u32 err = 0;
         u64 ilen = vmx_vmcs_read(VMCS_INSTRUCTION_LENGTH);
@@ -1388,7 +1765,170 @@ static int handle_exception(u64 qualification, u64 rip, int *out_resume) {
             }
         }
     }
-    if (g_linux_guest_active) {
+    if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+        struct vm_vcpu *exc_vcpu = vm_vcpu_active();
+        static u32 exc_logs;
+        if (exc_logs < 8) {
+            exc_logs++;
+            log_hex64("[WIN] exc vcpu=", exc_vcpu ? exc_vcpu->id : 0);
+            log_hex64("[WIN] exc vec=", intr_info & 0xFF);
+            log_hex64("[WIN] exc rip=", rip);
+            if ((intr_info & 0xFF) == 13) {
+                u64 rsp = vmx_vmcs_read(VMCS_GUEST_RSP);
+                u64 hhdm = g_hhdm_request.response ?
+                           g_hhdm_request.response->offset : 0;
+                u64 hpa = ept_gpa_to_hpa(rsp & ~0xFFFULL);
+                log_hex64("[WIN] gp rsp=", rsp);
+                log_hex64("[WIN] gp rbx=", g_guest_regs.rbx);
+                log_hex64("[WIN] gp rcx=", g_guest_regs.rcx);
+                {
+                    u64 cr3 = vmx_vmcs_read(VMCS_GUEST_CR3) & ~0xFFFULL;
+                    int shifts[4] = { 39, 30, 21, 12 };
+                    u64 table = cr3;
+                    u64 gva0 = 0;
+                    log_hex64("[WIN] gp cr3=", cr3);
+                    for (int level = 0; level < 4 && hhdm; level++) {
+                        u64 th = ept_gpa_to_hpa(table);
+                        if (!th) {
+                            log_hex64("[WIN] gp walk miss=", table);
+                            break;
+                        }
+                        u64 ent = ((u64 *)(hhdm + th))[(0ULL >> shifts[level]) & 0x1FF];
+                        if (level == 0) log_hex64("[WIN] gp pml4e=", ent);
+                        if (!(ent & 1)) break;
+                        if (level < 3 && (ent & (1ULL << 7))) {
+                            u64 mask = (1ULL << shifts[level]) - 1;
+                            gva0 = (ent & ~0xFFFULL & ~mask);
+                            break;
+                        }
+                        table = ent & ~0xFFFULL;
+                        if (level == 3) gva0 = table;
+                    }
+                    log_hex64("[WIN] gp va0gpa=", gva0);
+                    if (gva0) {
+                        u64 zh = ept_gpa_to_hpa(gva0);
+                        if (zh) {
+                            log_hex64("[WIN] gp va0=", *(u64 *)(hhdm + zh));
+                            log_hex64("[WIN] gp va48=", *(u64 *)(hhdm + zh + 0x48));
+                        }
+                    }
+                }
+                if (hpa && hhdm && (rsp & 0xFFF) <= 0xFE8) {
+                    u64 ret = *(u64 *)(hhdm + hpa + (rsp & 0xFFF));
+                    log_hex64("[WIN] gp stk0=", ret);
+                    log_hex64("[WIN] gp stk1=",
+                              *(u64 *)(hhdm + hpa + (rsp & 0xFFF) + 8));
+                    if (ret > 32) {
+                        u64 ch = ept_gpa_to_hpa(ret & ~0xFFFULL);
+                        if (ch && (ret & 0xFFF) >= 32) {
+                            u8 *cb = (u8 *)(hhdm + ch + (ret & 0xFFF) - 32);
+                            u64 w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                            for (int i = 0; i < 8; i++) {
+                                w0 |= (u64)cb[i] << (i * 8);
+                                w1 |= (u64)cb[8 + i] << (i * 8);
+                                w2 |= (u64)cb[16 + i] << (i * 8);
+                                w3 |= (u64)cb[24 + i] << (i * 8);
+                            }
+                            log_hex64("[WIN] gp call-32=", w0);
+                            log_hex64("[WIN] gp call-24=", w1);
+                            log_hex64("[WIN] gp call-16=", w2);
+                            log_hex64("[WIN] gp call-8=", w3);
+                        }
+                    }
+                }
+            }
+        }
+        if ((intr_info & 0xFF) == 13) {
+            u64 gp_rip = vmx_vmcs_read(VMCS_GUEST_RIP);
+            u64 gp_cs = vmx_vmcs_read(VMCS_GUEST_CS_ACCESS);
+            /* A 64-bit call into the real-mode startup page faults on
+             * mov ss. Return EFI_UNSUPPORTED to the caller instead of
+             * letting the AP die in the firmware exception loop. */
+            if (gp_rip < 0x100000 && (gp_cs & 0x2000)) {
+                u64 gp_rsp = vmx_vmcs_read(VMCS_GUEST_RSP);
+                u64 gp_hhdm = g_hhdm_request.response ?
+                              g_hhdm_request.response->offset : 0;
+                u64 gp_hpa = ept_gpa_to_hpa(gp_rsp & ~0xFFFULL);
+                if (gp_hpa && gp_hhdm && (gp_rsp & 0xFFF) <= 0xFF8) {
+                    u64 gp_ret = *(u64 *)(gp_hhdm + gp_hpa + (gp_rsp & 0xFFF));
+                    if (gp_ret > 0x100000 && gp_ret < 0x100000000ULL) {
+                        u64 restored = g_guest_regs.rdx + 8;
+                        if ((g_guest_regs.rbp & ~0xFFFFULL) ==
+                            (restored & ~0xFFFFULL))
+                            g_guest_regs.rbp = restored;
+                        g_guest_regs.rax = 0;
+                        {
+                            u64 out_h = ept_gpa_to_hpa(g_guest_regs.rdx);
+                            if (out_h && gp_hhdm)
+                                *(u64 *)(gp_hhdm + out_h) = 1;
+                        }
+                        u16 data_sel = (u16)vmx_vmcs_read(VMCS_GUEST_SS_SELECTOR);
+                        u64 data_base = vmx_vmcs_read(VMCS_GUEST_SS_BASE);
+                        u64 data_lim = vmx_vmcs_read(VMCS_GUEST_SS_LIMIT);
+                        u64 data_acc = vmx_vmcs_read(VMCS_GUEST_SS_ACCESS);
+                        vmx_vmcs_write(VMCS_GUEST_DS_SELECTOR, data_sel);
+                        vmx_vmcs_write(VMCS_GUEST_ES_SELECTOR, data_sel);
+                        vmx_vmcs_write(VMCS_GUEST_DS_BASE, data_base);
+                        vmx_vmcs_write(VMCS_GUEST_ES_BASE, data_base);
+                        vmx_vmcs_write(VMCS_GUEST_DS_LIMIT, data_lim);
+                        vmx_vmcs_write(VMCS_GUEST_ES_LIMIT, data_lim);
+                        vmx_vmcs_write(VMCS_GUEST_DS_ACCESS, data_acc);
+                        vmx_vmcs_write(VMCS_GUEST_ES_ACCESS, data_acc);
+                        vmx_vmcs_write(VMCS_GUEST_RSP, gp_rsp + 8);
+                        vmx_vmcs_write(VMCS_GUEST_RIP, gp_ret);
+                        vmx_vmcs_write(VMCS_VM_ENTRY_INTERRUPT_INFO, 0);
+                        {
+                            u64 nh = ept_gpa_to_hpa(gp_ret);
+                            if (nh && gp_hhdm) {
+                                u64 nw = 0;
+                                u8 *nb = (u8 *)(gp_hhdm + nh);
+                                for (int i = 0; i < 8; i++)
+                                    nw |= (u64)nb[i] << (i * 8);
+                                log_hex64("[WIN] gp next=", nw);
+                            }
+                        }
+                        {
+                            u64 outer_h = ept_gpa_to_hpa(g_guest_regs.rdx + 16);
+                            if (outer_h && gp_hhdm) {
+                                u64 outer = *(u64 *)(gp_hhdm + outer_h);
+                                log_hex64("[WIN] gp outer=", outer);
+                                if (outer > 16) {
+                                    u64 oh = ept_gpa_to_hpa(outer - 8);
+                                    if (oh) {
+                                        u8 *ob = (u8 *)(gp_hhdm + oh);
+                                        u64 ow = 0, ow2 = 0;
+                                        for (int i = 0; i < 8; i++) {
+                                            ow |= (u64)ob[i] << (i * 8);
+                                            ow2 |= (u64)ob[8 + i] << (i * 8);
+                                        }
+                                        log_hex64("[WIN] gp outer-8=", ow);
+                                        log_hex64("[WIN] gp outer+0=", ow2);
+                                    }
+                                }
+                            }
+                        }
+                        log_hex64("[WIN] gp unwind=", gp_ret);
+                        *out_resume = 1;
+                        return 0;
+                    }
+                }
+            }
+        }
+        if ((intr_info & 0xFF) == 14) {
+            u64 cr2 = read_cr2_local();
+            u64 gla = vmx_vmcs_read(VMCS_GUEST_LINEAR_ADDR);
+            g_pf_cr2 = cr2 ? cr2 : gla;
+            g_pf_need_cr2 = 1;
+        }
+        if (intr_info & (1ULL << 11)) {
+            vmx_vmcs_write(VMCS_VM_ENTRY_EXCEPTION_ERROR,
+                           vmx_vmcs_read(VMCS_EXIT_INTR_ERROR_CODE));
+        }
+        vmx_vmcs_write(VMCS_VM_ENTRY_INTERRUPT_INFO, intr_info);
+        *out_resume = 1;
+        return 0;
+    }
+    if (vm_machine_profile_active(VM_PROFILE_LINUX)) {
         /* Linux's decompressor intentionally faults while extending its
          * identity map.  Reinject the intercepted hardware exception with
          * its original error code so the guest IDT can service it. */
@@ -1413,13 +1953,74 @@ int vmexit_dispatch(void) {
     u64 instr_len = vmx_vmcs_read(VMCS_INSTRUCTION_LENGTH);
     int resume = 0;
 
-    if (g_linux_guest_active)
+    if (vm_machine_profile_active(VM_PROFILE_LINUX))
         linux_cet_restore_host();
 
     g_vmexit_count++;
     INSTR_STAT_INC(vmexit_total);
+    if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+        static u64 win_exits;
+        win_exits++;
+        if (g_win_trace_arm) {
+            u64 port = reason == 0x1E ? (qualification >> 16) : 0;
+            int poll = reason == 0x1E &&
+                       (port == 0x60 || port == 0x64 || port == 0x608 ||
+                        port == 0x70 || port == 0x71 || port == 0x510 ||
+                        port == 0x511 || (port >= 0x3F8 && port <= 0x3FF));
+            static u64 seen_rip[24];
+            static u32 traced;
+            int seen = 0;
+            for (u32 i = 0; i < traced && i < 24; i++)
+                if (seen_rip[i] == rip) seen = 1;
+            if (!poll && !seen && traced < 24) {
+                seen_rip[traced++] = rip;
+                log_hex64("[WIN] trace reason=", reason);
+                log_hex64("[WIN] trace rip=", rip);
+                log_hex64("[WIN] trace qual=", qualification);
+                if (reason == 0x1F || reason == 0x20)
+                    log_hex64("[WIN] trace msr=", g_guest_regs.rcx);
+                if (rip == 0x1026569aULL) {
+                    u64 rsp = vmx_vmcs_read(VMCS_GUEST_RSP);
+                    u64 cr3 = guest_current_cr3();
+                    log_hex64("[WIN] probe rsp=", rsp);
+                    for (u32 s = 0; s < 20; s++) {
+                        u8 raw[8];
+                        u64 word = 0;
+                        if (guest_fetch_at_cr3(rsp + (u64)s * 8, raw, 8, cr3) != 0)
+                            break;
+                        for (int b = 0; b < 8; b++)
+                            word |= (u64)raw[b] << (b * 8);
+                        log_hex64("[WIN] probe stk=", word);
+                    }
+                }
+            }
+        }
+        if (win_exits <= 4 || (win_exits & 0x3FFFu) == 0) {
+            log_hex64("[WIN] exit n=", win_exits);
+            log_hex64("[WIN] exit reason=", reason);
+            log_hex64("[WIN] exit rip=", rip);
+            if (reason == 0x1E) {
+                struct vm_vcpu *io_vcpu = vm_vcpu_active();
+                log_hex64("[WIN] exit port=", qualification >> 16);
+                log_hex64("[WIN] exit vcpu=", io_vcpu ? io_vcpu->id : 0);
+            }
+            if (reason == 0x1F || reason == 0x20) {
+                log_hex64("[WIN] exit msr=", g_guest_regs.rcx);
+                log_hex64("[WIN] exit ilen=", instr_len);
+                u64 hhdm = g_hhdm_request.response ?
+                           g_hhdm_request.response->offset : 0;
+                u64 hpa = ept_gpa_to_hpa(rip);
+                if (hpa && hhdm) {
+                    u8 *b = (u8 *)(hhdm + hpa);
+                    u64 w = 0;
+                    for (int i = 0; i < 8; i++) w |= (u64)b[i] << (i * 8);
+                    log_hex64("[WIN] exit insn=", w);
+                }
+            }
+        }
+    }
 
-    if (g_linux_guest_active &&
+    if (vm_machine_profile_active(VM_PROFILE_LINUX) &&
         (g_vmexit_count <= 32 || (g_vmexit_count & 0xFFF) == 0)) {
         log_hex64("[VMEXIT] n=", g_vmexit_count);
         log_hex64("[VMEXIT] reason=", reason);
@@ -1436,6 +2037,17 @@ int vmexit_dispatch(void) {
     switch (reason) {
     case EXIT_HLT:
         handle_hlt(rip, instr_len, &resume);
+        /* idle HLT（Xfbdev / poll）会立刻再退出。若不计入时间片，
+         * linux_resume 一直在 guest 里打转，宿主收不到 EXEC_EXIT。 */
+        if (resume && vm_machine_profile_active(VM_PROFILE_LINUX) &&
+            g_linux_timeslice_armed) {
+            g_linux_slice_ticks++;
+            if (g_linux_slice_ticks >= LINUX_HOST_SLICE_TICKS) {
+                g_linux_slice_ticks = 0;
+                vm_machine_set_active_state(VM_MACHINE_PARKED);
+                resume = 0;
+            }
+        }
         break;
     case EXIT_ENTRY_FAIL_MSR_LOADING:
         log_warn("[VMEXIT] VM-entry MSR-load failed; dropping CET MSR list");
@@ -1496,11 +2108,36 @@ int vmexit_dispatch(void) {
         break;
     case EXIT_EXTERNAL_INTERRUPT:
         INSTR_STAT_INC(ext_irq);
-        /* 外部中断到达 host（真机比 QEMU 更频繁触发）。
-         * 当前 UTSM 不处理 host 外部中断（依赖 PIC/IDT），
-         * 直接 resume guest。真机上此 exit 由 PIN_EXT_INTERRUPT_EXITING
-         * 触发，不应终止 guest。 */
+        /* 外部中断到达 host。PIN_EXT_INTERRUPT_EXITING 使 host 中断不投递到
+         * guest 的 IDT 而是 VM-Exit；因此 host LAPIC 的中断（尤其周期定时器
+         * vector 0x41）在此必须补 EOI，否则 ISR 位永不释放 → 中断持续 in-service
+         * → 形成 external-interrupt 风暴：每次 vmresume 立即再 exit，且
+         * vmexit_before_resume 每次都重装抢占定时器 → PT 永不触发 → linux_resume
+         * 永挂（lxc guest→UTSM 方向挂起的根因）。EOI 后中断正常释放。 */
+        lapic_timer_eoi();
+        /* 关键修复：主机 8259 PIC 的中断经 ExtINT/LVT0 投递，走 VM-Exit 路径时
+         * 其 EOI 从不执行 → PIC 中断持续 re-assert → guest 被中断淹没，永远卡在
+         * irq_entries_start（实测 guest RIP 恒在中断入口桩、daemon 收不到请求）。
+         * 这里读两片 PIC 的 ISR，有在服务的中断就补发 EOI。 */
+        outb(0x20, 0x0B);                       /* master OCW3: read ISR */
+        if (inb(0x20)) outb(0x20, 0x20);        /* master EOI */
+        outb(0xA0, 0x0B);                       /* slave OCW3: read ISR */
+        if (inb(0xA0)) { outb(0xA0, 0x20); outb(0x20, 0x20); }
+        /* 有界保护：把 external-interrupt 也计入 linux 时间片预算。本 VMM 下
+         * host LAPIC 存在持续 re-assert 的中断，若不计预算则 ext-int 风暴使
+         * vmexit_before_resume 每次重装抢占定时器 → PT 永不触发 → linux_resume
+         * 永挂（桌面调 lxc 取 guest 数据即冻死）。计入预算后 linux_resume 有界
+         * 返回，桌面不再挂死。 */
         resume = 1;
+        if (vm_machine_profile_active(VM_PROFILE_LINUX) &&
+            g_linux_timeslice_armed) {
+            g_linux_slice_ticks++;
+            if (g_linux_slice_ticks >= LINUX_HOST_SLICE_TICKS) {
+                g_linux_slice_ticks = 0;
+                vm_machine_set_active_state(VM_MACHINE_PARKED);
+                resume = 0;
+            }
+        }
         break;
     case EXIT_INIT_SIGNAL:
         /* INIT 信号在 VMX root 下被阻断，但 non-root 会 exit。
@@ -1571,13 +2208,63 @@ int vmexit_dispatch(void) {
          * 轮询 host 串口 RX / 推进 PIT tick / 注入 pending IRQ。
          * Also force IRQ0 here. TSC-based PIT accounting can miss ticks
          * after park/resume, and nanosleep/Xorg then freeze on noapic. */
-        vmx_guest_queue_irq(g_pic_vec_base ? g_pic_vec_base : 0x30);
+        if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+            static u32 ticks;
+            struct vm_vcpu *tick_vcpu = vm_vcpu_active();
+            if (ticks < 12) {
+                log_hex64("[WIN] tick vcpu=", tick_vcpu ? tick_vcpu->id : 0);
+                log_hex64("[WIN] tick rip=", rip);
+            }
+            if (ticks == 0 || (rip == 0x3FF69B27ULL && ticks < 14)) {
+                u64 hhdm = g_hhdm_request.response ?
+                           g_hhdm_request.response->offset : 0;
+                u64 hpa = ept_gpa_to_hpa(rip & ~7ULL);
+                if (hpa && hhdm) {
+                    u8 *b = (u8 *)(hhdm + hpa);
+                    u64 w0 = 0, w1 = 0;
+                    for (int i = 0; i < 8; i++) {
+                        w0 |= (u64)b[i] << (i * 8);
+                        w1 |= (u64)b[8 + i] << (i * 8);
+                    }
+                    log_hex64("[WIN] bsp spin=", w0);
+                    log_hex64("[WIN] bsp spin2=", w1);
+                    u64 earlier = ept_gpa_to_hpa(0x3FF61EE0ULL);
+                    if (earlier) {
+                        u8 *e = (u8 *)(hhdm + earlier);
+                        u64 ew = 0;
+                        for (int i = 0; i < 8; i++) ew |= (u64)e[i] << (i * 8);
+                        log_hex64("[WIN] bsp earlier=", ew);
+                    }
+                    log_hex64("[WIN] bsp rax=", g_guest_regs.rax);
+                    log_hex64("[WIN] bsp rdi=", g_guest_regs.rdi);
+                    if (g_guest_regs.rdi > 0x1000) {
+                        u64 sh = ept_gpa_to_hpa(g_guest_regs.rdi);
+                        if (sh) {
+                            u32 *slot = (u32 *)(hhdm + sh);
+                            log_hex64("[WIN] bsp signal=", *slot);
+                        }
+                    }
+                }
+            }
+            ticks++;
+            windows_platform_tick();
+            if (windows_vcpu_yield() < 0) {
+                resume = 0;
+                break;
+            }
+            resume = 1;
+            break;
+        }
+        if (!g_linux_no_irq_inject)
+            vmx_guest_queue_irq(g_pic_vec_base ? g_pic_vec_base : 0x30);
         resume = 1;
-        if (g_linux_guest_active && g_linux_timeslice_armed) {
+        if (vm_machine_profile_active(VM_PROFILE_LINUX) &&
+            g_linux_timeslice_armed) {
+            { static int _pc; if (_pc < 40) { _pc++; log_hex64("[PTa] slice=", g_linux_slice_ticks); } }
             g_linux_slice_ticks++;
             if (g_linux_slice_ticks >= LINUX_HOST_SLICE_TICKS) {
                 g_linux_slice_ticks = 0;
-                g_guest_parked = 1;
+                vm_machine_set_active_state(VM_MACHINE_PARKED);
                 resume = 0;
             }
         }
@@ -1596,6 +2283,27 @@ int vmexit_dispatch(void) {
          * 注意：WRMSR 写入某些 MSR 可能影响 host，需要白名单保护。
          */
         u64 msr = g_guest_regs.rcx & 0xFFFFFFFFULL;
+        if (vm_machine_profile_active(VM_PROFILE_WINDOWS) &&
+            (msr == 0x1B || (msr >= 0x800 && msr <= 0x8FF))) {
+            if (reason == EXIT_RDMSR) {
+                u64 val = msr == 0x1B ? windows_platform_apic_base_read()
+                                      : windows_platform_x2apic_read((u32)msr);
+                g_guest_regs.rax = val & 0xFFFFFFFFULL;
+                g_guest_regs.rdx = (val >> 32) & 0xFFFFFFFFULL;
+            } else if (msr == 0x1B) {
+                windows_platform_apic_base_write(
+                    (g_guest_regs.rax & 0xFFFFFFFFULL) |
+                    (g_guest_regs.rdx << 32));
+            } else {
+                windows_platform_x2apic_write(
+                    (u32)msr,
+                    (g_guest_regs.rax & 0xFFFFFFFFULL) |
+                    (g_guest_regs.rdx << 32));
+            }
+            vmx_vmcs_write(VMCS_GUEST_RIP, rip + (instr_len ? instr_len : 2));
+            resume = 1;
+            break;
+        }
         if (msr == 0xC0000080ULL) { /* IA32_EFER */
             if (reason == EXIT_RDMSR) {
                 u64 val = vmx_vmcs_read(VMCS_GUEST_IA32_EFER);
@@ -1604,7 +2312,20 @@ int vmexit_dispatch(void) {
             } else {
                 u64 val = (g_guest_regs.rax & 0xFFFFFFFFULL) |
                           (g_guest_regs.rdx << 32);
-                val |= EFER_LME | EFER_LMA;
+                if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+                    u64 cr0 = vmx_vmcs_read(VMCS_GUEST_CR0);
+                    u64 entry = vmx_vmcs_read(VMCS_VM_ENTRY_CONTROLS);
+                    if ((val & EFER_LME) && (cr0 & CR0_PG)) {
+                        val |= EFER_LMA;
+                        entry |= VM_ENTRY_IA32E_MODE_GUEST;
+                    } else {
+                        val &= ~EFER_LMA;
+                        entry &= ~VM_ENTRY_IA32E_MODE_GUEST;
+                    }
+                    vmx_vmcs_write(VMCS_VM_ENTRY_CONTROLS, entry);
+                } else {
+                    val |= EFER_LME | EFER_LMA;
+                }
                 val &= ~EFER_SVME;
                 vmx_vmcs_write(VMCS_GUEST_IA32_EFER, val);
             }
@@ -1640,6 +2361,31 @@ int vmexit_dispatch(void) {
                     /* SWAPGS reads the hardware KERNEL_GS_BASE MSR. */
                     __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(0xC0000102u));
                 }
+            }
+            vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
+            resume = 1;
+            break;
+        }
+        /* Windows bootmgr writes IA32_MISC_ENABLE and reads it back.
+         * Swallowing the write makes BlInitializeLibrary fail 0xC0000185. */
+        if (msr == 0x1A0 && vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+            static u64 misc_enable;
+            static int misc_valid;
+            if (reason == EXIT_RDMSR) {
+                u64 val = 0;
+                if (!misc_valid) {
+                    u32 lo = 0, hi = 0;
+                    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x1A0u));
+                    misc_enable = (u64)lo | ((u64)hi << 32);
+                    misc_valid = 1;
+                }
+                val = misc_enable;
+                g_guest_regs.rax = val & 0xFFFFFFFFULL;
+                g_guest_regs.rdx = (val >> 32) & 0xFFFFFFFFULL;
+            } else {
+                misc_enable = (g_guest_regs.rax & 0xFFFFFFFFULL) |
+                              (g_guest_regs.rdx << 32);
+                misc_valid = 1;
             }
             vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
             resume = 1;

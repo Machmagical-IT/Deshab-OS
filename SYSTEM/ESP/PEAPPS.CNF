@@ -1,0 +1,5 @@
+# Deshab Windows PE 应用注册表
+# 格式: NAME|DISPLAY|path/file.exe|args   ('/' 分隔长路径, args 可省略)
+# 仅注册 GUI PE（消息循环驱动桌面 pump）；控制台 PE 请走 CMD。
+# 目录约定：bin/ = ELF 工具，program/ = exe（g++ 编译，cmd PATH 含 /program/）。
+DEAICUP|Deaicup|program/deaicup.exe

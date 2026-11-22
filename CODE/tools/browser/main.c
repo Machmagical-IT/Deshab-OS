@@ -21,11 +21,25 @@ static int br_ns_init(void);
 
 static da_app_context g_ac;
 static da_cursor g_cursor;
-static da_mouse g_mouse;
+
+/* Linux guest 兼容层服务（dsk_boot_context.reserved[5]）。
+ * 用于优先经 guest 的 curl 取网页（guest 由 UTSM/Linux 双内核提供，
+ * 具备完整 DNS/TCP/TLS 与联网路径）。仅镜像 linux_compat_service 的前
+ * 三个成员（magic / is_available / exec），避免引入 utsm/types.h 与
+ * desktop_app.h 的 u8/u32 typedef 冲突。 */
+#define BR_LXC_MAGIC 0x4C4E58434F4D5000ULL  /* "LNXCOMP\0" */
+typedef struct br_lxc_svc {
+    u64 magic;
+    int (*is_available)(void);
+    int (*exec)(const char *path, int argc, const char *const *argv,
+                char *stdout_buf, u64 stdout_cap, u64 *stdout_len,
+                u64 *exit_code);
+} br_lxc_svc;
+static const br_lxc_svc *g_lxc = 0;
 
 /* 地址栏 */
-static char url_buf[URL_BUF_SIZE] = "http://10.0.2.2:8000/";
-static int url_len = 22;
+static char url_buf[URL_BUF_SIZE] = "http://example.com/";
+static int url_len = 19;
 static int url_focused = 1;  /* 启动时地址栏聚焦 */
 
 /* 内容缓冲 */
@@ -37,14 +51,65 @@ static char status_msg[64] = "Ready";
 
 /* ---- 状态消息 ---- */
 static void br_set_status(const char *s) {
+    /* 先写串口（此时 s 未偏移）；无头环境下用于自动化验证取网页结果。 */
+    da_slog("browser.status", s);
     int i = 0;
     while (*s && i < 63) status_msg[i++] = *s++;
     status_msg[i] = 0;
 }
 
+/* ---- Linux guest 取网页（经 lxc exec 跑 guest 的 curl）----
+ * 返回 0 = 成功（content_buf 填好）；负值 = guest 不可用/失败（调用方回退
+ * 到 host 原生 net_stack）。curl 走 guest 完整协议栈（DNS/HTTPS 皆可）。 */
+static int br_fetch_guest(void) {
+    if (!g_lxc || !g_lxc->is_available || !g_lxc->exec) return -1;
+    if (g_lxc->is_available() != 1) return -1;
+
+    br_set_status("Guest fetch...");
+    redraw_all_imm();
+
+    /* curl -s -L --max-time 15 '<url>' ；输出（HTTP body）截断到 content_buf。 */
+    static char cmd[256];
+    int p = 0;
+    const char *pre = "curl -s -L --max-time 15 '";
+    while (*pre && p < 200) cmd[p++] = *pre++;
+    for (int i = 0; i < url_len && p < 230; i++) {
+        char c = url_buf[i];
+        if (c == '\'') break;              /* 不放开引号，避免破坏命令 */
+        cmd[p++] = c;
+    }
+    cmd[p++] = '\''; cmd[p] = 0;
+
+    const char *argv[] = { "sh", "-c", cmd };
+    u64 n = 0, ec = 0;
+    int rc = g_lxc->exec("/bin/sh", 3, argv,
+                         (char *)content_buf, CONTENT_BUF_SIZE - 1, &n, &ec);
+    if (rc != 0) { br_set_status("Guest fetch failed"); return rc; }
+    if (n == 0) { br_set_status("Empty response"); return -2; }
+
+    content_len = (u32)n;
+    content_buf[content_len] = 0;
+    content_scroll = 0;
+    {
+        char sm[32]; int sp = 0;
+        const char *ok = "OK "; while (*ok && sp < 30) sm[sp++] = *ok++;
+        char nb[12]; ns_u32_dec(nb, content_len);
+        for (int i = 0; nb[i] && sp < 30; i++) sm[sp++] = nb[i];
+        sm[sp] = 0;
+        br_set_status(sm);
+    }
+    return 0;
+}
+
 /* ---- HTTP 请求（复制 shell cmd_curl 核心逻辑） ---- */
 static void do_fetch(void) {
     if (url_len == 0) { br_set_status("Empty URL"); return; }
+
+    /* 优先走 Linux guest（curl 代理）；不可用时回退 host 原生 net_stack。 */
+    if (g_lxc && g_lxc->is_available && g_lxc->is_available() == 1) {
+        if (br_fetch_guest() == 0) return;
+        /* fall through to host path */
+    }
 
     br_set_status("Initializing net...");
     redraw_all_imm();
@@ -54,14 +119,27 @@ static void do_fetch(void) {
         return;
     }
 
-    /* 解析 URL: [http://]host[:port][/path] */
+    /* 解析 URL: [http://|https://]host[:port][/path]
+     * 注意：本浏览器只实现明文 HTTP（无 TLS）。https:// 必须显式识别并给出
+     * 明确提示——否则 "https" 会被当成主机名去查 DNS，表现为误导性的
+     * "DNS failed"。 */
     const char *p = url_buf;
-    if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]==':'&&p[5]=='/'&&p[6]=='/') p += 7;
+    int scheme_https = 0;
+    if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]=='s'&&p[5]==':' &&
+        p[6]=='/'&&p[7]=='/') { scheme_https = 1; p += 8; }
+    else if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]==':' &&
+             p[5]=='/'&&p[6]=='/') p += 7;
+    else if (p[0]=='/'&&p[1]=='/') p += 2;
 
     char host[64]; int hl = 0;
     while (*p && *p != ':' && *p != '/' && hl < 63) host[hl++] = *p++;
     host[hl] = 0;
     if (!hl) { br_set_status("Bad host"); return; }
+    if (scheme_https) {
+        /* host 路径无法完成 TLS 握手；给出可操作提示而不是 DNS 失败 */
+        br_set_status("HTTPS not supported - use http://");
+        return;
+    }
 
     u16 port = 80;
     if (*p == ':') {
@@ -170,7 +248,7 @@ static void redraw_all_imm(void) {
     da_draw_titlebar(&g_ac, "Browser", (i64)g_ac.fb_w);
 
     /* 地址栏 */
-    int bar_y = DA_TITLEBAR_H + 6;
+    int bar_y = da_chrome_h() + 6;
     int bar_h = 28;
     int bar_x = 12;
     int bar_w = (int)g_ac.fb_w - 24;
@@ -270,7 +348,9 @@ static int br_ns_init(void) {
 
 __attribute__((visibility("default")))
 void dsk_entry(const da_boot_context *ctx) {
-    __asm__ volatile("cli");
+    /* P6b：输入走 srv.input.*.poll（IRQ1/IRQ12 由 ps2kbd/ps2mouse 投递），
+     * 必须开中断，否则 ring 永远为空 —— 这里 sti 取代旧的 cli。 */
+    __asm__ volatile("sti");
     da_slog("browser", "boot");
 
     if (!ctx || ctx->magic != DA_BOOT_MAGIC) {
@@ -280,8 +360,22 @@ void dsk_entry(const da_boot_context *ctx) {
 
     da_init(&g_ac, ctx);
     ns_apply_lease_from_ctx((u64)(const void *)ctx);  /* netman 租约覆盖默认 slirp IP */
+
+    /* Linux guest 兼容层服务指针：存在则优先经 guest curl 取网页。 */
+    g_lxc = (const br_lxc_svc *)(unsigned long)ctx->reserved[5];
+    if (g_lxc && g_lxc->magic != BR_LXC_MAGIC) g_lxc = 0;
+    da_slog("browser", g_lxc ? "lxc available (guest curl proxy)" : "lxc unavailable");
     da_cursor_init(&g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h);
-    da_mouse_init();
+    /* 输入经服务总线（P6b）：端口 0x60 已被 IRQ handler 读走，直接轮询会饿死。 */
+    static da_input g_in;
+    if (da_input_open(&g_in, &g_ac) != 0) {
+        da_slog("browser", "input bus missing (INPUT-E01)");
+        da_fill_bg(&g_ac, DA_BG_PRIMARY);
+        da_draw_string(&g_ac, "input bus missing", 12, 60,
+                       DA_ERROR, DA_BG_PRIMARY, 12);
+        return;
+    }
+    da_slog("browser", g_in.mouse_poll ? "input: kbd+mouse via bus" : "input: kbd via bus");
 
     /* 初始化网络协议栈 */
     br_ns_init();
@@ -293,11 +387,11 @@ void dsk_entry(const da_boot_context *ctx) {
     for (;;) {
         int need_redraw = 0;
 
-        /* 鼠标轮询 */
-        if (da_mouse_poll(&g_mouse, &g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
+        /* 鼠标轮询（总线快照绝对坐标） */
+        if (da_input_mouse(&g_in, &g_cursor, (i64)g_ac.fb_w, (i64)g_ac.fb_h)) {
             need_redraw = 1;
             /* 点击地址栏聚焦 */
-            int bar_y = DA_TITLEBAR_H + 6;
+            int bar_y = da_chrome_h() + 6;
             int bar_h = 28;
             if (g_cursor.btn &&
                 g_cursor.my >= bar_y && g_cursor.my < bar_y + bar_h &&
@@ -307,11 +401,9 @@ void dsk_entry(const da_boot_context *ctx) {
             }
         }
 
-        /* 键盘轮询 */
-        u8 st = inb(0x64);
-        if ((st & 1) && !(st & 0x20)) {
-            u8 data = inb(0x60);
-            u8 sc = data;
+        /* 键盘轮询（总线 ring，一次取一个扫描码） */
+        u8 sc;
+        while (da_input_kbd(&g_in, &sc)) {
             if (sc == 0xE0) { e0 = 1; goto skip; }
             if (sc == 0x2A || sc == 0x36) { shift = 1; goto skip; }
             if (sc == 0xAA || sc == 0xB6) { shift = 0; goto skip; }

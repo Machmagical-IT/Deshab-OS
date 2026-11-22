@@ -29,12 +29,15 @@
 #include <utsm/block.h>
 #include <utsm/pe.h>
 #include <utsm/linux_compat.h>
+#include <utsm/zt5_loader.h>
 #include "../kernel/ini_parser.h"
 
 /* manifest.c 提供；签名见 dkm.h 头注释（避免头依赖） */
 void dsm_load_named(const ini_config *cfg, const char *name);
 /* kernel/main.c 提供：FUCK 启动配置只读访问（g_boot_cfg） */
 const ini_config *utsm_boot_cfg_get(void);
+/* kernel/dsk_loader.c 提供：probe 缓冲描述 getter（P4b kern.probe.info 后端） */
+const void *utsm_probe_info_get(void);
 
 static dkm_bus_service g_services[DKM_BUS_MAX_SERVICES];
 static u32 g_service_count;
@@ -298,6 +301,8 @@ void dkm_bus_init(void) {
     /* drr / utrw（kapi 迁移） */
     bus_seed("kern.drr.snapshot_dirty", (void *)drr_ckpt_snapshot_dirty);
     bus_seed("kern.drr.rollback_pages", (void *)drr_rollback_pages);
+    bus_seed("kern.drr.rollback_segment", (void *)drr_rollback_segment);  /* R4 */
+    bus_seed("kern.drr.rollback_system",  (void *)drr_rollback_system);   /* R4 */
     bus_seed("kern.utrw.debug_dump",    (void *)utrw_debug_dump_page);
     /* block registry 前端（替代 desktop 的 api+0xA8 裸偏移读） */
     {
@@ -308,10 +313,14 @@ void dkm_bus_init(void) {
     /* PE / Linux 兼容层服务（替代 reserved[4]/reserved[5]） */
     bus_seed("kern.pe.service",  (void *)pe_get_service);
     bus_seed("kern.lxc.service", (void *)linux_compat_get_service);
+    /* Probe 缓冲描述（替代 reserved[6]；P4b shell $probe 消费） */
+    bus_seed("kern.probe.info",  (void *)utsm_probe_info_get);
     /* 按名加载（session.drv 的排序拉手，P3 接 FUCK 过滤） */
     bus_seed("kern.dkm.load_by_name", (void *)bus_kern_load_by_name);
     /* FUCK 配置只读访问（替代 reserved[] 内散落的配置回传） */
     bus_seed("kern.config.get", (void *)bus_kern_config_get);
+    /* ZT5 guest 子系统状态（srv.zts.guest.status / shell zts guest 消费） */
+    bus_seed("kern.zt5.status", (void *)zt5_status_text);
 
     log_info("[BUS] ready services=");
     log_hex64("[BUS] count=", g_service_count);

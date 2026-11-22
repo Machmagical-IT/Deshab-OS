@@ -8,8 +8,8 @@ Usage: python gen_panic_logo.py <src.png> <out.c> [target_width]
 import sys
 from PIL import Image
 
-SRC = r"d:/Code/DEAICUP/Deshab/ohMyLogo.png"
-DST = r"d:/Code/DEAICUP/Deshab/CODE/UTSM/kernel/panic_logo_data.inc"
+SRC = r"D:/Code/Deshab/TEXTURES/panic/machmagic.png"
+DST = r"D:/Code/Deshab/CODE/UTSM/kernel/panic_logo_data.inc"
 TARGET_W = 384
 
 
@@ -35,7 +35,8 @@ def main() -> None:
     bg = 0xFF000000 | (r << 16) | (g << 8) | b
 
     lines = []
-    lines.append("/* Auto-generated from ohMyLogo.png — panic screen logo (RGBA8888) */")
+    name = src.replace("\\", "/").split("/")[-1]
+    lines.append(f"/* Auto-generated from {name} — panic screen logo (RGBA8888) */")
     lines.append("/* DO NOT EDIT. Regenerate via: python gen_panic_logo.py */")
     lines.append("")
     lines.append(f"static const int g_panic_logo_w = {w};")

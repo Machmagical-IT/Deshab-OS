@@ -16,7 +16,14 @@
  *   zhfont.c        中文位图字库（.dbf）加载与渲染（M1）
  *   wallpaper.c     壁纸背景层缓存（M1）
  *   files.c         窗口化文件资源管理器（目录遍历 + 打开文本）
- *   startmenu.c     M3 Win11 开始菜单（搜索 + 应用瓦片 + 电源行）
+ *   motion.c        16.16 弹簧 / ease-out（窗口呈现轨道 + 单轨推进）
+ *   glass.c         壁纸盒式模糊缓存（glass_pixels / du_glass_wallpaper）
+ *   blit.c          定点缩放 src-over
+ *   aqua_draw.c     Aqua 绘制原语：抗锯齿圆角、投影、毛玻璃、应用图标缓存
+ *   menubar.c       Aqua 顶栏（Apple 菜单 / 应用名 / 窗口菜单 / Wi-Fi / 控制中心 / 时钟）
+ *   dock.c          Aqua Dock（弹簧放大、运行点、启动弹跳）
+ *   launchpad.c     Aqua Launchpad（全屏网格 + 搜索，替代 M3 开始菜单）
+ *   taskbar.c       顶栏弹出卡片（Wi-Fi / 控制中心 / 关机确认）+ logo 纹理
  *
  * 依赖单向：main → shell → (pages/appreg/launcher/lxc) → wm/compositor → input。
  * 全局状态按"最 owning 模块定义、此处 extern"原则组织。
@@ -55,6 +62,8 @@ static __inline__ void sputc(char c) {
 }
 static __inline__ void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
 static __inline__ void slog(const char *s) { swrite("[desktop] "); swrite(s); swrite("\n"); }
+/* 插桩：点击/启动自检失败时整屏 fatal（实现在 main.c） */
+void desktop_fatal(const char *sym);
 
 static __inline__ int kstrlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static __inline__ void kstrcpy(char *d, const char *s, int cap) {
@@ -140,6 +149,9 @@ typedef struct {
 
 /* ---- 窗口 / 应用 ---- */
 
+#include "motion.h"
+#include "aqua_theme.h"
+
 typedef struct desktop_window {
     int    id;
     int    x, y, w, h;
@@ -152,7 +164,19 @@ typedef struct desktop_window {
     int    closing;
     int    dirty;
     int    ws;              /* 所属工作区 */
+    /* 呈现轨道：Aqua 窗口框按它绘制；命中测试仍读逻辑 x/y/w/h。 */
+    motion_track present_x, present_y, present_w, present_h, present_opacity;
+    int    anim;            /* WIN_ANIM_*；非 NONE 时不画应用内容 */
+    int    zoomed;          /* 绿钮缩放态；zx..zh 为缩放前矩形 */
+    int    zx, zy, zw, zh;
 } desktop_window;
+
+#define WIN_ANIM_NONE    0
+#define WIN_ANIM_OPEN    1
+#define WIN_ANIM_CLOSE   2
+#define WIN_ANIM_MIN     3
+#define WIN_ANIM_RESTORE 4
+#define WIN_ANIM_ZOOM    5
 
 typedef struct desktop_window desktop_win;
 
@@ -333,10 +357,19 @@ extern int g_icon_count;
 extern int g_vscode_app_id;   /* 第一个名为 "vscode" 的注册项 */
 
 /* ---- appreg.c：M3 开始菜单注册表（STARTMENU.CNF，缺失时回退全量） ---- */
-#define SM_MAX_APPS     24     /* 开始菜单条目上限 */
+#define SM_MAX_APPS     24     /* 本机开始菜单条目上限（Dock 固定前 8 项） */
 extern int  g_sm_ids[SM_MAX_APPS];       /* → g_apps 下标 */
 extern char g_sm_labels[SM_MAX_APPS][48];/* 瓦片中文标签（UTF-8） */
 extern int  g_sm_count;
+
+/* GUESTMENU.CNF：打包时扫 Linux .desktop 与 Windows「开始菜单」.lnk。
+ * 不进 g_apps（图标缓存按 app 槽位，放大 MAX_APPS 会撑爆 desktop 映像）。 */
+#define GUEST_MENU_MAX  192
+extern int  g_guest_count;
+extern char g_guest_kind[GUEST_MENU_MAX];       /* 'L' Linux / 'W' Windows */
+extern char g_guest_name[GUEST_MENU_MAX][12];
+extern char g_guest_label[GUEST_MENU_MAX][64];
+void launch_guest_entry(int idx);
 
 /* ---- launcher.c：PE 运行时 ---- */
 extern int   g_pe_running;
@@ -365,8 +398,12 @@ extern struct linux_compat_scanout_info g_so;
 extern int g_so_valid;
 extern int g_so_full_repaint;
 
-/* ---- main.c：M2 Fluent 开关（FUCK [desktop] fluent=，缺省 1） ---- */
+/* ---- main.c：外壳开关（FUCK [desktop] fluent=，缺省 1）。
+ * 1 = macOS Aqua 外壳（顶栏 + Dock + Launchpad）；0 = KATE 回退路径。 ---- */
 extern int g_fluent;
+
+/* 进桌面演出：0 = 只画壁纸，1..255 = 图标淡入且顶栏/Dock 滑入，256 = 静止。 */
+extern int g_boot_reveal;
 
 /* ---- shell.c：外壳状态 / 命中矩形 ---- */
 extern int g_page;                 /* 1..3 内置, 4..8 自定义 */
@@ -387,6 +424,12 @@ extern int g_drag_slider;          /* 1=vol 2=bright */
 extern int g_vol_rect[4];
 extern int g_bri_rect[4];
 extern int g_quit;                 /* EXIT 按钮 → 返回 DSK */
+
+/* 电源（main.c）：经 srv.acpi.poweroff / srv.acpi.reboot 关机/重启；
+ * 服务缺席时 poweroff 退回 g_quit，reboot 退回键盘控制器 + 0xCF9。 */
+int desktop_poweroff(void);
+int desktop_reboot(void);
+
 extern u64 g_last_click_tsc;
 extern int g_last_click_x, g_last_click_y;
 extern int g_dash_rect[4][4];          /* 4 面板 x,y,w,h */
@@ -421,13 +464,20 @@ void rtc_read(int *yy, int *mo, int *dd, int *hh, int *mi, int *ss);
 int  rtc_day_sec(void);
 void fmt_hms(char *out, int sec);
 void tsc_calibrate(void);
-void ps2_mouse_init(void);
+int  dt_input_init(void);          /* P6b: srv.input.kbd/mouse.poll；0=ok，-1=kbd 缺席 */
+int  dt_kbd_poll(u8 *sc);          /* 1 = 取到一个扫描码 */
+void dt_kbd_inject(u8 sc);         /* dev 串口测试：插入一个 Set-1 扫描码 */
+void ps2_mouse_init(void);         /* 兼容名：仅做输入总线就绪检查 */
 int  ps2_mouse_poll(void);
 char scan_to_ascii(u8 sc, int shift);
 u16  scancode_to_linux_keycode(u8 base, int e0);
 void cursor_save_bg(int mx, int my);
 void cursor_restore_bg(void);
 void cursor_draw(int mx, int my);
+/* ELF 嵌进窗口期间：光标画在真实 fb 上，客户区内的像素留给应用自己重画。 */
+void desktop_host_begin(int x, int y, int w, int h);
+void desktop_host_pump(void);
+void desktop_host_end(void);
 
 /* ---- wm.c ---- */
 desktop_window *win_find(int id);
@@ -435,14 +485,26 @@ desktop_window *win_find_at(int mx, int my);
 void win_focus(desktop_window *w);
 desktop_window *win_create(int app_id, const char *title, int x, int y, int w, int h);
 void win_destroy(desktop_window *w);
-int  win_titlebar_h(void);        /* M2：Fluent 36 / KATE 28 */
+/* 呈现轨道：sync 吸附到逻辑矩形；animate_to 弹簧追向逻辑矩形并把不透明度收到 255。 */
+void win_present_sync(desktop_window *w);
+void win_present_rect(const desktop_window *w, int *x, int *y, int *ww, int *hh, int *opacity);
+void win_present_animate_to(desktop_window *w);
+int  win_present_settled(const desktop_window *w);
+/* Aqua 窗口动画。close 结束后 win_destroy；minimize 结束后置 minimized=1。 */
+void win_anim_open(desktop_window *w);
+void win_anim_restore(desktop_window *w);
+void win_anim_close(desktop_window *w);
+void win_anim_minimize(desktop_window *w);
+void win_zoom_toggle(desktop_window *w);
+void wm_anim_settle(void);
+int  wm_hover_key(void);
+void draw_window_post(desktop_window *w);   /* 应用 on_draw 之后：圆角回填 + 描边 */
+int  win_titlebar_h(void);        /* Aqua / KATE 均为 28 */
 int  win_hit_titlebar(desktop_window *w, int mx, int my);
 void win_close_request(desktop_window *w);
 int  win_hit_close_btn(desktop_window *w, int mx, int my);
-int  win_hit_min_btn(desktop_window *w, int mx, int my);   /* M2 Fluent */
-int  win_hit_max_btn(desktop_window *w, int mx, int my);   /* M2 Fluent */
-void wm_set_btn_hover(int btn);   /* 0=无 1=min 2=max 3=close */
-int  wm_detect_btn_hover(desktop_window *w, int mx, int my);
+int  win_hit_min_btn(desktop_window *w, int mx, int my);   /* Aqua 黄钮 */
+int  win_hit_max_btn(desktop_window *w, int mx, int my);   /* Aqua 绿钮（缩放） */
 int  ws_win_count(int ws);
 void draw_window_frame(desktop_window *w);
 
@@ -494,6 +556,7 @@ int desktop_app_icon(int app_id);
 /* ---- launcher.c ---- */
 void launch_external_elf(const char *name11);
 void launch_external_elf_path(const char *path);
+int  launch_app_by_name(const char *name);   /* 按内部名启动（串口验证用） */
 void fill_app_ctx(app_ctx *ctx, desktop_window *win);
 void launch_app(int app_id);
 void launch_pe_app(int app_id);
@@ -504,6 +567,8 @@ void slog_num(const char *prefix, int rc);
 int  lxc_guest_ping(void);
 void guest_gui_launch(const char *path, int argc, const char *const *argv);
 void launch_linux_app(int app_id);
+void launch_linux_path(const char *name, const char *disp,
+                       const char *path, const char *args);
 void vscode_launch(void);
 void ide_attach_invalidate(void);
 const struct linux_compat_scanout_info *ide_scanout_state(void);
@@ -527,41 +592,64 @@ void draw_custom_page(int cp_idx);
 void draw_taskview(void);
 void draw_ctx_menu(void);
 
-/* ---- taskbar.c（M2 Fluent 悬浮任务栏） ---- */
-void taskbar_draw(void);
-int  taskbar_click(int mx, int my);
+/* ---- taskbar.c：顶栏弹出卡片（Wi-Fi / 控制中心 / 关机确认）+ Apple logo ---- */
 int  taskbar_init(int (*read_to)(const char *, unsigned char *,
                                  unsigned int, unsigned int *));
-
-/* ---- startmenu.c（M3 开始菜单，taskbar 开始按钮弹出） ---- */
-void startmenu_open(void);
-void startmenu_close(void);
-void startmenu_toggle(void);
-void startmenu_draw(void);            /* taskbar_draw 末尾叠加 */
-int  startmenu_click(int mx, int my); /* 1=已消费（面板内） */
-int  startmenu_key(u8 sc, int shift); /* 1=已消费（模态输入） */
-extern int g_sm_open;
-
-/* ---- taskbar.c WiFi 快捷卡片 ---- */
+void taskbar_logo_draw(int x, int y, int size);
+void taskbar_cards_draw(void);
+int  taskbar_cards_click(int mx, int my);   /* 1=已消费 */
+int  taskbar_cards_open(void);
+void taskbar_cards_close(void);
+void taskbar_wifi_toggle(void);
+void taskbar_cc_toggle(void);
+void taskbar_power_open(void);
+int  taskbar_net_up(void);                  /* 1=有链路 */
 extern int g_wifi_open;                 /* 卡片是否展开 */
 int wifi_key(u8 sc, int shift);         /* shell.c handle_key 路由；1=已消费 */
-/* ---- taskbar.c 快速设置卡片（音量/亮度） ---- */
 extern int g_qs_open;
-/* M2: logo 纹理 */
-extern int g_tb2_start_rect[4];
-extern int g_tb2_tv_rect[4];
-extern int g_tb2_app_rect[MAX_WINDOWS][4];
-extern int g_tb2_tray_rect[4];
+int taskbar_power_menu_key(int sc);     /* Esc 收起；1=已消费 */
+/* 卡片锚点：顶栏绘制时写入（Wi-Fi 图标 / 控制中心图标 / Apple logo） */
 extern int g_tb2_net_rect[4];
 extern int g_tb2_vol_rect[4];
 extern int g_tb2_pwr_rect[4];
-extern int g_tb2_clk_rect[4];
+
+/* ---- menubar.c：Aqua 顶栏 ---- */
+void menubar_draw(void);
+void menubar_draw_menus(void);              /* 下拉菜单，弹出层绘制 */
+void menubar_pointer(int mx, int my);       /* 菜单打开时悬停切换 */
+int  menubar_click(int mx, int my);         /* 1=已消费 */
+int  menubar_key(u8 sc);                    /* Esc 收起；1=已消费 */
+int  menubar_hover_key(void);
+int  menubar_menu_open(void);
+void menubar_close_menus(void);
+
+/* ---- dock.c：Aqua Dock ---- */
+void dock_draw(void);
+int  dock_slide_y(void);                /* Dock 动画条带的顶边（含向上伸出的图标） */
+void dock_pointer(int mx, int my);          /* 每帧更新放大目标 */
+int  dock_tick(int dt_ms);                  /* 1=仍有轨道活动 */
+int  dock_click(int mx, int my);            /* 1=已消费 */
+int  dock_hover_key(void);
+void dock_icon_rect(int app_id, int r[4]);  /* 最小化目标；不在 Dock 时给中心 */
+
+/* ---- launchpad.c：Aqua Launchpad（替代 M3 开始菜单） ---- */
+void launchpad_open(void);
+void launchpad_close(void);
+void launchpad_toggle(void);
+void launchpad_draw(void);
+int  launchpad_tick(int dt_ms);
+int  launchpad_click(int mx, int my);       /* 打开时恒消费 */
+int  launchpad_key(u8 sc, int shift);       /* 打开时恒消费 */
+int  launchpad_hover_key(void);
+extern int g_lp_open;
+
+/* ---- compositor.c ---- */
+int  aqua_hover_key(void);                  /* 悬停目标变化 → 重绘 */
 
 /* ---- prank.c：整蛊系统（FUCK [prank] 段控制） ---- */
 extern int g_prank_enabled;    /* 总开关 */
 extern int g_prank_boot_demo;  /* 进桌面后演示秒数，0=关 */
 extern int g_prank_interval;   /* 使用中自动整蛊间隔（秒），0=关 */
-extern int g_prank_fuck;       /* FUCK 跟随鼠标遮屏 */
 extern int g_prank_bsod;       /* 假蓝屏 */
 extern int g_prank_invert;     /* 反色闪屏 */
 extern int g_prank_hang;       /* 假"未响应"对话框 */
@@ -578,6 +666,7 @@ void prank_draw(du_context *ctx);
 
 /* ---- main.c ---- */
 void dsk_entry(const dsk_boot_context *ctx);
+int  desktop_motion_step(void);   /* 推进全部动效；1=需要重绘 */
 
 /* ---- 内联小绘制（依赖 g_fb extern，放头文件末尾） ---- */
 

@@ -1,6 +1,7 @@
 /* desktop_app.h — Deshab 独立工具应用公共头文件
  *
- * 独立工具应用运行在 DSK 加载的 .elf 中，全屏独占 framebuffer。
+ * 独立工具应用运行在 DSK 加载的 .elf 中。桌面可以把 framebuffer 收成窗口客户区
+ * （DSK_BOOT_FLAG_HOSTED，kernel_stack_top = desk_host_view）。
  * 每个 .elf 实现 dsk_entry(dsk_boot_context *ctx) 入口点。
  * 通过 kernel_api 访问块设备、网络等内核服务。
  * PS/2 键盘/鼠标通过端口 I/O 直接轮询。
@@ -58,12 +59,47 @@ typedef struct {
 } da_app_context;
 
 /* 从 dsk_boot_context 初始化 da_app_context。
- * block API 从 kernel_api + 0xA8 获取：read @ +0x10，write @ +0x18。 */
+ * block API 从 kernel_api + 0xA8 获取：read @ +0x10，write @ +0x18。
+ * 窗口宿主不占用 reserved[6]/[7]（probe / 网络租约）。 */
+#define DA_HOST_FLAG  (1ull << 5)
+#define DA_HOST_MAGIC 0x484F5354u
+typedef struct da_host_view {
+    u32 magic;
+    u16 ox, oy;
+    u16 close_x, close_y, close_w, close_h;
+    void (*pump)(void);
+} da_host_view;
+
+static int g_da_hosted;
+static int g_da_ox, g_da_oy;
+static int g_da_close_x, g_da_close_y, g_da_close_w, g_da_close_h;
+static int g_da_esc;
+static void (*g_da_pump)(void);
+
 static inline void da_init(da_app_context *ac, const da_boot_context *ctx) {
+    const da_host_view *v;
     ac->fb = (u32 *)ctx->framebuffer_address;
     ac->fb_w = ctx->framebuffer_width;
     ac->fb_h = ctx->framebuffer_height;
     ac->fb_pitch = ctx->framebuffer_pitch;
+    g_da_hosted = 0;
+    g_da_ox = g_da_oy = 0;
+    g_da_close_w = g_da_close_h = 0;
+    g_da_esc = 0;
+    g_da_pump = 0;
+    if (ctx->flags & DA_HOST_FLAG) {
+        v = (const da_host_view *)ctx->kernel_stack_top;
+        if (v && v->magic == DA_HOST_MAGIC) {
+            g_da_hosted = 1;
+            g_da_ox = (int)v->ox;
+            g_da_oy = (int)v->oy;
+            g_da_close_x = (int)v->close_x;
+            g_da_close_y = (int)v->close_y;
+            g_da_close_w = (int)v->close_w;
+            g_da_close_h = (int)v->close_h;
+            g_da_pump = v->pump;
+        }
+    }
     ac->kernel_api = (const void *)ctx->dkm_kernel_api;
     ac->block_read = 0;
     ac->block_write = 0;
@@ -338,6 +374,110 @@ static inline int da_mouse_poll(da_mouse *m, da_cursor *c, i64 fb_w, i64 fb_h) {
     return 1;
 }
 
+/* ========== 输入服务总线（P6b）==========
+ *
+ * P6b 后 ps2kbd.drv/ps2mouse.drv 常驻，其 IRQ1/IRQ12 handler 已把端口 0x60
+ * 的字节读走。全屏工具若仍用 da_mouse_poll/inb(0x60) 轮询，必然饿死
+ * （鼠标不动 / Esc 失灵，退出后残留半包导致光标错乱）。
+ *
+ * 改用总线 srv.input.kbd.poll / srv.input.mouse.poll（与 shell/cmd 同款）。
+ * 偏移：kernel_api.bus @ +0xF0；dkm_bus_api.probe @ +32。
+ * 与 SDK deshab/input_bus.h 的 dsb_input 语义一致。 */
+typedef struct {
+    int (*kbd_poll)(u8 *out, u32 cap);
+    int (*mouse_poll)(void *out);          /* out = da_mouse_state* */
+    int  present;
+} da_input;
+
+/* 与 ps2mouse.drv 的 mouse_state_t 逐字段一致（消费契约 ABI v1）。 */
+#define DA_MOUSE_STATE_MAGIC 0x4D4F5553u   /* "MOUS" */
+typedef struct {
+    u32 magic; u32 version;
+    int x, y;
+    u32 buttons, packet_count, overflow_count;
+    int max_x, max_y;
+} da_mouse_state;
+
+/* 从 da_app_context.kernel_api（void*，实为 dkm_kernel_api*）打开输入总线。
+ * 返回 0 = kbd 就绪；-1 = kbd 服务缺席（调用方应放弃端口轮询并退出）。 */
+static inline int da_input_open(da_input *in, const da_app_context *ac) {
+    u64 api = (u64)ac->kernel_api;
+    in->kbd_poll = 0;
+    in->mouse_poll = 0;
+    in->present = 0;
+    if (!api) return -1;
+    u64 bus = *(u64 *)(api + 0xF0);
+    if (!bus) return -1;
+    int (*probe)(const char *, void **, u32 *) =
+        (int (*)(const char *, void **, u32 *))*(u64 *)(bus + 32);
+    if (!probe) return -1;
+    void *fn = 0;
+    if (probe("srv.input.kbd.poll", &fn, 0) != 0 || !fn) return -1;
+    in->kbd_poll = (int (*)(u8 *, u32))fn;
+    fn = 0;
+    if (probe("srv.input.mouse.poll", &fn, 0) == 0 && fn)
+        in->mouse_poll = (int (*)(void *))fn;
+    in->present = 1;
+    return 0;
+}
+
+/* 取一个键盘扫描码；1 = 取到，0 = 无事件。（内部 64 槽预取缓存放静态） */
+static inline int da_input_kbd(da_input *in, u8 *sc) {
+    static u8 kbuf[64];
+    static u32 kn = 0, ki = 0;
+    if (g_da_pump) g_da_pump();
+    if (g_da_esc) { g_da_esc = 0; if (sc) *sc = 0x01; return 1; }
+    if (!in || !in->kbd_poll) return 0;
+    if (ki >= kn) {
+        int n = in->kbd_poll(kbuf, (u32)sizeof(kbuf));
+        ki = 0; kn = n > 0 ? (u32)n : 0;
+        if (!kn) return 0;
+    }
+    *sc = kbuf[ki++];
+    return 1;
+}
+
+/* 有新鼠标包时用绝对坐标更新 da_cursor（驱动已按 fb 钳位）。返回 1 = 新包。
+ * 首次调用只建基线（返回 0）。鼠标服务缺席时返回 0（键盘仍可用）。 */
+static inline int da_input_mouse(da_input *in, da_cursor *c, i64 fb_w, i64 fb_h) {
+    static u32 seen = 0;
+    static int valid = 0;
+    static int prev_btn = 0;
+    da_mouse_state m;
+    int x, y, btn, changed;
+    if (g_da_pump) g_da_pump();
+    if (!in || !in->mouse_poll || !c) return 0;
+    if (in->mouse_poll(&m) != 0 || m.magic != DA_MOUSE_STATE_MAGIC) return 0;
+    x = (int)m.x - g_da_ox;
+    y = (int)m.y - g_da_oy;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (fb_w > 0 && x >= (int)fb_w) x = (int)fb_w - 1;
+    if (fb_h > 0 && y >= (int)fb_h) y = (int)fb_h - 1;
+    btn = (int)(m.buttons & 0x01u);
+    if (!valid) {
+        valid = 1;
+        seen = m.packet_count;
+        prev_btn = btn;
+        c->mx = x;
+        c->my = y;
+        c->btn = btn;
+        return 0;
+    }
+    if (g_da_hosted && btn && g_da_close_w > 0 &&
+        m.x >= g_da_close_x && m.x < g_da_close_x + g_da_close_w &&
+        m.y >= g_da_close_y && m.y < g_da_close_y + g_da_close_h)
+        g_da_esc = 1;
+    changed = (m.packet_count != seen) || (btn != prev_btn) ||
+              (x != c->mx) || (y != c->my) || g_da_esc;
+    seen = m.packet_count;
+    prev_btn = btn;
+    c->mx = x;
+    c->my = y;
+    c->btn = btn;
+    return changed ? 1 : 0;
+}
+
 /* ========== 键盘 ========== */
 static inline char da_scan_to_ascii(u8 sc, int shift) {
     static const char normal[58] = {
@@ -360,6 +500,7 @@ static inline char da_scan_to_ascii(u8 sc, int shift) {
 /* 独立工具全屏运行时的窗口装饰：标题栏 + 关闭按钮 */
 
 #define DA_TITLEBAR_H 28
+static inline int da_chrome_h(void) { return g_da_hosted ? 0 : DA_TITLEBAR_H; }
 #define DA_BORDER_W   2
 #define DA_STATUSBAR_H 20
 
@@ -380,6 +521,7 @@ static inline char da_scan_to_ascii(u8 sc, int shift) {
 #define DA_WARNING        0xFFF0A030u   /* DP_WARNING */
 
 static inline void da_draw_titlebar(da_app_context *ac, const char *title, i64 w) {
+    if (g_da_hosted) return;
     da_fill_rect(ac, 0, 0, w, DA_TITLEBAR_H, DA_BG_SECONDARY);
     da_draw_string(ac, title, 8, (DA_TITLEBAR_H - 18) / 2, DA_TEXT_PRIMARY, DA_BG_SECONDARY, 12);
     /* 关闭按钮 */

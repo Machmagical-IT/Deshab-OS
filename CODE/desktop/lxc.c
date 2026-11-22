@@ -18,6 +18,7 @@ int g_launch_phase = 0;
 char g_launch_status[64] = "";
 u64  g_launch_tsc = 0;        /* 启动开始 TSC（测各阶段耗时） */
 int  g_launch_exec_rc = 0;    /* exec_async 返回码 */
+static int g_guest_absent = 0; /* 1 = 这次启动时 guest 根本不在（无 VMX） */
 int  g_launch_pgrep_rc = -1;  /* pgrep 验证结果（0=找到, 1=未找到）*/
 
 /* P7.4 多实例：IDE tab 动态标签——显示最近启动实例的 DISPLAY 名
@@ -61,21 +62,22 @@ void slog_num(const char *prefix, int rc) {
  * shell 立即退出被 daemon 回收，Xfbdev 由 init 收养继续运行。
  * Phase 6: pgrep 守卫保证幂等（多实例/重复 attach 不重起 X）。 */
 static void ide_launch_guest_x(void) {
-    if (!g_lxc_svc || !g_lxc_svc->exec) { slog("ide: lxc exec unavailable"); return; }
+    if (!g_lxc_svc || !g_lxc_svc->exec_async) { slog("ide: lxc exec_async unavailable"); return; }
     slog("[launch] phase 1: launching Xfbdev");
     g_launch_phase = 1;
     kstrcpy(g_launch_status, "LAUNCHING X SERVER . . .", 64);
+    /* 以前用同步 sh -c '... &'，Xfbdev 的报错被送进 /dev/null，socket 起不来
+     * 时只剩一条 timeout。改成异步前台 exec，日志留在 /tmp/Xfbdev.log。 */
     const char *argv[] = {
         "sh", "-c",
-        "pgrep -x Xfbdev >/dev/null 2>&1 || "
-        "Xfbdev :0 -geometry 1024x768 -depth 32 >/dev/null 2>&1 &"
+        "if pgrep -x Xfbdev >/dev/null 2>&1; then exit 0; fi; "
+        "mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix; "
+        "if [ -x /usr/bin/Xfbdev ]; then X=/usr/bin/Xfbdev; else X=Xfbdev; fi; "
+        "exec \"$X\" :0 -ac -nolisten tcp -geometry 1024x768 -depth 32 "
+        ">/tmp/Xfbdev.log 2>&1"
     };
-    u64 exit_code = 0;
-    int rc = g_lxc_svc->exec("/bin/sh", 3, argv, 0, 0, 0, &exit_code);
-    slog_num("[launch] Xfbdev exec rc=", rc);
-    if (rc != 0) {
-        slog("[launch] WARNING: Xfbdev launch rc!=0 (may still be OK if already running)");
-    }
+    int rc = g_lxc_svc->exec_async("/bin/sh", 3, argv);
+    slog_num("[launch] Xfbdev exec_async rc=", rc);
 }
 
 /* P8.1 Fix: lxc guest ping -- exec "echo OK" 快速检测 Linux guest 是否运行。
@@ -97,10 +99,13 @@ int lxc_guest_ping(void) {
  * 后续调用（多实例）跳过 X 准备直接 spawn。path 为 NULL 时仅确保 X 在线。
  * P8.1 Fix: 启动前 ping 检测 guest 可用性；失败时快速短路，不浪费 5s X socket 等待。 */
 void guest_gui_launch(const char *path, int argc, const char *const *argv) {
+    g_launch_exec_rc = -1;
+    g_guest_absent = 0;
     if (!g_lxc_svc) {
         slog("[launch] lxc service null");
+        g_guest_absent = 1;
         g_launch_phase = 7;
-        kstrcpy(g_launch_status, "LXC SERVICE UNAVAILABLE", 64);
+        desktop_fatal("DESK-E14 LINUX GUEST DEAD");
         return;
     }
     if (g_vscode_state == 0) {
@@ -115,9 +120,10 @@ void guest_gui_launch(const char *path, int argc, const char *const *argv) {
         slog_num("[launch] guest ping rc=", prc);
         if (prc != 0) {
             slog("[launch] FAIL: Linux guest not running (VMX/guest unavailable)");
-            g_vscode_state = 0;   /* 回到未启动状态 */
+            g_vscode_state = 0;
+            g_guest_absent = 1;
             g_launch_phase = 7;
-            kstrcpy(g_launch_status, "GUEST NOT RUNNING - NEED KVM/VMX", 64);
+            desktop_fatal("DESK-E14 LINUX GUEST DEAD");
             return;
         }
         slog("[launch] guest ping OK - Linux guest is running");
@@ -133,17 +139,24 @@ void guest_gui_launch(const char *path, int argc, const char *const *argv) {
             const char *wargv[] = {
                 "sh", "-c",
                 "i=0; while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 25 ]; "
-                "do sleep 0.2; i=$((i+1)); done; [ -S /tmp/.X11-unix/X0 ] && echo OK || echo FAIL"
+                "do sleep 0.2; i=$((i+1)); done; "
+                "if [ -S /tmp/.X11-unix/X0 ]; then echo OK; "
+                "else echo FAIL; "
+                "ps | grep -e Xfbdev -e code | grep -v grep; "
+                "ls -l /usr/bin/Xfbdev /dev/fb0 /tmp/.X11-unix 2>&1; "
+                "tail -c 180 /tmp/Xfbdev.log 2>&1; fi"
             };
-            /* 用 exec + stdout 捕获验证 X socket 是否就绪 */
-            char xout[16] = {0};
+            char xout[240];
+            int xi;
             u64 ec = 0;
-            int rc = g_lxc_svc->exec("/bin/sh", 3, wargv, xout, 15, 0, &ec);
+            for (xi = 0; xi < (int)sizeof(xout); xi++) xout[xi] = 0;
+            int rc = g_lxc_svc->exec("/bin/sh", 3, wargv, xout, (int)sizeof(xout) - 1, 0, &ec);
             slog_num("[launch] X socket wait rc=", rc);
             if (xout[0] == 'O' && xout[1] == 'K') {
                 slog("[launch] X socket READY (/tmp/.X11-unix/X0 exists)");
             } else {
                 slog("[launch] WARNING: X socket NOT ready after ~5s timeout");
+                slog(xout);
                 kstrcpy(g_launch_status, "X SOCKET TIMEOUT - RETRYING SPAWN", 64);
             }
         }
@@ -162,10 +175,14 @@ void guest_gui_launch(const char *path, int argc, const char *const *argv) {
             slog("[launch] exec_async OK - process spawned");
         } else {
             slog("[launch] exec_async FAILED - process not spawned");
-            g_vscode_state = 0;   /* P8.1 Fix: 回到未启动，UI 显示错误而非永远 STARTING */
+            g_vscode_state = 0;
             g_launch_phase = 7;
             kstrcpy(g_launch_status, "SPAWN FAILED - CHECK SERIAL LOG", 64);
             return;
+        }
+        /* 异步子进程要靠后续 resume 才跑得起来。先切几片，避免一返回就冻住。 */
+        if (g_lxc_svc->run_slice) {
+            for (int s = 0; s < 8; s++) (void)g_lxc_svc->run_slice();
         }
 
         /* Phase 4: pgrep verify process exists (bounded wait ~1s) */
@@ -236,46 +253,52 @@ void desktop_launch_pending_native(void) {
 
 /* VSCode Phase 5/6: 桌面图标启动 Linux 应用（LINUXAPP.CNF 注册项）。
  * 解析 args（空格分隔）后经共享路径 exec_async，并切到 IDE 页 attach。 */
-void launch_linux_app(int app_id) {
-    if (app_id < 0 || app_id >= g_app_count) return;
-    app_descriptor *app = &g_apps[app_id];
-    if (!app->linux_path) return;
+void launch_linux_path(const char *name, const char *disp,
+                       const char *path, const char *args) {
+    if (!name || !name[0]) name = "linux";
+    if (!disp || !disp[0]) disp = name;
+    if (!path || !path[0]) {
+        desktop_fatal("DESK-E14 LINUX PATH DEAD");
+        return;
+    }
     if (!g_lxc_svc || !g_lxc_svc->exec_async) {
         slog("linuxapp: lxc service unavailable");
+        desktop_fatal("DESK-E14 LINUX GUEST DEAD");
         return;
     }
 
-    if (fat32_lfn_streq_ci(app->name, "kde")) {
-        const char *kargv[2];
+    if (fat32_lfn_streq_ci(name, "kde")) {
         struct linux_compat_scanout_info si;
         u32 *fb = (u32 *)g_fb.fb;
+        const char *kargv[2];
         slog("kde: launching fullscreen Plasma");
-        if (g_lxc_svc->exec) {
-            const char *rmargv[] = { "sh", "-c", "rm -f /tmp/deshab-native /tmp/deshab-native-app" };
-            u64 ec = 0;
-            (void)g_lxc_svc->exec("/bin/sh", 3, rmargv, 0, 0, 0, &ec);
-        }
-        kargv[0] = app->linux_path;
+        kargv[0] = path;
         kargv[1] = 0;
-        if (g_lxc_svc->exec_async(app->linux_path, 1, kargv) != 0) {
-            slog("kde: exec_async failed");
+        /* 不再先做同步 rm：那次 exec 的迟到 EXEC_EXIT 会被后面的
+         * exec_async 当成自己的失败码。改走和 VSCode 相同的启动。 */
+        guest_gui_launch(path, 1, kargv);
+        if (g_guest_absent) {
+            desktop_fatal("DESK-E14 LINUX GUEST DEAD");
+            return;
+        }
+        if (g_launch_exec_rc != 0 || g_vscode_state == 0) {
+            slog_num("kde: exec_async rc=", g_launch_exec_rc);
+            desktop_fatal("DESK-E14 LINUX EXEC DEAD");
             return;
         }
         {
             int scanout_logged = 0;
         for (;;) {
-            u8 st = inb(0x64);
-            if (st & 1) {
-                if (!(st & 0x20)) {
-                    u8 sc = inb(0x60);
-                    if (sc == 0x01) {
-                        slog("kde: aborted by Esc");
-                        break;
-                    }
-                } else {
-                    (void)inb(0x60);
+            int aborted = 0;
+            u8 sc;
+            while (dt_kbd_poll(&sc)) {
+                if (sc == 0x01) {
+                    slog("kde: aborted by Esc");
+                    aborted = 1;
+                    break;
                 }
             }
+            if (aborted) break;
             if (g_lxc_svc->run_slice) {
                 int pump;
                 for (pump = 0; pump < 4; pump++)
@@ -316,12 +339,12 @@ void launch_linux_app(int app_id) {
     /* argv: [name, ...args]（args 在本地缓冲内原地切分） */
     const char *argv[16];
     int argc = 0;
-    argv[argc++] = app->name;
+    argv[argc++] = name;
     char abuf[96];
-    if (app->linux_args && app->linux_args[0]) {
-        int n = kstrlen(app->linux_args);
+    if (args && args[0]) {
+        int n = kstrlen(args);
         if (n > (int)sizeof(abuf) - 1) n = (int)sizeof(abuf) - 1;
-        for (int i = 0; i < n; i++) abuf[i] = app->linux_args[i];
+        for (int i = 0; i < n; i++) abuf[i] = args[i];
         abuf[n] = 0;
         char *p = abuf;
         while (*p && argc < 15) {
@@ -333,12 +356,25 @@ void launch_linux_app(int app_id) {
         }
     }
 
-    guest_gui_launch(app->linux_path, argc, argv);
+    guest_gui_launch(path, argc, argv);
+
+    /* guest 缺席（无 VMX/KVM）→ guest_gui_launch 把 g_vscode_state 归零。
+     * 此时不要 attach/切 IDE 页：否则用户点一下 Linux 应用就被带到空白的
+     * IDE 页，桌面上再点其它应用（窗口只在 DESKTOP 页绘制）也看不到。 */
+    if (g_guest_absent) {
+        desktop_fatal("DESK-E14 LINUX GUEST DEAD");
+        return;
+    }
+    if (g_vscode_state == 0) {
+        slog("linuxapp: guest unavailable");
+        desktop_fatal("DESK-E14 LINUX GUEST DEAD");
+        return;
+    }
 
     /* P7.4: tab 标签跟随最近启动实例（DISPLAY 名，≤15 字符） */
     {
         int i = 0;
-        const char *dn = app->display_name;
+        const char *dn = disp;
         while (dn && dn[i] && i + 1 < (int)sizeof(g_ide_tab_label)) {
             g_ide_tab_label[i] = dn[i];
             i++;
@@ -352,6 +388,16 @@ void launch_linux_app(int app_id) {
     ide_attach_invalidate();   /* P7.3: attach 首帧全量重绘 */
     page_switch(2);
     slog("linuxapp launched -> ide attached");
+}
+
+void launch_linux_app(int app_id) {
+    app_descriptor *app;
+    if (app_id < 0 || app_id >= g_app_count) {
+        desktop_fatal("DESK-E14 LINUX APP ID DEAD");
+        return;
+    }
+    app = &g_apps[app_id];
+    launch_linux_path(app->name, app->display_name, app->linux_path, app->linux_args);
 }
 
 /* VSCode Phase 6: IDE attach 共享入口——启动（或复用）VSCode。 */

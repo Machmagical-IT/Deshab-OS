@@ -13,6 +13,17 @@
 /* FUCK [panic] mode=fallback：DSK/desktop/login/FirstInit 的 *_fatal 记录后返回，
  * 调用点走备用路径（见 utsm/panic.h）。未置位 = strict。 */
 #define DSK_BOOT_FLAG_PANIC_FALLBACK  (1ULL << 4)
+/* 桌面把应用嵌进窗口时，只在栈上的 context 副本置位。
+ * kernel_stack_top 指向 desk_host_view（不占用 reserved[4..7]）。 */
+#define DSK_BOOT_FLAG_HOSTED          (1ULL << 5)
+#define DESK_HOST_MAGIC               0x484F5354u /* "HOST" */
+
+typedef struct desk_host_view {
+    u32 magic;
+    u16 ox, oy;
+    u16 close_x, close_y, close_w, close_h;
+    void (*pump)(void);
+} desk_host_view;
 
 /* ---- Probe 信息结构（通过 reserved[6] 传递给 shell/desktop） ---- */
 #define PROBE_INFO_MAGIC 0x50524F42u  /* "PRFB" — Probe inFo Buffer */

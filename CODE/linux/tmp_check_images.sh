@@ -3,7 +3,7 @@
 # payload files, so we know which images carry the FLUSH_N kernel.
 set -uo pipefail
 ROOT=/mnt/d/Code/DEAICUP/Deshab
-SRC="$ROOT/SYSTEM/boot/utsm.elf"
+SRC="$ROOT/SYSTEM/ESP/boot/utsm.elf"
 WANT=$(md5sum "$SRC" | cut -d' ' -f1)
 
 echo "want utsm.elf md5=$WANT size=$(stat -c %s "$SRC")"

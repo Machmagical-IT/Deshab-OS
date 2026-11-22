@@ -79,6 +79,8 @@ static inline u64 gp(u64 va) {
 static u8  *s_wsurf = 0;
 static u32 s_wsurf_w = 0, s_wsurf_h = 0, s_wsurf_pitch = 0;
 static int (*s_host_pump)(void *ud) = 0;
+static int s_presented;   /* 第一帧 BitBlt 之前不接受 WM_CLOSE（启动残留 Esc） */
+static int g_mq_head, g_mq_count;
 static void *s_host_ud = 0;
 static struct limine_framebuffer s_wsurf_fb;   /* 伪造 fb（窗口模式） */
 static const pe_window_host *s_winhost_pending = 0;  /* service 层挂起配置 */
@@ -93,6 +95,9 @@ void pe_shim_init(const char *cmdline) {
     g_cmdline = cmdline ? cmdline : "";
     g_exit_jmp_set = 0;
     g_exit_code = 0;
+    s_presented = 0;
+    g_mq_head = 0;
+    g_mq_count = 0;
     g_emu_mem_base = 0;  /* BUG-007: 默认非解释器上下文(原生路径恒等映射) */
 
     /* P5：应用 service 层挂起的窗口模式配置（在状态重置之后生效） */
@@ -1034,11 +1039,16 @@ typedef struct {
 
 #define SHIM_MSGQ_CAP 64
 static shim_msg_t g_msgq[SHIM_MSGQ_CAP];
-static int g_mq_head = 0, g_mq_count = 0;
 
 static u32 g_mq_drops = 0;  /* 队列满丢弃计数(诊断) */
 
 static void shim_msg_push_pt(u32 msg, u64 w, u64 l, i32 ptx, i32 pty) {
+    /* 关闭按钮走 inject_input → 这里，不经过 shim_msg_push。
+     * 第一帧画上之前的 WM_CLOSE 一律丢掉。 */
+    if (msg == SHIM_WM_CLOSE && !s_presented) {
+        log_info("[shim] drop WM_CLOSE before first present");
+        return;
+    }
     if (g_mq_count >= SHIM_MSGQ_CAP) {
         if (g_mq_drops < 4) { g_mq_drops++; log_hex64("[shim] msgq drop msg=", msg); }
         return;
@@ -1666,6 +1676,7 @@ static u64 __attribute__((ms_abi)) shim_BitBlt(u64 dstdc, u64 x, u64 y, u64 cx, 
         }
     }
     shim_draw_cursor(fb);
+    s_presented = 1;
     g_blit_count++;
     if (g_blit_count == 1) log_info("[shim] BitBlt first frame on screen");
     if ((g_blit_count % 600) == 0) {

@@ -9,6 +9,7 @@
 
 #include <utsm/linux_xsave.h>
 #include <utsm/vmx.h>
+#include <utsm/vm_machine.h>
 #include <utsm/log.h>
 #include <utsm/types.h>
 
@@ -18,10 +19,20 @@
 #define LINUX_XSAVE_YMM_OFF     576u
 
 static int g_xsave_ok;
-static u64 g_guest_xcr0 = LINUX_XSAVE_XCR0;
 static u64 g_host_xcr0 = LINUX_XSAVE_XCR0;
-static u8 g_guest_xsave[4096] __attribute__((aligned(64)));
+static u64 g_fallback_guest_xcr0 = LINUX_XSAVE_XCR0;
+static u8 g_fallback_guest_xsave[4096] __attribute__((aligned(64)));
 static u8 g_host_xsave[4096] __attribute__((aligned(64)));
+
+static u8 *active_guest_xsave(void) {
+    struct vm_vcpu *vcpu = vm_vcpu_active();
+    return vcpu ? vcpu->xsave_area : g_fallback_guest_xsave;
+}
+
+static u64 *active_guest_xcr0(void) {
+    struct vm_vcpu *vcpu = vm_vcpu_active();
+    return vcpu ? &vcpu->xcr0 : &g_fallback_guest_xcr0;
+}
 
 static void xsave_zero(u8 *p, usize n) {
     for (usize i = 0; i < n; i++)
@@ -84,15 +95,15 @@ void linux_xsave_init(void) {
         return;
     }
 
-    xsave_zero(g_guest_xsave, sizeof(g_guest_xsave));
+    xsave_zero(active_guest_xsave(), 4096);
     xsave_zero(g_host_xsave, sizeof(g_host_xsave));
-    g_guest_xcr0 = LINUX_XSAVE_XCR0;
+    *active_guest_xcr0() = LINUX_XSAVE_XCR0;
     g_host_xcr0 = LINUX_XSAVE_XCR0;
 
     xsave_enable_osxsave();
     xsave_xsetbv(LINUX_XSAVE_XCR0);
     /* Init-state XRSTOR so the first vmlaunch does not inherit host junk. */
-    xrstor_mem(g_guest_xsave, LINUX_XSAVE_XCR0);
+    xrstor_mem(active_guest_xsave(), LINUX_XSAVE_XCR0);
 
     g_xsave_ok = 1;
     log_info("[LINUX] XSAVE ready for L2 (x87+SSE+AVX, XCR0=7)");
@@ -102,17 +113,19 @@ void linux_xsave_init(void) {
 void linux_xsave_save_guest(void) {
     if (!g_xsave_ok)
         return;
+    u64 guest_xcr0 = *active_guest_xcr0();
     xsave_enable_osxsave();
-    xsave_xsetbv(g_guest_xcr0);
-    xsave_mem(g_guest_xsave, g_guest_xcr0);
+    xsave_xsetbv(guest_xcr0);
+    xsave_mem(active_guest_xsave(), guest_xcr0);
 }
 
 void linux_xsave_load_guest(void) {
     if (!g_xsave_ok)
         return;
+    u64 guest_xcr0 = *active_guest_xcr0();
     xsave_enable_osxsave();
-    xsave_xsetbv(g_guest_xcr0);
-    xrstor_mem(g_guest_xsave, g_guest_xcr0);
+    xsave_xsetbv(guest_xcr0);
+    xrstor_mem(active_guest_xsave(), guest_xcr0);
 }
 
 void linux_xsave_save_host(void) {
@@ -148,7 +161,7 @@ void linux_xsave_set_guest_xcr0(u64 xcr0) {
         log_hex64("[LINUX] XSETBV clamped from=", xcr0);
         log_hex64("[LINUX] XSETBV clamped to=", v);
     }
-    g_guest_xcr0 = v;
+    *active_guest_xcr0() = v;
     xsave_enable_osxsave();
     xsave_xsetbv(v);
 }

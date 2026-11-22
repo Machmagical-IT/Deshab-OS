@@ -6,14 +6,6 @@
  */
 #include "pe_tool.h"
 
-static void draw_hand(PT_Canvas *cv, int cx, int cy,
-                      double angle, int len, int width, u32 col) {
-    /* 角度 0 = 12 点方向，顺时针 */
-    int ex = cx + (int)(len * angle_sin(angle));
-    int ey = cy - (int)(len * angle_cos(angle));
-    pt_line(cv, cx, cy, ex, ey, width, col);
-}
-
 /* sin/cos：角度单位 = 圈（0..1）。表盘刻度只需粗精度，
  * 用 0.1° 查表 + 线性插值避免引入浮点库调用。 */
 static const short S_SIN[91] = { /* sin(0..90°)*10000 */
@@ -50,6 +42,14 @@ static double angle_sin(double turns) {
 
 static double angle_cos(double turns) {
     return angle_sin(turns + 0.25);
+}
+
+static void draw_hand(PT_Canvas *cv, int cx, int cy,
+                      double angle, int len, int width, u32 col) {
+    /* 角度 0 = 12 点方向，顺时针 */
+    int ex = cx + (int)(len * angle_sin(angle));
+    int ey = cy - (int)(len * angle_cos(angle));
+    pt_line(cv, cx, cy, ex, ey, width, col);
 }
 
 static void frame(PT_Canvas *cv) {

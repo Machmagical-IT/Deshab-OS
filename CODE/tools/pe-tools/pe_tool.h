@@ -10,7 +10,7 @@
  *   kernel32: ExitProcess/GetTickCount/QueryPerformanceCounter/Frequency
  *
  * 不可用（调了即未实现 stub / panic）：
- *   TextOut*/SetPixel 等 GDI 绘制（自带 11x18 位图字体 + DIB 直写像素）
+ *   TextOut / SetPixel 等 GDI 绘制（自带 11x18 位图字体 + DIB 直写像素）
  *   文件 IO（CreateFileA → PE-E05 panic）
  *   WM_TIMER（SetTimer 为 no-op；渲染循环每帧自驱）
  *
@@ -25,6 +25,11 @@
 typedef unsigned int   u32;
 typedef unsigned char  u8;
 typedef unsigned short u16;
+typedef unsigned long long u64;
+
+/* -nostdlib 下 g++ 仍会在 main 头部插 __main 调用（全局构造器入口）。
+ * 本运行时禁止全局构造（无 CRT 初始化），提供空实现顶掉链接依赖。 */
+extern "C" void __main(void) {}
 
 /* ---- 端口 I/O（Ring0 原生） ---- */
 static inline void pt_outb(u16 port, u8 v) {
@@ -266,7 +271,9 @@ static LRESULT CALLBACK pt_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (pt_g_desc.key) pt_g_desc.key(0, (unsigned)wp);
         return 0;
     case WM_CLOSE:
-        DestroyWindow(hwnd);
+        /* shim 的 DestroyWindow 是 no-op（不发 WM_DESTROY），必须直接
+         * PostQuitMessage 才能让 pt_run 的 PeekMessage 收到 WM_QUIT 退出。 */
+        PostQuitMessage(0);
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);

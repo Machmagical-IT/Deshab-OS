@@ -6,6 +6,11 @@
 #include "../UTSM/include/utsm/dsk.h"
 #include "../UTSM/include/utsm/pe.h"
 #include "../UTSM/include/utsm/linux_compat.h"
+#include "../DKM/dkm_shared.h"   /* P6b: dkm_kernel_api/dkm_bus_api 布局 */
+#include "../DKM/dkm_input.h"     /* P6b: srv.input.kbd.poll 客户端 */
+
+static dkm_input g_input;
+static int g_input_logged;
 
 typedef unsigned char      u8;
 typedef unsigned short     u16;
@@ -3226,10 +3231,24 @@ static void cmd_test(void) {
     run_script(g_script_buf, ssize);
 }
 
+/* 窗口关闭钮：桌面主循环被本函数占住，这里自己看鼠标。 */
+static int host_take_close(void) {
+    const desk_host_view *v;
+    dkm_input_mouse m;
+    if (!g_boot_ctx || !(g_boot_ctx->flags & DSK_BOOT_FLAG_HOSTED)) return 0;
+    v = (const desk_host_view *)(u64)g_boot_ctx->kernel_stack_top;
+    if (!v || v->magic != DESK_HOST_MAGIC) return 0;
+    if (v->pump) v->pump();
+    if (!g_input.mouse_poll || v->close_w == 0) return 0;
+    if (g_input.mouse_poll(&m) != 0 || m.magic != DKM_INPUT_MOUSE_MAGIC) return 0;
+    if ((m.buttons & 1u) == 0) return 0;
+    return m.x >= (int)v->close_x && m.x < (int)v->close_x + (int)v->close_w &&
+           m.y >= (int)v->close_y && m.y < (int)v->close_y + (int)v->close_h;
+}
+
 /* ---- 主入口 ---- */
 __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
-    __asm__ volatile("cli");
     logl("[shell] boot");
 
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
@@ -3256,6 +3275,18 @@ void dsk_entry(const dsk_boot_context *ctx) {
     }
     if (g_block_read)  logl("[shell] block_read ok");
     if (g_block_write) logl("[shell] block_write ok");
+
+    /* P6b：输入经服务总线（IRQ1 已由 session.drv 解屏蔽）。 */
+    {
+        const struct dkm_kernel_api *api = (const struct dkm_kernel_api *)(u64)g_kernel_api;
+        if (dkm_input_open(&g_input, api) != 0) {
+            logl("[shell] srv.input.kbd.poll missing");
+            if (api && api->log) api->log->panic("INPUT-E01 KBD POLL SERVICE MISSING");
+            return;
+        }
+        __asm__ volatile("sti" ::: "memory");
+        logl("[shell] input: kbd via srv.input.kbd.poll");
+    }
 
     /* 获取 Linux 兼容层服务（reserved[5]）—— 双内核 park-and-resume */
     {
@@ -3343,11 +3374,13 @@ void dsk_entry(const dsk_boot_context *ctx) {
                     cur_visible = want_vis;
                 }
             }
-            u8 st = inb(0x64);
-            if (!(st & 1)) { __asm__("pause"); continue; }
-            u8 data = inb(0x60);
-            if (st & 0x20) continue;
-            u8 sc = data;
+            u8 sc;
+            if (host_take_close()) { logl("[shell] close -> return to DSK"); return; }
+            if (!dkm_input_kbd(&g_input, &sc)) { __asm__("pause"); continue; }
+            if (!g_input_logged) {
+                g_input_logged = 1;
+                logl("[shell] kbd event via srv.input.kbd.poll");
+            }
             /* 有键盘输入时重置闪烁，让光标保持可见 */
             blink_start = rdtsc_shell();
             if (!cur_visible) { cur_visible = 1; term_redraw_cursor(); }

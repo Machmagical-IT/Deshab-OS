@@ -12,10 +12,14 @@
 #include <utsm/ipc_shm.h>
 #include <utsm/linux_compat.h>
 #include <utsm/xj380_loader.h>
+#include <utsm/zt5_loader.h>
+#include <utsm/windows_guest.h>
 #include <utsm/instr.h>
 #include <utsm/attest.h>
 #include "ini_parser.h"
 #include "../arch/x86_64/limine.h"
+#include <utsm/boot_status.h>
+#include <utsm/lapic_timer.h>
 #include "../pe/pe_dll_manager.h"
 
 void arch_halt_forever(void);
@@ -28,13 +32,9 @@ void dsm_load_named(const ini_config *cfg, const char *name);
 /* P0 顺序豁免版：唯一调用方就是下方 VMM 路径（pci+ahci 必须先于 apic） */
 void dsm_load_named_boot(const ini_config *cfg, const char *name);
 
-/* dsk_loader.c: 按路径读取 FAT32 文件到 g_dsk_fat32_filedata 静态缓冲。
- * Phase 1 已支持 LFN 长文件名 + 子目录遍历。 */
-extern int fat32_read_path(const char *path, u8 **out_data, u32 *out_size);
-
-/* dsk_loader.c: 实机启动日志落盘。把日志缓冲写入 FAT32 文件：
- * SYSTEM/DESHAB64/DEV/BOOTLOG.TXT（DEV 缺失时回退根目录 BOOTLOG.TXT）。 */
-extern int utsm_bootlog_write(const u8 *data, u32 size);
+/* P2 归位：FAT32 读写能力已移入 fat32.drv，经服务总线消费
+ * （srv.fs.fat32.read_path / bootlog，见 utsm_fat32_svc）。dsk_loader.c 的
+ * 同名工具函数已删除。 */
 
 /* ---- 运行期配置全局变量（从 FUCK 文件初始化） ---- */
 u32 g_utsm_max_segments     = UTSM_MAX_SEGMENTS_DEFAULT;
@@ -98,10 +98,24 @@ static void utsm_apply_compat_config(const ini_config *cfg) {
     log_hex64("[UTSM] vscode_install=", (u64)g_compat_vscode_install);
 }
 
+/* D6 万物互联：经服务总线取 fat32.drv 提供的服务。缺席返回 NULL——
+ * 设计内回退（无 FAT32 卷/无块设备属环境能力缺失，白名单登记）。 */
+static void *utsm_fat32_svc(const char *name) {
+    const dkm_kernel_api *api = dkm_get_kernel_api();
+    if (!api || !api->bus) return 0;
+    void *fn = 0;
+    if (api->bus->probe(name, &fn, 0) != 0) return 0;
+    return fn;
+}
+
 /* DLL 文件读取回调：从 FAT32 根目录下 lib/ 子目录读取 DLL。
- * 路径构造成 "<g_compat_lib_path>/<name>"（lib 在 FAT32 根，不是 SYSTEM/lib！）。 */
+ * 路径构造成 "<g_compat_lib_path>/<name>"（lib 在 FAT32 根，不是 SYSTEM/lib！）。
+ * P2：改由 fat32.drv 经总线提供（srv.fs.fat32.read_path，GPT 分区感知）。 */
 static int dll_reader_from_fat32(const char *name, u8 **out_data, u32 *out_size) {
     if (!name || !out_data || !out_size) return -1;
+    int (*read_path)(const char *, u8 **, u32 *) =
+        (int (*)(const char *, u8 **, u32 *))utsm_fat32_svc("srv.fs.fat32.read_path");
+    if (!read_path) return -1;
     char path[128];
     int pl = 0;
     /* 拼接 g_compat_lib_path */
@@ -117,7 +131,7 @@ static int dll_reader_from_fat32(const char *name, u8 **out_data, u32 *out_size)
         path[pl++] = name[i++];
     }
     path[pl] = 0;
-    return fat32_read_path(path, out_data, out_size);
+    return read_path(path, out_data, out_size);
 }
 
 /* 将 FUCK [utsm] 区的配置应用到运行期全局变量 */
@@ -206,20 +220,33 @@ static void disk_log_flush(void) {
     }
     if (len > BOOTLOG_MAX_BYTES) len = BOOTLOG_MAX_BYTES;
 
-    int rc = utsm_bootlog_write((const u8 *)buf, len);
+    /* P2：bootlog 经 fat32.drv 总线服务写入（GPT 分区感知 + 真实 write）。 */
+    int (*bootlog)(const u8 *, u32) =
+        (int (*)(const u8 *, u32))utsm_fat32_svc("srv.fs.fat32.bootlog");
+    if (!bootlog) {
+        /* 【插桩白名单】设计内回退：fat32.drv 未提供 bootlog（无 FAT32 卷/
+         * 无块设备属环境能力缺失）。诊断日志不得阻断启动。 */
+        log_warn("[UTSM] disk_log: srv.fs.fat32.bootlog unavailable, skip");
+        return;
+    }
+
+    int rc = bootlog((const u8 *)buf, len);
     if (rc == 0) {
         log_info("[UTSM] disk_log: BOOTLOG.TXT written");
         log_hex64("[UTSM] disk_log: bytes=", len);
     } else {
-        /* 【插桩白名单】设计内只读块路径：AHCI provider 当前仅注册最小
-         * read（CLAUDE.md ahci 驱动说明），write 恒为空，bootlog 落盘
-         * 失败属环境能力缺失而非数据读写错误。诊断日志不得阻断启动。 */
+        /* 【插桩白名单】设计内只读块路径：write 为空时属环境能力缺失，
+         * 非数据读写错误。诊断日志不得阻断启动。 */
         log_error("[UTSM] disk_log: FAT32 write failed (read-only block path, skip)");
         log_hex64("[UTSM] disk_log: rc=", (u64)(i64)rc);
     }
 }
 
 void kernel_main(void) {
+    /* 引导器已经把屏幕收到深蓝。这里立刻画上初始化提示和转圈，
+     * 后面的日志会一直推动它，直到会话 Logo 接管。 */
+    boot_status_start();
+
     /* ---- 插桩: 启动总时间戳 ---- */
     INSTR_TS_DECL(boot_total);
     INSTR_TS_BEGIN(boot_total);
@@ -425,7 +452,11 @@ void kernel_main(void) {
     INSTR_TS_DECL(ts_dkm);
     INSTR_TS_BEGIN(ts_dkm);
     dkm_init();
+    boot_status_register();
     dkm_fill_platform_info();
+    /* 转圈任务从此和启动主流程并发。guest 运行期间把主机定时器罩住，
+     * 避免 LAPIC tick 把 guest 打成 external-interrupt 退出风暴。 */
+    boot_status_spawn();
     INSTR_TS_END(ts_dkm, "dkm_init");
 
     /* === VMM — 可通过 FUCK [boot] vmm=0 跳过 ===
@@ -438,7 +469,10 @@ void kernel_main(void) {
         INSTR_TS_DECL(ts_vmm);
         INSTR_TS_BEGIN(ts_vmm);
         log_info("[UTSM] VMM init ok");
+        lapic_irq_quiesce(1);
         int vmm_st = vmm_self_test();
+        lapic_irq_quiesce(0);
+        __asm__ volatile("sti" ::: "memory");
         /* P8.4: On KVM nested VMX, self-test VMCS may fail but Linux guest VMCS
          * (configured separately) may still work. Force-continue regardless. */
         if (vmm_st != 0) {
@@ -478,7 +512,10 @@ void kernel_main(void) {
                 int launched = 0;
                 if (ipc_shm_init() == 0) {
                     log_info("[UTSM] IPC shm init ok");
+                    lapic_irq_quiesce(1);
                     lin_st = linux_launch();
+                    lapic_irq_quiesce(0);
+                    __asm__ volatile("sti" ::: "memory");
                     launched = 1;
                 } else {
                     panic_full("LNX-E03 IPC SHM INIT FAILED",
@@ -520,6 +557,28 @@ void kernel_main(void) {
             } else if (!run_linux) {
                 log_warn("[UTSM] Linux guest disabled by FUCK (linux_guest=0)");
             }
+
+            int run_windows = ini_get_bool(cfg, "boot", "windows_guest", 0);
+            if (run_windows) {
+                if (windows_guest_prepare() != 0) {
+                    panic_full("WIN-E23 WINDOWS PREPARE FAILED",
+                               "windows_guest=1 but OVMF platform preparation failed", 0);
+                } else {
+                    log_info("[UTSM] Windows guest prepared (launch on request)");
+                    if (ini_get_bool(cfg, "boot", "windows_autostart", 0)) {
+                        lapic_irq_quiesce(1);
+                        int win_st = windows_guest_launch();
+                        lapic_irq_quiesce(0);
+                        __asm__ volatile("sti" ::: "memory");
+                        if (win_st != 0) {
+                            panic_full("WIN-E24 WINDOWS AUTOSTART FAILED",
+                                       "Windows OVMF launch failed", 0);
+                        }
+                    }
+                }
+            } else {
+                log_info("[UTSM] Windows guest disabled by FUCK (windows_guest=0)");
+            }
         } else {
             INSTR_TS_END(ts_vmm, "vmm_init+selftest");
             log_error("[UTSM] VMM self-test FAIL");
@@ -541,7 +600,10 @@ void kernel_main(void) {
             INSTR_TS_DECL(ts_xj380);
             INSTR_TS_BEGIN(ts_xj380);
             log_info("[UTSM] XJ380 loader init ok");
+            lapic_irq_quiesce(1);
             int xj_st = xj380_launch();
+            lapic_irq_quiesce(0);
+            __asm__ volatile("sti" ::: "memory");
             INSTR_TS_END(ts_xj380, "xj380_launch");
             if (xj_st == 0) {
                 log_info("[UTSM] XJ380 guest terminated (host resumed)");
@@ -555,6 +617,35 @@ void kernel_main(void) {
         } else {
             log_warn("[UTSM] XJ380 guest disabled by FUCK (xj380_guest=0)");
         }
+
+        /* === ZT5 guest 子系统（P3）— FUCK [zt5] enable=1 开启 ===
+         * 严格策略：enable=1 即请求了 guest；模块缺失/启动失败 → panic。
+         * 注意：当前为独占运行（vmlaunch 后 host 挂起直到 guest 终止）；
+         * 协作切片（kern.zt5.pump）在 P4 接通。 */
+        int run_zt5 = ini_get_bool(cfg, "zt5", "enable", 0);
+        if (run_zt5 && zt5_loader_init() != 0) {
+            panic_full("ZT5-E20 ZT5 KERNEL MODULE MISSING",
+                       "zt5 enable=1 but zt5.krl boot module not found", 0);
+            log_warn("[UTSM] fallback: ZT5 guest skipped");
+        } else if (run_zt5) {
+            INSTR_TS_DECL(ts_zt5);
+            INSTR_TS_BEGIN(ts_zt5);
+            log_info("[UTSM] ZT5 loader init ok");
+            lapic_irq_quiesce(1);
+            int zst = zt5_launch();
+            lapic_irq_quiesce(0);
+            __asm__ volatile("sti" ::: "memory");
+            INSTR_TS_END(ts_zt5, "zt5_launch");
+            if (zst == 0) {
+                log_info("[UTSM] ZT5 guest terminated (host resumed)");
+            } else {
+                log_hex64("[UTSM] ZT5 launch st=", (u64)(i64)zst);
+                panic_full("ZT5-E21 ZT5 LAUNCH FAILED",
+                           "zt5 enable=1 requested but VMX launch failed", 0);
+            }
+        } else {
+            log_info("[UTSM] ZT5 guest disabled by FUCK ([zt5] enable=0)");
+        }
     } else {
         log_warn("[UTSM] VMM unavailable (VMX not supported or disabled by FUCK)");
     }
@@ -566,6 +657,9 @@ void kernel_main(void) {
     INSTR_TS_BEGIN(ts_dsm);
     dsm_load_by_manifest_ex(cfg);
     INSTR_TS_END(ts_dsm, "dsm_load_manifest");
+
+    /* P5 万物互联：会话编排移交 session.drv（stage4，srv.session.run）。
+     * UTSM 不再逐个拉起 netman/shell——那由 session.drv 统一排序（见下）。 */
 
     /* === 启动期能力证明：DKM 驱动派生能力 + 设计占位能力 === */
     {
@@ -614,12 +708,14 @@ void kernel_main(void) {
         }
     }
 
-    /* === SAS-R0-PCQ 调度器：demo 任务 + LAPIC tick 抢占启用（Phase 7） ===
-     * 此刻 DKM 全部驱动加载完毕（timer.drv 的 PIT 校准已完成且此后无人
-     * 再用 PIT）、VMM/Linux/XJ380 guest 已 park/terminate —— LAPIC timer
-     * 接管 tick 源。demo 窗口内 bootstrap 被周期抢占，demo 任务交错运行。 */
+    /* === SAS-R0-PCQ 调度器：常驻启用（P6 万物互联） ===
+     * 此刻 DKM 全部驱动加载完毕（timer.drv 的 PIT 校准完成）、VMM/Linux/XJ380
+     * guest 已 park/terminate —— LAPIC timer 接管 tick 源。调度器常驻（不再
+     * demo、不再 quiesce）：bootstrap 变 idle，session.drv 编排的模块为任务。
+     * 注意：当前各 app 模块入口仍 `cli`（IF=0），抢占在 P6b（消费者切到
+     * srv.input.* 事件服务 + IRQ1/12 解屏蔽）后才实际投递。 */
     if (g_sched_enabled_cfg) {
-        utsm_sched_demo_window();
+        utsm_sched_enable(0);   /* 0 = 用 FUCK [sched] tick_hz 默认 */
     }
 
     /* ---- 插桩: DSK 加载跳转前记录 ---- */
@@ -644,19 +740,33 @@ void kernel_main(void) {
      * FUCK [attest] require_<name>=1（默认）而能力未就绪 → 莲花屏 panic。 */
     attest_check(cfg);
 
-    /* === 调度器静默（Phase 7/8 收尾） ===
-     * 停 LAPIC timer、注销 tick/异常 handler、杀 demo 任务——保证
-     * dsk_load_and_jump 的 DSK 交接路径与无调度器时逐字节一致。 */
-    utsm_sched_quiesce();
+    /* === 调度器常驻（P6）：不再 quiesce——调度器保持 armed，bootstrap 为 idle。
+     * session.drv 编排的模块在 bootstrap 上下文运行；P6b 起模块将改为任务。 === */
 
-    if (dsk_load_and_jump() != 0) {
-        log_error("[UTSM] DSK jump failed");
-        /* 启动链终点，无可继续的路径：两种模式都上莲花屏 */
-        panic_halt("VMM-E15 DSK JUMP FAILED",
-                   "dsk_load_and_jump returned non-zero", 0);
+    /* P5 万物互联：DSK 已退役。session.drv（srv.session.run）接管会话编排
+     * （netman/firstinit/login/desktop/cmd 全在模块内经总线排序）。
+     * P6b：desktop 任务化后 session 会返回 1——此时 bootstrap 已完成编排使命，
+     * 转入 idle（sti; hlt）把 CPU 让给长驻任务；返回 0 视为编排失败。 */
+    {
+        const dkm_kernel_api *api = dkm_get_kernel_api();
+        void *sfn = 0;
+        if (api && api->bus && api->bus->probe("srv.session.run", &sfn, 0) == 0 && sfn) {
+            log_info("[UTSM] invoking srv.session.run");
+            int (*srun)(void) = (int (*)(void))sfn;
+            int orchestrated = srun();
+            if (orchestrated == 1) {
+                log_info("[UTSM] session orchestrated; bootstrap idle");
+                for (;;) { __asm__ volatile("sti; hlt"); }
+            }
+        }
     }
 
-    /* ---- 插桩: 启动总耗时（仅在 DSK 跳转失败时可见） ---- */
+    /* session.drv 缺席 = 无会话编排者，启动链无法继续（DSK 已退役）。 */
+    log_error("[UTSM] no session service");
+    panic_halt("SESSION-E00 NO SESSION ORCHESTRATOR",
+               "srv.session.run missing and DSK retired", 0);
+
+    /* ---- 插桩: 启动总耗时（仅在无会话编排时可见） ---- */
     INSTR_TS_END(boot_total, "boot_total");
 
     arch_halt_forever();/*I LOVE YOU*/

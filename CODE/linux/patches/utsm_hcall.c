@@ -353,8 +353,7 @@ static long utsm_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
     case UTSM_IOCTL_PARK: {
         /* VMCALL park. Idle HLT must stay in the guest (wait for IRQ).
-         * idle=poll + HLT-as-park panicked in cpu_idle_poll (current=NULL).
-         */
+         * idle=poll + HLT-as-park panicked in cpu_idle_poll (current=NULL). */
         mb();
         if (utsm_hcall(UTSM_HCALL_PARK, 0, 0, 0) != 0)
             return -EIO;

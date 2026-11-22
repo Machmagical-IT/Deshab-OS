@@ -168,6 +168,28 @@ CONFIG_VIRTIO_BLK_SCSI=y
 # virtio net (Phase 2: network)
 CONFIG_VIRTIO_NET=y
 
+# Wireless stack (mac80211_hwsim) — Deshab guest WiFi backend.
+# No real 802.11 hardware under QEMU; mac80211_hwsim provides virtual
+# cfg80211/mac80211 radios so the guest has a genuine wlan0 (scan / assoc /
+# WPA2 4-way handshake). hostapd runs a demo AP on a second hwsim radio.
+# All built-in (CONFIG_MODULES is not set in this config).
+CONFIG_WLAN=y
+CONFIG_CFG80211=y
+CONFIG_CFG80211_INTERNAL_REGDB=y
+CONFIG_MAC80211=y
+CONFIG_MAC80211_HWSIM=y
+CONFIG_RFKILL=y
+# WPA2 (CCMP) / WPA (TKIP) / WEP software crypto used by mac80211 + hwsim.
+CONFIG_CRYPTO_AEAD=y
+CONFIG_CRYPTO_GCM=y
+CONFIG_CRYPTO_CCM=y
+CONFIG_CRYPTO_CTR=y
+CONFIG_CRYPTO_AES=y
+CONFIG_CRYPTO_ARC4=y
+CONFIG_CRYPTO_CMAC=y
+CONFIG_CRYPTO_MD5=y
+CONFIG_CRYPTO_SHA1=y
+
 # virtio-fs (Phase 1.5: shared filesystem)
 CONFIG_VIRTIO_FS=y
 CONFIG_FUSE_FS=y

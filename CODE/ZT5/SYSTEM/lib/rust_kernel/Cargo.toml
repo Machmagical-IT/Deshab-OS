@@ -1,0 +1,17 @@
+[package]
+name = "zratro-rustkernel"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rustknl"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

@@ -4,10 +4,9 @@
 #include <utsm/drr.h>
 
 /* ===================================================================
- *  F1: 莲花崩溃屏（panic_full）
+ *  F1: machmagic 崩溃屏（panic_full）
  *
- *  "崩了也得崩出莲花。"
- *  帧缓冲直绘（fbcon 抽象，F2）：DEAICUP 莲花 Logo（ohMyLogo.png
+ *  帧缓冲直绘（fbcon 抽象，F2）：machmagic Logo（TEXTURES/panic/machmagic.png
  *  内嵌）+ panic_symbol + 消息 + 寄存器简表，背景色与图片背景一致，
  *  DRR crash_buf 归档后 halt。不依赖驱动/堆/中断。
  * =================================================================== */
@@ -21,7 +20,7 @@ void arch_halt_forever(void);
 
 #include <utsm/fbcon.h>
 
-/* DEAICUP 莲花 Logo（ohMyLogo.png 缩放 384px，RGBA8888）+
+/* machmagic Logo（TEXTURES/panic/machmagic.png 缩放 384px，RGBA8888）+
  * 背景色（图片四角平均色）。生成：kernel/gen_panic_logo.py */
 #include "panic_logo_data.inc"
 
@@ -68,9 +67,9 @@ static int g_panic_fallback;
 static u32 g_panic_fallback_hits;
 
 void panic_set_fallback(int enable) {
-    g_panic_fallback = enable ? 1 : 0;
-    log_info(g_panic_fallback ? "[PANIC] mode=fallback (panic points take backup paths)"
-                              : "[PANIC] mode=strict (zero degradation)");
+    (void)enable;
+    g_panic_fallback = 0;
+    log_info("[PANIC] mode=strict (fallback ignored, bug points halt)");
 }
 
 int panic_fallback_enabled(void) {
@@ -82,14 +81,6 @@ u32 panic_fallback_hits(void) {
 }
 
 void panic_full(const char *symbol, const char *msg, const panic_regs *regs) {
-    if (g_panic_fallback && !regs) {
-        g_panic_fallback_hits++;
-        log_warn("[PANIC:FALLBACK] panic point hit, taking backup path");
-        if (symbol) log_warn(symbol);
-        if (msg) log_warn(msg);
-        log_hex64("[PANIC:FALLBACK] hits=", g_panic_fallback_hits);
-        return;
-    }
     panic_halt(symbol, msg, regs);
 }
 
@@ -97,7 +88,7 @@ void panic_full(const char *symbol, const char *msg, const panic_regs *regs) {
 
 void panic_halt(const char *symbol, const char *msg, const panic_regs *regs) {
     log_error("[PANIC] ==========================================");
-    log_error("[PANIC] panic_full: 莲花崩溃屏");
+    log_error("[PANIC] panic_full: machmagic");
     if (symbol) { log_error("[PANIC] symbol:"); log_error(symbol); }
     if (msg)    { log_error("[PANIC] msg:");    log_error(msg); }
     if (regs) {
@@ -125,7 +116,7 @@ void panic_halt(const char *symbol, const char *msg, const panic_regs *regs) {
         /* 背景色 = Logo 图片背景色（四角平均，gen_panic_logo.py 生成） */
         fbc_fill_bg(p, g_panic_logo_bg);
 
-        /* 底部留给错误码：莲花按整数步进缩小，保证 symbol/msg 落在屏内。
+        /* 底部留给错误码：Logo 按整数步进缩小，保证 symbol/msg 落在屏内。
          * 长串按屏宽折行，避免居中后错误码被裁出左右边缘。 */
         const u32 fg = 0xFFF0E8D8, dim = 0xFFB0A8C0, acc = 0xFFF0D080;
         i64 text_need = (g_ascii_h + 6) * (regs ? 8 : 5);

@@ -1,6 +1,7 @@
 /* appreg.c — 应用注册表 + 桌面图标（M0 自 main.c 平移）
  *
  * 注册来源：内置 / LINUXAPP.CNF / PEAPPS.CNF / user/desktop/*.lnk / STARTMENU.CNF
+ * 启动台另外读 GUESTMENU.CNF（Linux .desktop + Windows 开始菜单 .lnk）
  */
 #include "desktop.h"
 #include "../UTSM/include/utsm/fluent_ui.h"   /* M3: desktop_app_icon 图标映射 */
@@ -150,6 +151,7 @@ static char g_ud_name[UDESK_MAX][12];
 static char g_ud_disp[UDESK_MAX][48];
 static char g_ud_path[UDESK_MAX][96];
 static char g_ud_elf[UDESK_MAX][12];
+static char g_ud_elfpath[UDESK_MAX][96];
 static char g_ud_files[UDESK_MAX][64];
 static int  g_ud_nfiles;
 /* 桌面图标按 user/desktop 目录枚举顺序排，不按内置表下标。 */
@@ -277,12 +279,16 @@ static void udesk_parse_lnk(int slot, const u8 *data, u32 size) {
     lapp_field_copy(kind, 16, lines[1], nlen[1]);
     g_ud_path[slot][0] = 0;
     g_ud_elf[slot][0] = 0;
+    g_ud_elfpath[slot][0] = 0;
     /* 种类优先。第三行路径经常以 '/' 开头，不能因此把 ELF / NATIVE 当成 Linux。 */
     if (kind_word(kind, "LINUX")) {
         if (n >= 3)
             lapp_field_copy(g_ud_path[slot], 96, lines[2], nlen[2]);
     } else if (kind_word(kind, "NATIVE")) {
         if (bind_desktop_builtin(slot, g_ud_name[slot])) return;
+        /* 没有同名内置应用时，第三行是要启动的 ELF（native.lnk 的 desktop.elf）。 */
+        if (n >= 3)
+            lapp_field_copy(g_ud_elfpath[slot], 96, lines[2], nlen[2]);
     } else {
         const char *bn = kind_builtin_name(kind);
         if (bn && bind_desktop_builtin(slot, bn)) return;
@@ -293,8 +299,22 @@ static void udesk_parse_lnk(int slot, const u8 *data, u32 size) {
             f32_name_to_83_w(kind, g_ud_elf[slot]);
         g_ud_elf[slot][11] = 0;
     }
-    if (udesk_name_taken(g_ud_name[slot])) return;
-    if (!kind_word(kind, "NATIVE") && !g_ud_path[slot][0] && !g_ud_elf[slot][0]) return;
+    if (udesk_name_taken(g_ud_name[slot])) {
+        /* LINUXAPP.CNF 先注册了同名项（KDE/VSCODE）。快捷方式仍要落在桌面上，
+         * 复用已有描述符，保留 linux_path。 */
+        int a;
+        for (a = 0; a < g_app_count; a++) {
+            if (g_apps[a].name && fat32_lfn_streq_ci(g_apps[a].name, g_ud_name[slot])) {
+                g_apps[a].display_name = g_ud_disp[slot];
+                desk_place(a);
+                slog("desktop shortcut -> existing");
+                slog(g_ud_disp[slot]);
+                break;
+            }
+        }
+        return;
+    }
+    if (!g_ud_path[slot][0] && !g_ud_elf[slot][0] && !g_ud_elfpath[slot][0]) return;
     if (g_app_count >= MAX_APPS) return;
     {
         int id = g_app_count;
@@ -306,6 +326,8 @@ static void udesk_parse_lnk(int slot, const u8 *data, u32 size) {
             0
         };
         g_app_count++;
+        if (g_ud_elfpath[slot][0])
+            g_apps[id].elf_path = g_ud_elfpath[slot];
         desk_place(id);
     }
     slog("user/desktop icon:");
@@ -471,10 +493,10 @@ static void register_pe_apps(void) {
  *  M3: STARTMENU.CNF 开始菜单注册表
  *  FAT32 根目录 STARTMENU.CNF（8.3: STARTMENUCNF），每行一个菜单项：
  *    NAME|显示名|path|args（args 可省略）
- *  path 四种：
+ *  path 四种（目录约定：bin/ = ELF 工具，program/ = exe）：
  *    builtin:<name>   → 已注册内置应用（editor/calc/fileman/settings/...）
- *    program/xxx.exe  → GUI PE 应用（run_windowed 桌面嵌入，g++ 编译）
- *    bin/xxx.exe      → PE 应用（同上；CLI exe 请从 cmd 运行，不入菜单）
+ *    program/xxx.exe  → PE 应用（run_windowed 桌面嵌入，g++ 编译；
+ *                       CLI exe 同目录但请从 cmd 运行，不入菜单）
  *    bin/xxx.elf      → ELF 工具（按路径全屏加载）
  *    /guest/path      → Linux guest 应用（exec_async）
  *  显示名允许 UTF-8 中文（瓦片标签）；NAME 为 ASCII（窗口标题）。
@@ -608,10 +630,18 @@ static void register_startmenu_apps(void) {
     u8 *data = 0;
     u32 size = 0;
     char n11[11];
+    int rc;
 
     g_sm_count = 0;
-    if (f32_name_to_83_w("STARTMENU.CNF", n11) == 0 &&
-        f32_read_root_file_w(n11, &data, &size) == 0 && data && size) {
+    /* STARTMENU.CNF 的 8 字符基名被 vfat 驱动存为短名 STARTM~1.CNF + LFN
+     * （基名恰满 8 字符时驱动走 LFN 路径），所以必须用 LFN 路径读取；
+     * 先试 LFN，失败再回退 8.3 根读（某些环境可能存为纯 8.3）。 */
+    rc = f32_read_path_lfn_w("STARTMENU.CNF", &data, &size);
+    if ((rc != 0 || !data || !size) &&
+        f32_name_to_83_w("STARTMENU.CNF", n11) == 0) {
+        rc = f32_read_root_file_w(n11, &data, &size);
+    }
+    if (rc == 0 && data && size) {
         int slot = 0;
         u32 pos = 0;
         while (pos < size && slot < SM_MAX_APPS) {
@@ -660,6 +690,119 @@ static void register_startmenu_apps(void) {
     slog("[startmenu] no config, fallback to all apps");
 }
 
+/* GUESTMENU.CNF：L|name|label|/abs/path|args 或 W|name|label|C:\path|args
+ * 由 tools/desktop/scan_guest_menus.ps1 从 Linux 应用菜单和 Windows
+ * 「开始菜单」扫出来。已在本机菜单里的同一 Linux 路径不重复列入。 */
+#define GUEST_PATH_CAP 180
+#define GUEST_ARGS_CAP 96
+int  g_guest_count = 0;
+char g_guest_kind[GUEST_MENU_MAX];
+char g_guest_name[GUEST_MENU_MAX][12];
+char g_guest_label[GUEST_MENU_MAX][64];
+static char g_guest_path[GUEST_MENU_MAX][GUEST_PATH_CAP];
+static char g_guest_args[GUEST_MENU_MAX][GUEST_ARGS_CAP];
+
+static int guest_path_taken(const char *path) {
+    int i;
+    for (i = 0; i < g_app_count; i++) {
+        if (g_apps[i].linux_path && str_eq(g_apps[i].linux_path, path)) return 1;
+    }
+    for (i = 0; i < g_guest_count; i++) {
+        if (str_eq(g_guest_path[i], path)) return 1;
+    }
+    return 0;
+}
+
+static void register_guest_menus(void) {
+    u8 *data = 0;
+    u32 size = 0;
+    u32 pos = 0;
+    int nL = 0, nW = 0;
+    g_guest_count = 0;
+    if (f32_read_path_lfn_w("GUESTMENU.CNF", &data, &size) != 0 || !data || !size) {
+        slog("[startmenu] no guest menu");
+        return;
+    }
+    while (pos < size && g_guest_count < GUEST_MENU_MAX) {
+        u32 eol = pos;
+        u32 line_len, next;
+        const char *line;
+        int f0 = -1, f1 = -1, f2 = -1, f3 = -1;
+        int name_n, label_n, path_n, args_n, slot;
+        char kind;
+        while (eol < size && data[eol] != '\n' && data[eol] != '\r') eol++;
+        line_len = eol - pos;
+        next = eol;
+        while (next < size && (data[next] == '\n' || data[next] == '\r')) next++;
+        if (line_len == 0 || data[pos] == '#') { pos = next; continue; }
+        line = (const char *)data + pos;
+        for (u32 i = 0; i < line_len; i++) {
+            if (line[i] != '|') continue;
+            if (f0 < 0) f0 = (int)i;
+            else if (f1 < 0) f1 = (int)i;
+            else if (f2 < 0) f2 = (int)i;
+            else if (f3 < 0) { f3 = (int)i; break; }
+        }
+        if (f0 != 1 || f1 <= f0 || f2 <= f1) { pos = next; continue; }
+        kind = line[0];
+        if (kind != 'L' && kind != 'W') { pos = next; continue; }
+        name_n = f1 - f0 - 1;
+        label_n = f2 - f1 - 1;
+        path_n = (f3 > f2) ? (f3 - f2 - 1) : ((int)line_len - f2 - 1);
+        args_n = (f3 > f2) ? ((int)line_len - f3 - 1) : 0;
+        if (path_n <= 0 || path_n >= GUEST_PATH_CAP) { pos = next; continue; }
+        if (kind == 'L' && line[f2 + 1] != '/') { pos = next; continue; }
+        if (kind == 'W') {
+            int colon = 0, k;
+            for (k = 0; k < path_n; k++) if (line[f2 + 1 + k] == ':') colon = 1;
+            if (!colon && line[f2 + 1] != '\\') { pos = next; continue; }
+        }
+        slot = g_guest_count;
+        lapp_field_copy(g_guest_path[slot], GUEST_PATH_CAP, line + f2 + 1, path_n);
+        if (guest_path_taken(g_guest_path[slot])) { pos = next; continue; }
+        g_guest_kind[slot] = kind;
+        if (name_n > 0)
+            lapp_field_copy(g_guest_name[slot], 12, line + f0 + 1, name_n);
+        else {
+            g_guest_name[slot][0] = (kind == 'L') ? 'l' : 'w';
+            g_guest_name[slot][1] = 0;
+        }
+        if (label_n > 0)
+            lapp_field_copy(g_guest_label[slot], 64, line + f1 + 1, label_n);
+        else
+            kstrcpy(g_guest_label[slot], g_guest_name[slot], 64);
+        if (args_n > 0)
+            lapp_field_copy(g_guest_args[slot], GUEST_ARGS_CAP, line + f3 + 1, args_n);
+        else
+            g_guest_args[slot][0] = 0;
+        g_guest_count++;
+        if (kind == 'L') nL++; else nW++;
+        pos = next;
+    }
+    slog_num("[startmenu] guest linux=", nL);
+    slog_num("[startmenu] guest windows=", nW);
+}
+
+void launch_guest_entry(int idx) {
+    if (idx < 0 || idx >= g_guest_count) {
+        desktop_fatal("DESK-E16 GUEST MENU IDX");
+        return;
+    }
+    if (g_guest_kind[idx] == 'L') {
+        launch_linux_path(g_guest_name[idx], g_guest_label[idx],
+                          g_guest_path[idx], g_guest_args[idx]);
+        return;
+    }
+    if (g_guest_kind[idx] == 'W') {
+        /* 开始菜单能列出 Windows 程序。逐个 exe 拉起 Windows guest 还没接线。 */
+        slog("win start menu:");
+        slog(g_guest_path[idx]);
+        desktop_fatal("DESK-E15 WIN GUEST APP");
+        return;
+    }
+    desktop_fatal("DESK-E16 GUEST MENU KIND");
+}
+
 /* ============================================================
  *  应用注册
  *  ============================================================ */
@@ -667,15 +810,18 @@ static void register_startmenu_apps(void) {
 void register_apps(void) {
     /* 命令行1：shell.elf（原生命令行 + 可运行 Linux 程序）*/
     g_apps[0] = (app_descriptor){
-        "shell", "Terminal", 720, 480,
-        0, 0, 0, 0, "SHELL   ELF"
+        "shell", "Terminal", 840, 540, 0, 0, 0, 0, 0
     };
+    /* 内置 ELF 应用用 elf_path（FS 路径），不用 elf_name（FS 根 8.3 名）——
+     * 这些 .elf 实际在 system/deshab64/ 下，不是根目录，取根名必然 "not found"。
+     * （此前经开始菜单/桌面图标点开一律静默失败。） */
+    g_apps[0].elf_path = "system/deshab64/shell.elf";
     g_app_count++;
     /* 命令行2：cmd.elf（Windows 风格命令行 + PE/EXE 执行）*/
     g_apps[1] = (app_descriptor){
-        "cmd", "CMD", 720, 480,
-        0, 0, 0, 0, "CMD     ELF"
+        "cmd", "CMD", 840, 540, 0, 0, 0, 0, 0
     };
+    g_apps[1].elf_path = "system/deshab64/cmd.elf";
     g_app_count++;
     g_apps[2] = (app_descriptor){
         "editor", "Editor", 600, 450,
@@ -693,21 +839,21 @@ void register_apps(void) {
     };
     g_app_count++;
     g_apps[5] = (app_descriptor){
-        "browser", "Browser", 700, 500,
-        0, 0, 0, 0, "BROWSER ELF"
+        "browser", "Browser", 1000, 660, 0, 0, 0, 0, 0
     };
+    g_apps[5].elf_path = "system/deshab64/tools/browser.elf";
     g_app_count++;
     /* ProEdit — 增强版文本编辑器（语法高亮、设置、目录浏览）*/
     g_apps[6] = (app_descriptor){
-        "proedit", "ProEdit", 750, 550,
-        0, 0, 0, 0, "PROEDIT ELF"
+        "proedit", "ProEdit", 880, 620, 0, 0, 0, 0, 0
     };
+    g_apps[6].elf_path = "system/deshab64/tools/editor.elf";
     g_app_count++;
     /* Settings — 系统设置（内核 FUCK 配置 + 网络 NETCONF 配置）*/
     g_apps[7] = (app_descriptor){
-        "settings", "Settings", 760, 540,
-        0, 0, 0, 0, "SETTINGSELF"
+        "settings", "Settings", 920, 640, 0, 0, 0, 0, 0
     };
+    g_apps[7].elf_path = "system/deshab64/tools/settings.elf";
     g_app_count++;
     /* VSCode Phase 5: Linux guest 应用（VSCode 等），来自 LINUXAPP.CNF */
     register_linux_apps();
@@ -716,6 +862,7 @@ void register_apps(void) {
     register_user_desktop_icons();
     /* M3: 开始菜单注册（STARTMENU.CNF；须在全部来源注册后跑以支持 builtin:/path 复用） */
     register_startmenu_apps();
+    register_guest_menus();
 }
 
 /* M2: 桌面图标 = user/desktop/*.lnk 用户快捷方式（user_desktop 标记）。
@@ -737,12 +884,43 @@ static void place_desktop_icon(int app_id, int *x, int *y, int pad, int max_x) {
     *x += KATE_ICON_W + KATE_ICON_GAP;
 }
 
+/* Aqua：图标从右上角（顶栏下方）自上而下排一列，满列向左另起一列 */
+static void place_desktop_icon_aqua(int app_id, int *x, int *y) {
+    int top = AQUA_MENUBAR_H + 12;
+    int bot = (int)g_fb_h - AQUA_DOCK_RESERVE;
+    if (g_icon_count >= MAX_ICONS) return;
+    if (app_id < 0 || app_id >= g_app_count) return;
+    if (*y > top && *y + KATE_ICON_H > bot) {
+        *y = top;
+        *x -= KATE_ICON_W;
+    }
+    g_icons[g_icon_count].app_id = app_id;
+    g_icons[g_icon_count].x = *x;
+    g_icons[g_icon_count].y = *y;
+    g_icons[g_icon_count].label = g_apps[app_id].display_name;
+    g_icons[g_icon_count].selected = 0;
+    g_icon_count++;
+    *y += KATE_ICON_H + 6;
+}
+
 void setup_desktop_icons(void) {
     int pad = KATE_ICON_PAD;                        /* 24 */
     int x = pad;
-    int y = g_fluent ? (pad + 8) : (KATE_TOPBAR_H + KATE_PAGE_PAD + pad);
+    int y = KATE_TOPBAR_H + KATE_PAGE_PAD + pad;
     int max_x = (int)g_fb_w - pad;                  /* canvas 右缘 */
     int k;
+    if (g_fluent) {
+        x = (int)g_fb_w - 12 - KATE_ICON_W;
+        y = AQUA_MENUBAR_H + 12;
+        if (g_desk_n > 0) {
+            for (k = 0; k < g_desk_n; k++)
+                place_desktop_icon_aqua(g_desk_order[k], &x, &y);
+            return;
+        }
+        for (int i = 0; i < g_app_count; i++)
+            if (g_apps[i].user_desktop) place_desktop_icon_aqua(i, &x, &y);
+        return;
+    }
     if (g_desk_n > 0) {
         for (k = 0; k < g_desk_n; k++)
             place_desktop_icon(g_desk_order[k], &x, &y, pad, max_x);

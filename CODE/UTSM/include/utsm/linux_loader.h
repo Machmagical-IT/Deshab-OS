@@ -132,9 +132,11 @@ struct linux_setup_header {
 #define LINUX_GUEST_SURFACE_SIZE (16 * 1024 * 1024)  /* 16MB */
 
 /* General RAM starts after IPC + surface regions.
- * Phase 1 expansion: 1.4GB to fit VSCode + Electron + GUI stack. */
+ * Phase 1 expansion: 1.4GB -> 3GB to fit VSCode + Electron + GUI stack;
+ * VSCode alone extracts to ~969MB, and the install also stages the 330MB
+ * tarball in /tmp (both RAM-backed tmpfs), so 1.4GB was too tight. */
 #define LINUX_GUEST_RAM_GPA     0x05000000ULL  /* 80 MB */
-#define LINUX_GUEST_RAM_SIZE    0x5B000000ULL  /* 1.4GB (0x05000000..0x5FFFFFFF) */
+#define LINUX_GUEST_RAM_SIZE    0xC0000000ULL  /* 3GB (0x05000000..0xC4FFFFFF) */
 
 /* ===== virtio-mmio device GPA layout =====
  * virtio-mmio 设备放在 GPA 高位 MMIO 区（guest RAM 之上，不占用 e820 RAM）。

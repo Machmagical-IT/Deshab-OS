@@ -31,10 +31,7 @@ extern void vmx_vm_exit_handler(void);
 extern int vmexit_dispatch(void);
 extern u64 vmexit_get_count(void);
 
-/* g_saved_host_rsp / g_saved_return_rip / g_guest_terminated /
- * g_last_exit_reason / g_linux_guest_active / g_guest_parked /
- * g_guest_regs / g_host_stack 通过 <utsm/vmm.h> 声明（vmm.c 定义）。 */
-extern u8 g_host_stack[8192];
+/* Active-vCPU VM-exit slots and guest registers come from <utsm/vmm.h>. */
 
 /* CR helpers */
 static inline u64 read_cr0_local(void) {
@@ -150,7 +147,7 @@ static void linux_vmcs_setup_host_state(void) {
     }
 
     /* Host RSP/RIP: VM-Exit handler */
-    vmx_vmcs_write(VMCS_HOST_RSP, (u64)&g_host_stack[sizeof(g_host_stack) - 16]);
+    vmx_vmcs_write(VMCS_HOST_RSP, vmm_get_host_stack_top());
     vmx_vmcs_write(VMCS_HOST_RIP, (u64)vmx_vm_exit_handler);
     linux_cet_vmcs_sync_host();
 }
@@ -452,6 +449,7 @@ int linux_launch(void) {
     }
 
     log_info("[LINUX] launch begin");
+    vmm_set_active_profile(VM_PROFILE_LINUX);
     linux_xsave_init();
 
     /* 注册 virtio-mmio 后端（block + net），guest 经 cmdline
@@ -464,8 +462,7 @@ int linux_launch(void) {
     /* Reset VM-Exit state */
     g_guest_terminated = 0;
     g_last_exit_reason = 0xFFFFFFFFULL;
-    g_linux_guest_active = 1;   /* 标记当前 guest 为 Linux（HLT 时 park） */
-    g_guest_parked = 0;
+    vm_machine_set_active_state(VM_MACHINE_RUNNING);
 
     /* Configure VMCS */
     linux_vmcs_setup_guest_state(gi);
@@ -525,9 +522,11 @@ int linux_launch(void) {
     g_linux_launch_failed = 1;
     g_linux_launch_flags = 0;
     __asm__ volatile(
-        "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"
+        "movq g_active_saved_host_rsp(%%rip), %%rax\n\t"
+        "movq %%rsp, (%%rax)\n\t"
         "leaq 1f(%%rip), %%rax\n\t"
-        "movq %%rax, g_saved_return_rip(%%rip)\n\t"
+        "movq g_active_saved_return_rip(%%rip), %%rcx\n\t"
+        "movq %%rax, (%%rcx)\n\t"
         /* Linux 64-bit boot protocol requires every GPR except RSI zero. */
         "xorl %%eax, %%eax\n\t"
         "xorl %%ebx, %%ebx\n\t"
@@ -575,9 +574,11 @@ int linux_launch(void) {
         g_linux_launch_flags = 0;
         linux_cet_force_guest_off();
         __asm__ volatile(
-            "movq %%rsp, g_saved_host_rsp(%%rip)\n\t"
+            "movq g_active_saved_host_rsp(%%rip), %%rax\n\t"
+            "movq %%rsp, (%%rax)\n\t"
             "leaq 1f(%%rip), %%rax\n\t"
-            "movq %%rax, g_saved_return_rip(%%rip)\n\t"
+            "movq g_active_saved_return_rip(%%rip), %%rcx\n\t"
+            "movq %%rax, (%%rcx)\n\t"
             "xorl %%eax, %%eax\n\t"
             "xorl %%ebx, %%ebx\n\t"
             "xorl %%ecx, %%ecx\n\t"
@@ -625,7 +626,7 @@ int linux_launch(void) {
             vmx_vmcs_read_checked(VMCS_VMX_INSTRUCTION_ERROR, &error);
         }
         log_hex64("[LINUX] vmlaunch failed, error=", error);
-        g_linux_guest_active = 0;
+        vm_machine_set_active_state(VM_MACHINE_STOPPED);
         panic_full("LNX-E24 VMLAUNCH FAILED", "vmlaunch failed for the linux guest", 0);
         return -3;
     }
@@ -633,10 +634,10 @@ int linux_launch(void) {
     /* Only handle_hlt() may mark the Linux guest parked.  A fatal exception,
      * triple fault, or EPT failure also returns through post_guest, but must
      * not make the compatibility layer report a ready daemon. */
-    g_linux_guest_active = 0;
     log_hex64("[LINUX] last exit reason=", g_last_exit_reason);
     log_hex64("[LINUX] vmexit count=", vmexit_get_count());
-    if (!g_guest_parked) {
+    if (vm_machine_active_state() != VM_MACHINE_PARKED) {
+        vm_machine_set_active_state(VM_MACHINE_STOPPED);
         log_error("[LINUX] guest terminated before daemon park");
         panic_full("LNX-E25 GUEST TERMINATED BEFORE PARK", "linux guest terminated before the daemon parked", 0);
         return -6;
@@ -658,7 +659,7 @@ int linux_launch(void) {
             log_hex64("[LINUX] pre-ready message type=", ready.type);
         }
         if (!got_ready) {
-            g_guest_parked = 0;
+            vm_machine_set_active_state(VM_MACHINE_STOPPED);
             log_error("[LINUX] HLT without EXEC_READY handshake");
             panic_full("LNX-E26 HLT WITHOUT EXEC READY", "guest parked without the daemon publishing exec_ready", 0);
             return -7;

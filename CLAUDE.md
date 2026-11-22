@@ -2,32 +2,93 @@
 
 ## 项目概览
 
-Deshab 当前包含一个内核/系统实验方向，其中启动内核与主内核目标为：
+Deshab 当前包含一个内核/系统实验方向，启动目标为：
 
 ```text
-CODE/UTSM -> SYSTEM/boot/utsm.elf
-CODE/dsk  -> SYSTEM/system/deshab64/deshab.elf
+CODE/boot -> SYSTEM/ESP/EFI/BOOT/BOOTX64.EFI   （UEFI 引导器，替代 Limine）
+CODE/UTSM -> SYSTEM/ESP/boot/utsm.elf          （唯一内核）
 ```
 
-`utsm.elf` 是当前由 bootloader 直接加载的首阶段内核，负责 UTSM、DKM 驱动加载、平台发现和早期系统服务。当前已实现两阶段 DSK 加载：优先通过 `kernel_api.block` + 内嵌 FAT32 解析从真实块设备读取 `/system/deshab64/deshab.elf`（在 SATA FAT32 盘场景已验证）；无块设备时自动回退 Limine boot module 预加载。
+**启动链（A 方案：UTSM 由引导器直接装载）**：
 
-DSK 主内核（`deshab.elf`）当前已实现：
-- 内嵌 FAT32 只读解析器（256 扇区批量读取 + 内存内文件查找）
-- PIE ELF loader（PT_LOAD + PT_DYNAMIC + R_X86_64_RELATIVE 重定位）
-- 静态启动 Logo（嵌入 Logo.png RGBA 数据，居中 alpha 混合绘制于渐变背景上，取代原旋转加载动画）
-- 首次启动检测：读取 `firstInit.txt`，值为 `0` 则触发首次启动流程
-- 系统初始化调度：DSK 直接加载并调用 `mouseInit.elf`（PS/2 鼠标安全初始化）
-- 用户设置向导：DSK 加载并跳转 `FirstInit.elf`（圆角卡片 UI、键盘输入、SHA256 密码、加密配置缓冲）
+```text
+UEFI 固件 → BOOTX64.EFI（CODE/boot/main.c）
+    → GOP 渐变背景 + 无步骤文字的加载条动画
+    → EFI SimpleFileSystem 读取 FUCK / manifest / 全部 .drv / 可选的 Linux guest 载荷
+    → 解析 utsm.elf（静态 ET_EXEC）并按 PT_LOAD 复制到物理内存
+    → 自建页表（恒等映射 + HHDM 0xffff800000000000 + 内核高半区 0xffffffff80000000）
+    → 伪造 Limine 兼容响应（module/fb/hhdm/rsdp/kernel_address/memmap）
+    → ExitBootServices → 切 CR3/GDT/栈 → 回填内核 .limine_requests → 跳 UTSM
+```
 
-FirstInit（`CODE/firstInit`）只负责用户级设置向导：
-- 淡蓝背景 → "欢迎使用 Deshab"（中英双语，英文小字副标题）→ 设置提示 → 账户设置卡片
+`utsm.elf` 仍是 Limine 协议入口（六类 request 结构不变），但不再依赖 Limine：
+`CODE/boot` 提供同名响应。引导器把启动卷 FAT32 卷序列号作为 `boot:volid`
+伪模块下传，`fat32.drv` 据此在实机多盘场景锁定启动 U 盘（AHCI/NVMe 内置盘常先于
+xHCI 注册为块设备 0）。`SYSTEM/ESP/limine/` 与 `limine.conf` 保留但不再参与启动。
+
+`SYSTEM/ESP/boot/utsm.elf` 由 UTSM 负责 UTSM、DKM 驱动加载、平台发现和早期系统服务；
+DSK（`SYSTEM/ESP/system/deshab64/deshab.elf`）已退役，会话编排由 `session.drv`
+（stage4，`srv.session.run`）承担。
+
+FirstInit（`CODE/firstInit`）与 `firstinit.drv` 负责用户级设置向导：
+- 淡蓝背景 → "欢迎使用 Deshab"（中英双语）→ 账户设置卡片
 - PS/2 键盘轮询输入：计算机名、用户名、密码
-- SHA256 密码摘要 + XOR 加密配置缓冲（user.conf 格式已定义，写盘待 FAT32 write API）
-- 18px 黑体中文位图（预渲染嵌入 ELF）
+- SHA256 密码摘要 + XOR 加密配置缓冲（写盘经 `srv.fs.fat32.*`）
+- 18px 黑体中文位图（预渲染嵌入）
 
-mouseInit（`CODE/mouse`）是 DSK 直接调度的系统输入初始化器：
-- 当前为安全 stub（只读 PS/2 状态，不写控制器），避免阻塞首次启动
-- 后续将实现完整 IRQ12 + 鼠标包解码
+## ZTS 子系统 / ZT5 guest（2026-10-18）
+
+**源码母本**：`CODE/ZT5/`（从 `D:\Code\DEAICUP\ZT5` 复制的完整源码树，排除
+AIquekao/target/ISO 等构建产物）。运行期实现分成两部分：
+
+```text
+CODE/DKM/zts/                 → SYSTEM/ESP/driver/misc/zts.drv（DKM stage3）
+  zts_api.c / zts_elf.c / zts_module.c / zts_hotupdate.c / zts_store.c
+  zts_selftest.c / zts_main.c / zts.h
+CODE/zts/                     → ZTS 模块工具链与示例
+  include/zts_module.h, modules/example_module*.c, mkzts.py
+SYSTEM/ESP/zts/                   → ESP 根 /zts/（ZTS.CNF + .zts + A/B 状态）
+```
+
+ZTS 热更子系统：
+
+- `.zts` = 760B `zts_header` + 16B 对齐 + ELF64 **ET_REL**正文；重定位
+  `R_X86_64_64/32/32S/PC32/PLT32`，未定义符号解析到宿主 `zts_api` 导出表。
+- 功能：模块加载/执行/卸载、热替换、检查点（槽位引用+注册表+patch 快照）、
+  差分更新（modify/insert/delete 变长块）、事务（内存/文件/模块 op）、
+  ftrace 式函数替换、版本快照回滚、符号/依赖检查、A/B 状态持久化
+  （`STATEA/B.CNF` + CRC32 + SEQ）。
+- 入口：`srv.zts.*` 服务总线、shell `zts` 命令、settings ZTS 页（F4）、
+  `ZTS.CNF` 开机自动加载。FUCK `[zts] enable/autoload/selftest`。
+- 模块失败只回滚并打印 `ZTS-E01..E14/E90`，不 panic 内核。
+- **驱动内必须自带 `memcpy/memset/snprintf`**：clang 会把结构体赋值与
+  `__builtin_snprintf` 降级为 libc 调用；DKM 没有 libc，PLT32 会解析到
+  0/低地址（曾表现为 `#UD rip=0xa0000`）。
+
+ZT5 guest 子系统（VMX non-root）：
+
+- `CODE/UTSM/vmm/zt5_loader.c` + `zt5_boot.c` + `include/utsm/zt5_loader.h`：
+  装载 `SYSTEM/ESP/boot/zt5.krl`，构造 guest 页表（恒等 0-4GB + HHDM +
+  内核高半区；**PDPT 索引=510**）、GDT、伪 Limine 响应
+  （hhdm/memmap/fb/kernel_file/module/cmdline），回填 `.limine_reqs`
+  （knl.bin 无 section 头时扫描镜像前 64KB）；EPT 映射 boot area/fb/
+  modules/kernel(64MB)/RAM(1GB)。
+- Guest 布局：boot area 0x20000、fb 0x100000、modules 0x400000、
+  kernel 0x1000000（64MB 窗口）、RAM 0x6000000。**不要 identity-map
+  低 1MB**（会覆盖 boot area 的 EPT 映射）。
+- VMCS：VPID=4；guest CR4 必须含 VMXE、CR0 含 MP/ET；selector=0 的
+  FS/GS/LDTR 必须标 unusable；MSR bitmap 物理地址走
+  `vmx_kernel_virt_to_phys`（不能用 `-HHDM`）；vmlaunch 前
+  VMCLEAR+VMPTRLD。
+- FUCK `[zt5] enable=0|1`。默认 0；开启后 ZT5 独占运行（host 暂停到 guest
+  终止），协作切片 `kern.zt5.pump` 待 P4。`kern.zt5.status` 已注册。
+- `build.ps1` 复制 `CODE/ZT5/SYSTEM/system/knl.bin` → `SYSTEM/ESP/boot/zt5.krl`，
+  用户程序/配置 → `SYSTEM/ESP/boot/zt5/`；EFI 引导器以 `zt5:kernel` /
+  `zt5:<guest 路径>` 预加载。
+- 已验证（WSL2+KVM nested VMX）：ZT5 `_start` → GDT/IDT/PMM/VMM/Heap →
+  APIC/SMP → VFS/RAMFS → ZTS7/AI 初始化 → Stage 9 → 加载 desk → 进入
+  scheduler。剩余阻塞：scheduler 后 guest 页错误（desktop 返回路径，
+  待 guest profile/用户态页表继续定位）。
 
 ## 当前核心架构
 
@@ -82,23 +143,33 @@ FUCK
 SYSTEM/
     打包为 IMG 后的系统根目录。
 
-SYSTEM/driver/manifest.json
+SYSTEM/ESP/driver/manifest.json
     内核启动驱动模块清单，控制 ELF .drv 驱动的分阶段加载。
 
 SYSTEM/STARTMENU.CNF
     M3 开始菜单注册表（FAT32 根目录，desktop 启动时解析）。
-    格式 NAME|显示名|path|args；path 支持 builtin:<name> / program/xxx.exe（GUI PE，
+    格式 NAME|显示名|path|args；path 支持 builtin:<name> / program/xxx.exe（PE 应用，
     g++ 编译，run_windowed 嵌入桌面）/ bin/xxx.elf（ELF 工具，全屏加载）/
     /guest/path（Linux guest 应用）。显示名可 UTF-8 中文；文件缺失时回退全部已注册应用。
-    纯 CLI exe（bin/pciscan.exe、bin/portio.exe）不入菜单——在 CMD 里敲名字运行，
-    输出走串口。源码在 CODE/tools/pe-tools/（build.ps1 用 mingw-w64 g++ 编译），
-    ELF 工具源码在 CODE/tools/diskinfo/（→ SYSTEM/bin/diskinfo.elf）。
+    目录约定：bin/ = ELF 工具，program/ = exe（cmd PATH：根 → bin/ → program/）。
+    纯 CLI exe（program/pciscan.exe、program/portio.exe）不入菜单——在 CMD 里敲名字
+    运行，输出走串口（shim printf/putchar 只到 COM1）。源码在 CODE/tools/pe-tools/
+    （build.ps1 用 mingw-w64 g++ 编译，-nostdlib + 空 __main，导入面必须保持在
+    pe_shim 表内，objdump -p 自检），ELF 工具源码在 CODE/tools/diskinfo/
+    （→ SYSTEM/ESP/bin/diskinfo.elf，diskpart 风格只读磁盘工具）。
 
-SYSTEM/program/ + SYSTEM/bin/ + SYSTEM/lib/ + PEAPPS.CNF + LINUXAPP.CNF + STARTMENU.CNF
+SYSTEM/ESP/program/ + SYSTEM/ESP/bin/ + SYSTEM/ESP/lib/ + PEAPPS.CNF + LINUXAPP.CNF + STARTMENU.CNF + AUTOEXEC.BAT
     桌面 PE/工具链全部经 DSK FAT32 只读 ESP——pack_system_image.sh 会把这几项
     额外拷到 FAT32 ESP（p1）。漏拷则开始菜单/PE 应用在 GPT 镜像里静默失效。
 
-SYSTEM/system/deshab64/FUCK
+> **应用启动链路（desktop launcher.c）**：内置 ELF 应用（shell/cmd/browser/
+> settings/proedit）用 `app_descriptor.elf_path`（FS 路径如
+> `system/deshab64/shell.elf`），**不要**用 `elf_name`（那是 FS 根目录 8.3 名，
+> 这些文件不在根）。桌面侧外部 ELF 加载缓冲是**固定地址 0x8800000 起 8MB**
+> （`DT_ELF_IMAGE_ADDR`）——不能放 .bss：desktop.elf 自身映像须装进 DSK 的
+> 8MB ibuf，静态 4MB+ 缓冲会撑爆它；8MB 需容纳 cmd.elf 的 4.27MB 映像。
+
+SYSTEM/ESP/system/deshab64/FUCK
     内核启动配置文件（INI 分区格式），控制启动行为开关、驱动加载开关、UTSM 算法参数、DSK 桌面行为、panic 策略（[panic] mode=strict|fallback）。
     UTSM 通过 Limine boot module 预加载读取（cmdline="fuck:config")。
     DSK 通过 FAT32 子目录遍历读取（路径 "SYSTEM  /DESHAB64 /FUCK    ")。
@@ -141,22 +212,43 @@ ISO/run_qemu.bat
 SYSTEM/ 是唯一打包输入：build.ps1 只扫描 SYSTEM/，不从 /home 或其它路径取发行物。
 所有要进镜像的软件（utsm.elf、deshab.elf、.drv、bzImage/initrd、
 linux-rootfs.img、linux-extra-rootfs.img、Python/KDE 内容）必须先落到 SYSTEM/。
-打包成 GPT 双分区：p1 FAT32 ESP（SYSTEM/EFI + SYSTEM/limine + SYSTEM/boot
-+ SYSTEM/driver + SYSTEM/system — Limine 10 不能读 ext4，boot(): 模块必须在 ESP），
-p2 ext4（其余 SYSTEM/，并保留 driver/system 副本）。由 WSL
-CODE/linux/pack_system_image.sh 执行 mkfs.vfat + mkfs.ext4。
-ext4 UUID 固定为 64657368-6162-4000-8000-000000000002。
+
+SYSTEM/ 下只有三个分区目录，一个目录 = 一个分区，打包器原样拷贝、不再按白名单
+重新分类（位置即归属）：
+
+  SYSTEM/ESP   -> GPT p1 FAT32 ESP (EF00)   UEFI/引导器读的分区
+  SYSTEM/DATA  -> GPT p2 ext4      (8300)   内核与系统数据分区，uuid 固定
+                                            64657368-6162-4000-8000-000000000002
+  SYSTEM/WIN   -> GPT p3 NTFS      (0700)   Windows Guest 系统卷
+
+三个分区一律创建（数量固定，运行期 fat32/ext4/VMM 依赖稳定磁盘形状）。
+打包由 WSL CODE/linux/pack_system_image.sh 执行 mkfs.vfat + mkfs.ext4 + mkfs.ntfs。
+
+跨分区“同一份内容出现在两处”写在 SYSTEM/LINKS.CNF（符号链接表）：
+  <目标分区>:<目标路径> <- <来源分区>:<来源路径>
+源树只保留一份真实内容；同一文件系统内建硬链接，跨文件系统退化为复制。
+分区容量计算已把链接表额外承载的字节数计入。当前表项：
+  DATA:/system/deshab64/FUCK <- ESP:/system/deshab64/FUCK  （ext4 启动自检要求）
+  DATA:/driver              <- ESP:/driver
+
 内核/驱动/DSK 一律走 boot(): （FAT32 ESP）。
 FAT32 单文件上限 4GiB-1 仍适用于 ESP 上的 /boot 文件，linux-extra-rootfs.img 必须小于 4GiB。
-SYSTEM/boot/ 存放启动模块，例如 utsm.elf。
-SYSTEM/driver/ 存放 ELF .drv 驱动模块和 manifest.json。
-CODE/UTSM/README.md: 编译到 SYSTEM/boot/utsm.elf
+SYSTEM/ESP/boot/ 存放启动模块，例如 utsm.elf。
+SYSTEM/ESP/EFI/BOOT/BOOTX64.EFI 由 build.ps1 的 Build-EfiBootStub 从 CODE/boot/main.c 生成
+  （clang -target x86_64-pc-windows-msvc + lld-link /subsystem:efi_application）。
+  CODE/boot 装载 SYSTEM/ESP/boot/utsm.elf 与 SYSTEM/ESP/driver/**，不再需要 Limine。
+SYSTEM/ESP/driver/ 存放 ELF .drv 驱动模块和 manifest.json。
+SYSTEM/ESP/boot/zt5/ 是 ZT5（ZratroOS）guest 的用户态载荷（prgm/sys/init、
+  desk、zrdemage、zinstall、prgm/shell、windowprogram/fm、zratro.conf），
+  引导器按 "zt5:<guest 路径>" 预加载为 boot module；zt5.krl 是 guest 内核本体。
+CODE/UTSM/README.md: 编译到 SYSTEM/ESP/boot/utsm.elf
 build.bat: 调用 build.ps1，透传参数（如 -Variant dev）。
-build.ps1: 编译 UTSM/DSK/工具/驱动，把整个 SYSTEM/ 打成 GPT(FAT32 ESP + ext4) 镜像：
+build.ps1: 编译 UTSM/工具/驱动，把 SYSTEM/{ESP,DATA,WIN} 打成 GPT 三分区镜像：
   - ISO/deshab-dev.img      开发者模式（dev_mode=1，自动跑 shell.elf 测试，调试全开，QEMU 验证选项，panic=strict）
-  - ISO/deshab-release.img  发布版（dev_mode=0，进桌面+登录，调试零开销，真机安全选项，panic=fallback 即关闭 panic）
+  - ISO/deshab-release.img  发布版（dev_mode=0，进桌面+登录，调试零开销，真机安全选项，panic=strict）
   - ISO/deshab-realtest.img 真机测试版（release 同款真机选项 + 登录路径，panic=strict 即启用 panic）
-  参数 -Variant dev|release|realtest|both|all（默认 all = 三者；both = dev+release）。both/all 构建后恢复 SYSTEM 为 dev 配置。
+  参数 -Variant dev|release|realtest|both|all（默认 both = dev+release；all = 三者）。both/all 构建后恢复 SYSTEM 为 dev 配置。
+  每张镜像固定 25GiB：p1 ESP 7GiB、p2 DATA 3GiB、p3 NTFS 拿走余下约 15GiB。有 SYSTEM/windows/deshab-windows.wim 时两张镜像都把 WIM 装进 p3。
   配置模板在 build/configs/{dev,release,realtest}/（FUCK + firstInit.txt），打包前注入到 SYSTEM。
   realtest/FUCK 由 release/FUCK 复制而来，仅头注释与 [panic] mode 不同；改 release 真机选项须同步 realtest。
 ISO/run_qemu.bat [dev|release|realtest]: 用 QEMU + UEFI 固件启动对应镜像（默认 dev），串口输出到 stdio。
@@ -176,7 +268,7 @@ DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解
 当前已实现 14 个真实 DKM 驱动：
 - **timer** (stage0): PIT 校准, 100ms busy-wait demo
 - **apic** (stage0): CPUID Local APIC 探测, IA32_APIC_BASE MSR, ACPI MADT 枚举, LAPIC enable + IOAPIC 重定向表编程（ISO 表感知）; B7: FUCK `apic_route=1` 时 IOAPIC→LAPIC 接管（注册 UTSM LAPIC EOI 钩子 + PIC 全屏蔽 + TPR=0 + tick vec 0x20 链路自验，失败自动完整降级回 PIC）; `apic_route_legacy=1` 额外放开 IRQ1/12/11 持续投递（e1000 强制 level/active-low）; `apic_diag=1` HPET 绝对时基对拍 + 键鼠流观察窗
-- **acpi** (stage0): Limine RSDP → XSDT, ACPI 表枚举
+- **acpi** (stage0): Limine RSDP → XSDT, ACPI 表枚举；FADT → DSDT `_S5_` AML 解析 → S5 关机 + FADT `reset_reg` 重启，注册 `srv.acpi.poweroff` / `srv.acpi.reboot`（母本 `SYSTEMCOPY/OpenXJ380/driver/power.cpp`，Apache-2.0）
 - **pci** (stage0): PCI config space 扫描, 设备枚举
 - **console_fb** (stage1): Limine framebuffer, 淡蓝色背景清屏（原四色圆弧加载环已移除，启动画面改由 DSK 静态 Logo 接管）
 - **ahci** (stage1): PCI AHCI `8086:2922` 探测, BAR5/ABAR HHDM MMIO 映射, HBA CAP/GHC/PI/VS 与 port 枚举；已接入 `kernel_api.dma`，支持 SATA disk IDENTIFY 与 LBA0 READ 最小 DMA 路径；可向 `kernel_api.block` 注册 `ahci0` block provider；默认无 SATA 盘/ATAPI 场景会跳过命令
@@ -185,22 +277,24 @@ DKM/DSM 驱动加载系统已完工：内置 `console_early` + manifest.json 解
 - **vfs** (stage2): 挂载 bootfs, 文件查找/读取
 - **devfs** (stage2): 暴露 `/dev/version`, `/dev/platform`, `/dev/fb0`, `/dev/modules`, `/dev/boot/`
 - **fat32** (stage2): 只读 FAT32 BPB/FAT/目录项解析, 通过 `driver/test.fat32` 验证读取 `README.TXT`
-- **ps2kbd** (stage3): PS/2 IRQ1 注册, 端口 `0x60` 扫描码读取, scan code set 1 → ASCII demo
+- **ps2kbd** (stage3): PS/2 IRQ1 注册, 端口 `0x60` 扫描码读取, scan code set 1 → ASCII demo；事件 ring 经 `srv.input.kbd.poll` 暴露，另有 `srv.input.kbd.push` 供其他输入源（USB HID）注入扫描码
 - **e1000** (stage3): PCI `8086:10d3` 探测, BAR0 HHDM MMIO 映射, MAC 读取, IRQ 注册, 基础 link setup
 - **virtio_net** (stage3): PCI virtio-net `1af4:1001` 探测, BAR 枚举, modern virtio PCI capability 枚举；暂不进行 feature negotiation / virtqueue / 收发包
+- **hda** (stage3): Intel HDA 控制器 + codec AFG/DAC/引脚选择 + BDL 同步回放；注册 `srv.audio.play/stop/info`（消费契约 `CODE/DKM/dkm_audio.h`），FUCK `[drivers] hda` + `hda_selftest`。母本 `SYSTEMCOPY/OpenXJ380/driver/hda`（Apache-2.0）。只做回放，无录音/混音器
+- **xhci** (stage1): USB Mass Storage（BOT+SCSI）block provider；新增 **USB HID boot 键盘**——Root Hub 直连，8 字节报告差分翻译成 Set-1 扫描码，经 `srv.input.kbd.push` 注入 ps2kbd ring，`srv.input.usb.pump` 由 ps2kbd 每次 poll 前驱动（无需调度任务）。外部 hub 未支持
 
 当前内核平台能力：IDT 0–255 stub 全覆盖、异常处理、PIC remap 到 `0x20–0x2f`、IRQ handler 注册与 EOI、UTSM 侧 LAPIC EOI 钩子（`idt_register_apic_eoi`，IRQ 分发末尾调用，spurious 0xFF 特判跳过）、IOAPIC→LAPIC 路由接管（B7，legacy IRQ1/12/11 可持续投递）、Limine RSDP/framebuffer/module/HHDM request。
 
 kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bpp, boot_modules_response, irq_register, hhdm_offset, dma.alloc_pages, block provider registry, mmio/mm_map_mmio/mm_unmap_mmio, register_apic_eoi（尾部追加，ABI 兼容）。
 
-当前 manifest 中 14 个外部 `.drv` 均已替换为真实 DKM 驱动并可加载执行。
+manifest 中全部外部 `.drv` 均为真实 DKM 驱动并可加载执行。第三方源码（libvterm / libutf / MikanOS hankaku / dr_mp3，均 MIT/Apache-2.0/Unlicense 兼容）vendor 在 `CODE/third_party/`，来源与用法见该目录 `NOTICE.md`。
 
 下一阶段优先路线（活跃路线 = **万物互联 P0-P6**（D6/D7，设计定稿 `docs/RE/万物互联与服务总线设计.md`）+ `docs/ROADMAP_INSANE.md` 五期填补计划，任务编号 F/U/D/R/E；状态唯一来源 = `docs/STATUS.md`）：
 0. **万物互联（D6/D7，当前最高优先）**: P0 manifest 依赖图强制 → P1 dkm_bus 双向服务总线（kern.*/srv.*）→ P2 fat32/ext4.drv 归位 → P3 加载器 FS 化 + stage4 + ps2mouse.drv → P4 六 app 模块 DKM 化（netman/shell/firstInit/login/desktop/cmd）→ P5 DSK 退役 + session.drv → P6 常驻调度 + 真 IRQ 输入。每 phase QEMU 验证后提交，进度见 STATUS.md 万物互联表。
 1. **一期 F 系列收尾**: F2 统一控制台后端（fbcon.h 抽象已落，panic 已用）。（F1 莲花 panic / F3 跨平台 Makefile / F4 boot 分级自检 / F5 skip_firstinit 已完成）
 2. **二期 U 系列**: ✅ 已完成（U1 UUID 表 / U2 Slow Path 真分支 / U3 @sealed 可选标记+linker .sealed section / U4 密文 dump / U5 RFC 8439 KAT）。chacha20 KAT 三方对拍通过（pycryptodome+官方向量+C），"间歇 FAIL" 确认为从未合并的幽灵缺陷。
 3. **三期 D 系列**: DKM 热卸载（引用计数）、裸机器码加载器、按名 API 导出表升级为服务总线（并入万物互联 P1）。（~~彩色日志~~ D4 已完成：驱动名 hash → 8 色 ANSI，FUCK color_log 开关，BOOTLOG 保持纯文本）
-4. **四期 R 系列收尾**: segment/system 级回滚验证、PCQ per-cpu 多核（多核在 P6 常驻调度之后排队）。（~~drr_emergency_pool_kb/drr_recovery_log_size 接线~~ R3b 已完成，运行期钳位验证 PASS）
+4. **四期 R 系列收尾**: （~~segment/system 级回滚验证~~ R4 已完成：page/segment/system 三级闭环 + A/B 槽破坏 fallback 硬验收 PASS）、PCQ per-cpu 多核（多核在 P6 常驻调度之后排队）。（~~drr_emergency_pool_kb/drr_recovery_log_size 接线~~ R3b 已完成，运行期钳位验证 PASS）
 5. **五期 E 系列**: 启动莲花动画、假想时光键彩蛋、提交信息规范、风味 ISO。
 6. **工程债（Phase 存档遗留）**: vector allocator/MSI-X、NVMe 高位 BAR、virtio-net virtqueue、DKM 零 warning。
 
@@ -323,7 +417,7 @@ kernel_api 已暴露能力：log, rsdp_address, fb_address/width/height/pitch/bp
 ### 3. 改动节奏（防"一次性插完"幻觉）
 - 每次只处理 **一个文件** 的 STUB→panic，改完输出：改动行号 + 剩余 STUB 计数。
 - 骨架允许"不接线"（无人调用的 skeleton 函数），但接线后行为必须是 panic。
-- 例外白名单（设计内双路径回退，允许非 panic）：APIC 自验失败回 PIC、块设备缺失回 boot module、KDE 回落 native、VMX/bzImage/kernel.krl 未配置跳过。新增白名单项必须改本文件并说明理由。
+- 例外白名单（设计内双路径回退，允许非 panic）：APIC 自验失败回 PIC、块设备缺失回 boot module、KDE 回落 native、VMX/bzImage/kernel.krl 未配置跳过、ps2mouse 探测不到 vmmouse 回 PS/2 相对包（vmmouse 是 QEMU vmport 的绝对指针，真机没有这个后门端口）。新增白名单项必须改本文件并说明理由。
 - **panic 双模式（FUCK `[panic] mode=strict|fallback`，默认 strict）**：strict = 本规约原样执行。fallback = 全局白名单开关，用于真机/演示"带病看全貌"：
   - UTSM `panic_full(sym,msg,NULL)` 只打 `[PANIC:FALLBACK]` + 错误码 + 命中计数后返回，调用点走紧随其后的备用路径（跳过该能力/驱动/段/页面）；DKM `kernel_api.panic` / `kern.log.panic` 同样返回驱动，驱动 init 返回非零。
   - 模式经 `DSK_BOOT_FLAG_PANIC_FALLBACK (1<<4)` 下传，DSK/FirstInit/login/desktop 的 `*_fatal` 同样只留串口后返回；DSK ext4 内部 fatal 经 `__builtin_setjmp/longjmp` 中止本次操作 → 只用 FAT32 ESP。

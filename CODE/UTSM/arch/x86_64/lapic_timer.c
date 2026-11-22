@@ -190,3 +190,38 @@ void lapic_timer_eoi(void) {
         lapic_write(LAPIC_EOI, 0);
     }
 }
+
+/* guest 执行期间屏蔽/恢复主机可屏蔽中断（TPR 抬高/归零）。
+ * 目的：guest 运行（VMX non-root）时，主机周期中断（调度器 LAPIC 定时器等，
+ * 动态向量 0x40/0x41）会因 PIN_EXT_INTERRUPT_EXITING 走 VM-Exit；其 UTSM IDT
+ * handler 被绕过、不执行 EOI，于是中断持续 re-assert，形成 external-interrupt
+ * 风暴——每次 vmresume 立即再 exit，且 vmexit_before_resume 每次重装抢占定时器
+ * → PT 永不触发 → linux_resume 永挂 / guest 被饿死（桌面 lxc 取数挂起）。
+ * guest 的中断由 UTSM 经 vmx_guest_queue_irq 注入，与本机 LAPIC TPR 无关，
+ * 故此处抬高 TPR 不影响 guest 收中断；UTSM 自身在 guest 期间靠 PT 时间片推进，
+ * 不需要可屏蔽中断。 */
+#define LAPIC_LVT0 0x350u   /* LVT0 = ExtINT（8259 中断入口） */
+static u32 g_saved_lvt0;
+static int g_lvt_saved;
+
+void lapic_irq_quiesce(int on) {
+    if (!g_lapic) return;
+    /* TPR 屏蔽 LAPIC 直投中断（周期定时器等）。 */
+    lapic_write(LAPIC_TPR, on ? 0xF0u : 0u);
+    /* 关键：主机 8259 的中断经 LVT0=ExtINT 拉到 CPU INTR，**绕过 TPR**。
+     * 只要 PIC 有 pending（实测 IRQ0/IRQ1 常驻），guest 每次 vmresume 都被立即
+     * 打断，RIP 恒在 irq_entries_start，daemon 永不执行。这里 mask LVT0 切断
+     * ExtINT 投递——注意不能去屏蔽 8259 的 IMR：那是同一片 8259，guest 自己也在
+     * 用（屏蔽会让 guest 卡死在 mask_and_ack_8259A）。guest 的中断由 UTSM 经
+     * VM-entry interrupt info 注入，不依赖 ExtINT。返回 host 时恢复 LVT0。 */
+    if (on) {
+        if (!g_lvt_saved) {
+            g_saved_lvt0 = lapic_read(LAPIC_LVT0);
+            lapic_write(LAPIC_LVT0, g_saved_lvt0 | 0x10000u);   /* bit16 = mask */
+            g_lvt_saved = 1;
+        }
+    } else if (g_lvt_saved) {
+        lapic_write(LAPIC_LVT0, g_saved_lvt0);
+        g_lvt_saved = 0;
+    }
+}

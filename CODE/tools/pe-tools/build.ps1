@@ -1,22 +1,26 @@
-# build.ps1 — 编译 Deshab PE 系统工具（mingw-w64 g++）
+# build.ps1 - Build Deshab PE system tools (mingw-w64 g++)
 #
-# GUI 工具 → SYSTEM/program/*.exe（开始菜单 STARTMENU.CNF 启动，窗口嵌入桌面）
-# CLI 工具 → SYSTEM/bin/*.exe（CMD 里敲名字运行，输出走串口）
+# Directory convention: bin/ = ELF tools, program/ = exe.
+# All exes (GUI + CLI) -> SYSTEM\ESP\program/*.exe
+#   GUI: launched from STARTMENU.CNF, windowed via run_windowed
+#   CLI: run from CMD by name (cmd PATH: root -> bin/ -> program/), serial output
 #
-# 编译模式与 CODE/tools/pe-samples/hello64.c 相同：
-#   -nostartfiles -Wl,--entry,main -Wl,--image-base,0x140000000
-# （无 CRT 启动；只准调 pe_shim 表内的 Win32 面）
+# Link model (same entry/image-base as CODE/tools/pe-samples/hello64.c, plus
+# -nostdlib because g++ injects a __main call in C++ mode; pe_tool.h provides
+# an empty __main - no CRT, only pe_shim-table Win32 APIs allowed).
 #
-# 用法: powershell -File build.ps1 [-Gxx <g++路径>]
+# Usage: powershell -File build.ps1 [-GxxPath <path-to-g++>]
+# NOTE: keep this file ASCII-only - Windows PowerShell 5.1 reads BOM-less
+# files as ANSI and UTF-8 comment bytes can silently corrupt parsing.
 
 param([string]$GxxPath = "")
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
-$ProgDir = Join-Path $Root "SYSTEM\program"
-$BinDir = Join-Path $Root "SYSTEM\bin"
+$ProgDir = Join-Path $Root "SYSTEM\ESP\program"
+$BinDir = Join-Path $Root "SYSTEM\ESP\bin"
 
-# 定位 g++：参数 > PATH > msys2 默认位置
+# Locate g++: arg > PATH > msys2 default
 $gxx = $null
 if ($GxxPath -and (Test-Path $GxxPath)) {
     $gxx = $GxxPath
@@ -31,30 +35,31 @@ Write-Host "[pe-tools] g++ = $gxx"
 
 $Flags = @(
     "-O2", "-Wall", "-std=c++17",
-    "-nostartfiles",
+    "-finput-charset=UTF-8", "-fexec-charset=UTF-8",
+    "-nostdlib",
     "-Wl,--entry,main",
     "-Wl,--image-base,0x140000000"
 )
 
-# GUI 工具（user32 消息循环 + gdi32 DIB/BitBlt）
+# GUI tools (user32 message loop + gdi32 DIB/BitBlt)
 $GuiTools = @("sysinfo", "clock", "paint", "notes")
-# CLI 工具（putchar/puts/ExitProcess）
+# CLI tools (putchar/puts/ExitProcess)
 $CliTools = @("pciscan", "portio")
 
 foreach ($t in $GuiTools) {
     $src = Join-Path $PSScriptRoot "$t.cpp"
     $out = Join-Path $ProgDir "$t.exe"
-    & $gxx @Flags $src -o $out -lgdi32 -luser32
+    & $gxx @Flags $src -o $out -lgdi32 -luser32 -lkernel32 -lmsvcrt
     if ($LASTEXITCODE -ne 0) { throw "build failed: $t" }
-    Write-Host "[pe-tools] GUI  $t -> SYSTEM\program\$t.exe"
+    Write-Host "[pe-tools] GUI  $t -> SYSTEM\ESP\program\$t.exe"
 }
 
 foreach ($t in $CliTools) {
     $src = Join-Path $PSScriptRoot "$t.cpp"
-    $out = Join-Path $BinDir "$t.exe"
-    & $gxx @Flags $src -o $out
+    $out = Join-Path $ProgDir "$t.exe"
+    & $gxx @Flags $src -o $out -lkernel32 -lmsvcrt
     if ($LASTEXITCODE -ne 0) { throw "build failed: $t" }
-    Write-Host "[pe-tools] CLI  $t -> SYSTEM\bin\$t.exe"
+    Write-Host "[pe-tools] CLI  $t -> SYSTEM\ESP\program\$t.exe"
 }
 
 Write-Host "[pe-tools] done. (imports must stay within pe_shim table; verify with objdump -p)"

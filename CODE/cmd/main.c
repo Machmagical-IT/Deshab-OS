@@ -11,6 +11,12 @@
 #include "../UTSM/include/utsm/dsk.h"
 #include "../UTSM/include/utsm/pe.h"
 #include "../UTSM/pe/pe_loader.h"   /* PE 头结构体（image_dos_header 等），供 peinfo 解析 */
+#include "../DKM/dkm_shared.h"       /* P4f: DKM 驱动 ABI（driver_init/desc/kernel_api/bus） */
+#include "../DKM/dkm_input.h"         /* P6b: srv.input.kbd.poll 客户端 */
+
+/* P6b：输入经服务总线（srv.input.kbd.poll）。 */
+static dkm_input g_input;
+static int g_input_logged;
 
 typedef unsigned char      u8;
 typedef unsigned short     u16;
@@ -108,6 +114,39 @@ static int term_start_x, term_start_y;
 static const dsk_boot_context *g_boot_ctx = 0;
 static u64 g_kernel_api = 0;
 static const pe_service *g_pe_svc = 0;
+
+/* ---- 实机多盘：fat32_io.h 硬编码块设备 0 ----
+ * 与 desktop 同理：经 srv.fs.fat32.volume_info 取启动卷所在设备并重定向。 */
+static f32_block_read_fn  g_f32_read_raw;
+static f32_block_write_fn g_f32_write_raw;
+static u32 g_f32_dev;
+
+static int cmd_f32_read(u32 index, u64 lba, u32 count, void *buffer) {
+    (void)index;
+    return g_f32_read_raw ? g_f32_read_raw(g_f32_dev, lba, count, buffer) : -1;
+}
+static int cmd_f32_write(u32 index, u64 lba, u32 count, const void *buffer) {
+    (void)index;
+    return g_f32_write_raw ? g_f32_write_raw(g_f32_dev, lba, count, buffer) : -1;
+}
+
+/* 从总线解析启动卷设备索引；失败保持 0（单盘场景行为不变）。 */
+static void cmd_f32_init_from_api(const struct dkm_kernel_api *api) {
+    g_f32_read_raw  = (f32_block_read_fn)(api->block ? api->block->read  : 0);
+    g_f32_write_raw = (f32_block_write_fn)(api->block ? api->block->write : 0);
+    g_f32_dev = 0;
+    {
+        void *fn = 0;
+        if (api->bus && api->bus->probe("srv.fs.fat32.volume_info", &fn, 0) == 0 && fn) {
+            const struct dkm_fat32_volume_info *(*get)(void) =
+                (const struct dkm_fat32_volume_info *(*)(void))fn;
+            const struct dkm_fat32_volume_info *vi = get();
+            if (vi && vi->valid) g_f32_dev = vi->dev;
+        }
+    }
+    f32_init(g_f32_read_raw ? cmd_f32_read : 0,
+             g_f32_write_raw ? cmd_f32_write : 0);
+}
 
 /* dev_mode 串口镜像 */
 static int g_serial_mirror = 0;
@@ -382,6 +421,8 @@ static void cmd_help(void) {
     term_puts("  ver          显示版本\r\n");
     term_puts("  set          显示环境变量\r\n");
     term_puts("  help         显示此帮助\r\n");
+    term_puts("  shutdown     关机 (ACPI S5; 别名 poweroff/halt)\r\n");
+    term_puts("  reboot       重启 (ACPI reset)\r\n");
     term_puts("  exit         返回桌面\r\n");
     term_puts_color("\nPE 程序执行:\r\n", CMD_WARN);
     term_puts("  <name>.exe   运行 PE32+/PE32 程序 (如 hello.exe)\r\n");
@@ -662,6 +703,7 @@ static int has_exec_ext(const char *name) {
  * full_cmdline = 完整命令行（程序名 + 参数，即 GetCommandLineA 返回值）
  */
 static int cmd_read_pe_from_bin(const char *name11, u8 **data, u32 *size);  /* 前向声明 */
+static int cmd_read_pe_from_program(const char *name11, u8 **data, u32 *size);
 
 static void exec_pe(const char *prog_name, const char *full_cmdline) {
     if (!g_pe_svc) {
@@ -695,17 +737,20 @@ static void exec_pe(const char *prog_name, const char *full_cmdline) {
         return;
     }
 
-    /* PATH 查找：先根目录，再 /bin/ */
+    /* PATH 查找：根目录 → /bin/ → /program/（约定：bin=elf 工具，program=exe） */
     u8 *pe_data = 0; u32 pe_size = 0;
     int rc = f32_read_root_file(name11, &pe_data, &pe_size);
     if (rc != 0) {
         rc = cmd_read_pe_from_bin(name11, &pe_data, &pe_size);
     }
     if (rc != 0) {
+        rc = cmd_read_pe_from_program(name11, &pe_data, &pe_size);
+    }
+    if (rc != 0) {
         term_puts_color("'", CMD_ERROR);
         term_puts_color(prog_name, CMD_ERROR);
         term_puts_color("' 不是内部或外部命令，也不是可运行的程序。\r\n", CMD_ERROR);
-        term_puts_color("  (已搜索 C:\\ 及 C:\\bin\\)\r\n", CMD_DIM);
+        term_puts_color("  (已搜索 C:\\ 、C:\\bin\\ 及 C:\\program\\)\r\n", CMD_DIM);
         return;
     }
 
@@ -876,6 +921,15 @@ static int cmd_read_pe_from_bin(const char *name11, u8 **data, u32 *size) {
     u32 bin_clus;
     if (cmd_get_bin_cluster(&bin_clus) != 0) return -1;
     return cmd_read_file_in_dir(bin_clus, name11, data, size);
+}
+
+/* 从 /program 子目录读取 PE 文件（exe 约定目录：bin=elf 工具，program=exe）。 */
+static int cmd_read_pe_from_program(const char *name11, u8 **data, u32 *size) {
+    const f32_bpb *bpb = (const f32_bpb *)f32_disk;
+    char prog83[11] = {'P','R','O','G','R','A','M',' ',' ',' ',' '};
+    u32 clus;
+    if (cmd_find_subdir(bpb->root_clus, prog83, &clus) != 0) return -1;
+    return cmd_read_file_in_dir(clus, name11, data, size);
 }
 
 /* ============================================================
@@ -1157,6 +1211,36 @@ static void cmd_pe(const char *args) {
 
 static int g_should_exit = 0;
 
+/* driver_init 注入（正式定义在文件后段，电源分发先用到） */
+static const struct dkm_kernel_api *g_cmd_api;
+
+/* ---- 电源：经 acpi.drv 的服务（srv.acpi.poweroff / srv.acpi.reboot）。
+ * 服务缺席（无 ACPI 表 / FUCK [drivers] acpi=0）时退回本文件原有行为：
+ * 关机 = 停机自旋；重启 = 键盘控制器 + 0xCF9 + 三击。 ---- */
+static void *cmd_svc(const char *name) {
+    void *fn = 0;
+    if (!g_cmd_api || !g_cmd_api->bus) return 0;
+    if (g_cmd_api->bus->probe(name, &fn, 0) != 0) return 0;
+    return fn;
+}
+
+static void cmd_power_off(void) {
+    int (*svc)(void) = (int (*)(void))cmd_svc("srv.acpi.poweroff");
+    if (svc) svc();               /* 成功不返回 */
+    term_puts_color("系统已停止（ACPI S5 不可用）\r\n", CMD_DIM);
+    term_redraw_all();
+    for (;;) __asm__ volatile("hlt");
+}
+
+static void cmd_power_reboot(void) {
+    int (*svc)(void) = (int (*)(void))cmd_svc("srv.acpi.reboot");
+    if (svc) svc();               /* 成功不返回 */
+    for (u64 i = 0; i < 100000000ULL; i++) __asm__ volatile("pause");
+    outb(0x64, 0xFE);
+    outb(0xCF9, 0x06);
+    __asm__ volatile("int $0x03");   /* 三击复位 */
+}
+
 static void execute_command(const char *cmd) {
     while (*cmd == ' ') cmd++;
     if (*cmd == 0) return;
@@ -1192,12 +1276,16 @@ static void execute_command(const char *cmd) {
     }
     if (str_ieq(name, "pe"))     { cmd_pe(args);     return; }
     if (str_ieq(name, "peinfo")) { cmd_peinfo(args); return; }
+    if (str_ieq(name, "shutdown") || str_ieq(name, "poweroff") || str_ieq(name, "halt")) {
+        term_puts_color("关机中...\r\n", CMD_WARN);
+        term_redraw_all();
+        cmd_power_off();          /* ACPI S5（srv.acpi.poweroff）；失败则停机 */
+        return;
+    }
     if (str_ieq(name, "reboot")) {
         term_puts_color("重启中...\r\n", CMD_WARN);
         term_redraw_all();
-        for (u64 i = 0; i < 100000000ULL; i++) __asm__ volatile("pause");
-        /* 触发三重故障重启 */
-        __asm__ volatile("int $0x03");
+        cmd_power_reboot();       /* ACPI reset / 0xCF9 / 三击 */
         return;
     }
 
@@ -1272,54 +1360,140 @@ static void run_autoexec(void) {
  *  主入口
  * ============================================================ */
 
+/* ===================================================================
+ *  P4f 万物互联：DKM 驱动入口。driver_init 从 api/bus 解析服务并注册
+ *  srv.cmd.run；cmd_run 执行 CMD 主循环（Esc/AUTOEXIT 可返回）。
+ *  同源构建的 cmd.elf 仍走下方 dsk_entry（desktop 开始菜单启动）。
+ * =================================================================== */
+static struct dsk_boot_context g_cmd_compat_ctx;
+static int cmd_run(void);   /* 前向声明 */
+
+/* 外部 .elf 入口：desktop 开始菜单/桌面图标仍以 dsk_boot_context ABI 启动
+ * cmd.elf（与 cmd.drv 同源）。P4f 化时 driver_init 取代了 dsk_entry，导致
+ * cmd.elf 链接找不到入口符号、e_entry=0 —— 点击 CMD 会跳到镜像前一页的
+ * 垃圾地址。此入口按 compat 上下文建立与 driver_init 相同的运行环境，
+ * 再进入 cmd_run。 */
 __attribute__((visibility("default")))
 void dsk_entry(const dsk_boot_context *ctx) {
     __asm__ volatile("cli");
-    logl("[cmd] boot");
-
     if (!ctx || ctx->magic != 0x44534B31424F4F54ULL) {
         logl("[cmd] bad context");
-        for (;;) __asm__("hlt");
+        for (;;) __asm__ volatile("hlt");
     }
 
+    const struct dkm_kernel_api *api =
+        (const struct dkm_kernel_api *)ctx->dkm_kernel_api;
+    if (!api) {
+        logl("[cmd] no kernel api");
+        for (;;) __asm__ volatile("hlt");
+    }
+
+    g_cmd_api = api;
+    g_kernel_api = (u64)api;
+    g_boot_ctx = ctx;
     fb_a = ctx->framebuffer_address;
     fb_w = ctx->framebuffer_width;
     fb_h = ctx->framebuffer_height;
     fb_p = ctx->framebuffer_pitch;
 
-    g_kernel_api = ctx->dkm_kernel_api;
-    g_boot_ctx = ctx;
+    cmd_f32_init_from_api(api);
 
-    /* 获取 block 设备 read/write */
-    {
-        u64 api = ctx->dkm_kernel_api;
-        u64 blk = *(u64 *)(api + 0xA8);
-        f32_block_read_fn  bread = blk ? (f32_block_read_fn)*(u64 *)(blk + 16) : 0;
-        f32_block_write_fn bwrite = blk ? (f32_block_write_fn)*(u64 *)(blk + 24) : 0;
-        f32_init(bread, bwrite);
-    }
-    if (f32_blk_read)  logl("[cmd] block_read ok");
-    if (f32_blk_write) logl("[cmd] block_write ok");
-
-    /* 获取 PE 服务（reserved[4]） */
-    {
-        u64 pe_addr = ctx->reserved[4];
-        if (pe_addr) {
-            const pe_service *pe = (const pe_service *)pe_addr;
-            if (pe->magic == PE_SERVICE_MAGIC) {
-                g_pe_svc = pe;
-                logl("[cmd] PE service ok");
-            } else {
-                logl("[cmd] PE service magic mismatch");
-            }
-        } else {
-            logl("[cmd] PE service not available");
+    /* PE 服务：desktop 的 compat 上下文已把总线取得的服务回填 reserved[4]；
+     * 缺失时回落总线查询（与 driver_init 同路径）。 */
+    g_pe_svc = (const pe_service *)ctx->reserved[4];
+    if (!g_pe_svc) {
+        void *fn = 0;
+        if (api->bus && api->bus->probe("kern.pe.service", &fn, 0) == 0 && fn) {
+            const pe_service *(*pget)(void) = (const pe_service *(*)(void))fn;
+            const pe_service *pe = pget();
+            if (pe && pe->magic == PE_SERVICE_MAGIC) g_pe_svc = pe;
         }
     }
 
-    /* dev_mode 串口镜像 */
-    if (ctx->reserved[3] == 1) {
-        g_serial_mirror = 1;
+    (void)cmd_run();
+}
+
+__attribute__((visibility("default")))
+int driver_init(const struct dkm_kernel_api *api, struct dkm_driver_handle *handle) {
+    (void)handle;
+    if (!api || !api->log) return -1;
+    g_cmd_api = api;
+    g_kernel_api = (u64)api;
+
+    fb_a = (u64)api->fb_address;
+    fb_w = api->fb_width;
+    fb_h = api->fb_height;
+    fb_p = api->fb_pitch;
+
+    /* block（P4f：api->block 直读，不再 +0xA8 裸偏移）+ 启动卷设备重定向 */
+    cmd_f32_init_from_api(api);
+
+    /* PE 服务（P4f：经总线 kern.pe.service，不再 reserved[4]） */
+    g_pe_svc = 0;
+    {
+        void *fn = 0;
+        if (api->bus && api->bus->probe("kern.pe.service", &fn, 0) == 0 && fn) {
+            const pe_service *(*pget)(void) = (const pe_service *(*)(void))fn;
+            const pe_service *pe = pget();
+            if (pe && pe->magic == PE_SERVICE_MAGIC) g_pe_svc = pe;
+        }
+    }
+
+    /* 兼容 boot-context（供子应用，P5 后可移除） */
+    g_cmd_compat_ctx.magic = 0x44534B31424F4F54ULL;
+    g_cmd_compat_ctx.framebuffer_address = (u64)api->fb_address;
+    g_cmd_compat_ctx.framebuffer_width = api->fb_width;
+    g_cmd_compat_ctx.framebuffer_height = api->fb_height;
+    g_cmd_compat_ctx.framebuffer_pitch = api->fb_pitch;
+    g_cmd_compat_ctx.dkm_kernel_api = (u64)api;
+    g_boot_ctx = &g_cmd_compat_ctx;
+
+    if (api->bus) {
+        api->bus->register_service("srv.cmd.run", 1, (void *)cmd_run);
+        api->log->info("[cmd] srv.cmd.run registered");
+    }
+    return 0;
+}
+
+static int host_take_close(void) {
+    const desk_host_view *v;
+    dkm_input_mouse m;
+    if (!g_boot_ctx || !(g_boot_ctx->flags & DSK_BOOT_FLAG_HOSTED)) return 0;
+    v = (const desk_host_view *)(u64)g_boot_ctx->kernel_stack_top;
+    if (!v || v->magic != DESK_HOST_MAGIC) return 0;
+    if (v->pump) v->pump();
+    if (!g_input.mouse_poll || v->close_w == 0) return 0;
+    if (g_input.mouse_poll(&m) != 0 || m.magic != DKM_INPUT_MOUSE_MAGIC) return 0;
+    if ((m.buttons & 1u) == 0) return 0;
+    return m.x >= (int)v->close_x && m.x < (int)v->close_x + (int)v->close_w &&
+           m.y >= (int)v->close_y && m.y < (int)v->close_y + (int)v->close_h;
+}
+
+static int cmd_run(void) {
+    const struct dkm_kernel_api *api = g_cmd_api;
+    logl("[cmd] boot");
+
+    if (dkm_input_open(&g_input, api) != 0) {
+        g_cmd_api->log->error("[cmd] srv.input.kbd.poll missing");
+        g_cmd_api->log->panic("INPUT-E01 KBD POLL SERVICE MISSING");
+        return 0;
+    }
+    __asm__ volatile("sti" ::: "memory");   /* IRQ1/IRQ12 已由 session.drv 解屏蔽 */
+    logl("[cmd] input: kbd via srv.input.kbd.poll");
+
+    if (f32_blk_read)  logl("[cmd] block_read ok");
+    if (f32_blk_write) logl("[cmd] block_write ok");
+    if (g_pe_svc) logl("[cmd] PE service ok");
+    else logl("[cmd] PE service not available");
+
+    /* dev_mode 串口镜像（P4f：经 kern.config.get，不再 reserved[3]） */
+    {
+        void *fn = 0;
+        if (api && api->bus && api->bus->probe("kern.config.get", &fn, 0) == 0 && fn) {
+            const char *(*get)(const char *, const char *) = (const char *(*)(const char *, const char *))fn;
+            const char *dm = get("boot", "dev_mode");
+            if (dm && dm[0] == '1') g_serial_mirror = 1;
+        }
     }
 
     /* 初始化渲染上下文 */
@@ -1344,7 +1518,7 @@ void dsk_entry(const dsk_boot_context *ctx) {
 
     /* AUTOEXEC.BAT 自动执行（存在则逐行运行） */
     run_autoexec();
-    if (g_should_exit) return;
+    if (g_should_exit) return 0;
 
     /* 主循环 */
     int shift = 0;
@@ -1377,11 +1551,17 @@ void dsk_entry(const dsk_boot_context *ctx) {
                 }
             }
 
-            u8 st = inb(0x64);
-            if (!(st & 1)) { __asm__("pause"); continue; }
-            u8 data = inb(0x60);
-            if (st & 0x20) continue;  /* 忽略鼠标数据 */
-            u8 sc = data;
+            u8 sc;
+            if (host_take_close()) {
+                logl("[cmd] close -> return to DSK");
+                g_should_exit = 1;
+                break;
+            }
+            if (!dkm_input_kbd(&g_input, &sc)) { __asm__("pause"); continue; }
+            if (!g_input_logged) {
+                g_input_logged = 1;
+                logl("[cmd] kbd event via srv.input.kbd.poll");
+            }
 
             blink_start = rdtsc_cmd();
             if (!cur_visible) { cur_visible = 1; term_redraw_cursor(); }
@@ -1441,4 +1621,27 @@ void dsk_entry(const dsk_boot_context *ctx) {
     }
 
     logl("[cmd] exit");
+    return 0;
+}
+
+/* ===================================================================
+ *  P4f: DKM 驱动描述符 + 退出
+ * =================================================================== */
+static const char *const g_provides[] = { "cmd" };
+
+__attribute__((visibility("default"), used))
+const struct dkm_driver_desc driver_desc = {
+    .magic = DKM_DRIVER_MAGIC, .abi_version = DKM_ABI_VERSION,
+    .desc_size = sizeof(struct dkm_driver_desc),
+    .name = "cmd", .version = "0.1.0", .vendor = "Deshab",
+    .driver_class = DKM_CLASS_MISC, .stage = 4,
+    .flags = DKM_F_NO_UNLOAD, .priority = 0,
+    .depends = NULL, .depends_count = 0,
+    .provides = g_provides, .provides_count = 1,
+    .min_kernel_abi = 1,
+};
+
+__attribute__((visibility("default")))
+int driver_exit(struct dkm_driver_handle *handle) {
+    (void)handle; return 0;
 }
