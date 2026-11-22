@@ -21,6 +21,7 @@ param(
     [string]$Image = "ISO\deshab-release.img",
     [string]$Repo = "Linehu-Studio/Deshab-OS",
     [string]$Token = "",
+    [string[]]$ExtraAssets = @(),
     [switch]$Clobber
 )
 
@@ -261,6 +262,37 @@ $code = & curl.exe -sS -X POST "$uploadBase`?name=$sumsName" `
     -o NUL -w "%{http_code}"
 if ($code -ne "201") { $failed += $sumsName }
 
+# --- 附带资产（安装器 ISO 等，一次性小文件）---
+foreach ($ea in $ExtraAssets) {
+    if (-not (Test-Path $ea)) {
+        Write-Host "[release] 附带资产不存在: $ea"
+        $failed += $ea
+        continue
+    }
+    $ename = [System.IO.Path]::GetFileName($ea)
+    $esize = (Get-Item $ea).Length
+    $remoteMap = Get-RemoteAssets
+    if ($remoteMap.ContainsKey($ename)) {
+        Write-Host "[release] 删除旧资产: $ename"
+        Invoke-Gh api -X DELETE "repos/$Repo/releases/assets/$($remoteMap[$ename].id)" | Out-Null
+    }
+    $ok = $false
+    for ($t = 1; $t -le 6; $t++) {
+        Write-Host "[release] 上传附带资产 $ename ($([math]::Round($esize/1MB,1))MB) 第 $t/6 次 ..."
+        $code = & curl.exe -sS -X POST "$uploadBase`?name=$ename" `
+            -H "Authorization: token $env:GH_TOKEN" `
+            -H "Content-Type: application/octet-stream" `
+            --data-binary "@$((Get-Item $ea).FullName)" `
+            --retry 3 --retry-all-errors --retry-delay 10 `
+            --speed-limit 10240 --speed-time 120 --max-time 1800 `
+            -o NUL -w "%{http_code}"
+        if ($code -eq "201") { $ok = $true; break }
+        Write-Host "[release]   失败 http=$code，30s 后重试"
+        Start-Sleep -Seconds 30
+    }
+    if (-not $ok) { $failed += $ename } else { Write-Host "[release]   $ename OK" }
+}
+
 if ($failed.Count -gt 0) {
     Write-Host "[release] RELEASE-E08 以下资产未完成，release 保持 draft：$($failed -join ', ')"
     Write-Host "[release] 重跑本脚本会自动续传。"
@@ -279,11 +311,20 @@ $joinNote = if ($assets.Count -eq 1) {
     "cat deshab-release.img.gz.part* > deshab-release.img.gz  然后  gunzip deshab-release.img.gz"
 }
 
+$installerNote = ""
+foreach ($ea in $ExtraAssets) {
+    $en = [System.IO.Path]::GetFileName($ea)
+    if ($en -like '*.iso') {
+        $installerNote = "- ``$en``：装机镜像（Hybrid BIOS+UEFI，联网后自动从本 Release 拉取镜像写入目标硬盘）"
+    }
+}
+
 $notes = @"
 DeshabOS release $Tag
 
 ## 资产
 $assetNote
+$installerNote
 - ``SHA256SUMS``：各分卷与解压后镜像的 SHA256
 
 ## 镜像
