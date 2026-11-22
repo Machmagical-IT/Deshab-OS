@@ -53,12 +53,24 @@ typedef long long          i64;
 
 /* ---- 小工具（inline，各模块共享） ---- */
 
+#ifdef DESHAB_HOST
+/* 宿主演示构建（INSTALL/demo）：无特权指令，端口 I/O / 串口交给宿主实现。
+ * 裸机构建不定义 DESHAB_HOST，保持下方原始实现，零行为变化。 */
+#include "host_host.h"
+static __inline__ void outb(u16 port, u8 value) { host_outb(port, value); }
+static __inline__ u8 inb(u16 port) { return host_inb(port); }
+#else
 static __inline__ void outb(u16 port, u8 value) { __asm__ volatile("outb %0,%1"::"a"(value),"Nd"(port)); }
 static __inline__ u8 inb(u16 port) { u8 v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
+#endif
 
 static __inline__ void sputc(char c) {
+#ifdef DESHAB_HOST
+    host_serial_char(c);
+#else
     for (unsigned int i = 0; i < 100000; i++) { if (inb(COM1+5)&0x20) break; }
     outb(COM1, (unsigned char)c);
+#endif
 }
 static __inline__ void swrite(const char *s) { while(*s) { if(*s=='\n')sputc('\r'); sputc(*s++); } }
 static __inline__ void slog(const char *s) { swrite("[desktop] "); swrite(s); swrite("\n"); }
@@ -622,6 +634,11 @@ int  menubar_key(u8 sc);                    /* Esc 收起；1=已消费 */
 int  menubar_hover_key(void);
 int  menubar_menu_open(void);
 void menubar_close_menus(void);
+
+/* 右下角 Guest 装载进度横幅（kern.guest.progress → 桌面） */
+int  guest_banner_tick(void);
+void guest_banner_draw(void);
+int  guest_banner_visible(void);
 
 /* ---- dock.c：Aqua Dock ---- */
 void dock_draw(void);

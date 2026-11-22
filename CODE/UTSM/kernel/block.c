@@ -1,8 +1,10 @@
 #include <utsm/block.h>
 #include <utsm/log.h>
+#include <utsm/spinlock.h>
 
 static dkm_block_device_desc g_devices[DKM_BLOCK_MAX_DEVICES];
 static u32 g_device_count;
+static utsm_spinlock g_block_lock;   /* AP guest loader 与 BSP 桌面共享块设备 */
 
 void block_init(void) {
     g_device_count = 0;
@@ -32,14 +34,20 @@ static int block_read_impl(u32 index, u64 lba, u32 count, void *buffer) {
     if (index >= g_device_count || !buffer || count == 0) return -1;
     dkm_block_device_desc *dev = &g_devices[index];
     if (!dev->read) return -2;
-    return dev->read(dev->ctx, lba, count, buffer);
+    utsm_spin_lock(&g_block_lock);
+    int rc = dev->read(dev->ctx, lba, count, buffer);
+    utsm_spin_unlock(&g_block_lock);
+    return rc;
 }
 
 static int block_write_impl(u32 index, u64 lba, u32 count, const void *buffer) {
     if (index >= g_device_count || !buffer || count == 0) return -1;
     dkm_block_device_desc *dev = &g_devices[index];
     if (!dev->write) return -2;
-    return dev->write(dev->ctx, lba, count, buffer);
+    utsm_spin_lock(&g_block_lock);
+    int rc = dev->write(dev->ctx, lba, count, buffer);
+    utsm_spin_unlock(&g_block_lock);
+    return rc;
 }
 
 static u64 block_sector_size_impl(u32 index) {

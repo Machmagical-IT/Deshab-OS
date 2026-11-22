@@ -259,28 +259,32 @@ Checkpoint 扫描：O(number_of_dirty_shards + number_of_dirty_pages)
 CHECKPOINT_METADATA_COMMIT(gen)
     1. active = checkpoint.active_slot。
     2. inactive = opposite(active)。
-    3. 清理 inactive slot 的临时状态。
-    4. 写 inactive.metadata_header。
-    5. 写 segment desc snapshot。
-    6. 写 DMP snapshot。
-    7. 写 dirty shard summary。
-    8. 写 MAC root。
-    9. 写 generation。
-    10. 计算并写 CRC。
-    11. flush inactive slot。
-    12. 原子切换 checkpoint.active_slot = inactive。
-    13. 写 CHECKPOINT_COMMIT log。
+    3. 清理 inactive slot 的临时状态（active=0, seq=0）。
+    4. 写 inactive 字段：type / global_epoch / dirty_page_count / MAC root /
+       snap_gen / snap_crc（绑定本轮快照区头）。
+    5. 写 inactive.active = 1。
+    6. 写 inactive.seq = ++ckpt_seq（单调提交序号）。
+    7. CRC 覆盖 [0, offsetof(crc))（active/seq 均为最终值），最后写入 crc
+       —— crc 是唯一提交字。
+    8. flush inactive slot。
+    9. checkpoint.active_slot = inactive（旧槽保持 active=1 作为 fallback）。
+    10. 写 CHECKPOINT_COMMIT log。
 ```
+
+提交协议要求任何中断点都至少保留一个 CRC 合法的槽：步骤 5~7 之间新槽不可
+通过校验，恢复自动退回旧槽；旧槽在步骤 9 之前始终有效。CRC 必须先于
+`active` 置位的实现（历史缺陷）会使最新槽永远校验失败，禁止回归。
 
 恢复时：
 
 ```text
-1. 读取 active slot。
-2. 校验 generation 和 CRC。
-3. 如果 active 有效，使用 active。
-4. 如果 active 无效，校验 fallback slot。
-5. 如果 fallback 有效，使用 fallback。
-6. 如果双槽都无效，进入 system rollback。
+1. 读取 A/B 两个 slot。
+2. 各自校验 magic + version + active==1 + seq!=0 + CRC。
+3. 在合法槽中取 seq 最大者（不再盲信 RAM active_slot）。
+4. 被选槽与 RAM active_slot 不同 → 记录 recover fallback log 并对齐。
+5. 如果双槽都无效，进入 system rollback。
+6. 回滚前校验槽的 snap_gen/snap_crc 与快照区头一致；不一致拒绝恢复
+   （单快照区下旧元数据不能安全回滚新数据区，需双 bank 才能保留旧数据点）。
 ```
 
 ### 7.3 Dirty Page Checkpoint 算法

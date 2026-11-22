@@ -1,0 +1,208 @@
+#!/bin/busybox sh
+#
+# DeshabOS Installer — initramfs /init
+#
+# 流程：挂载伪文件系统 → DHCP 组网 → 解析 GitHub Release 资产（分卷）
+#       → 交互选择目标盘（二次确认）→ 逐卷下载 + SHA256 校验 + dd 写盘 → 关机
+#
+# 可选内核 cmdline：
+#   installer.repo=<owner/repo>   默认 Machmagical-IT/Deshab-OS
+#   installer.tag=<tag|latest>    默认 latest（仅取已正式发布的 release）
+#   installer.url=<单个 .img.gz>  跳过 GitHub API，直接写这一个文件（测试用）
+#
+# 设计：任何致命错误打印 INSTALLER-E## 后关机，绝不带病继续。
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+umask 022
+# Go 静态下载器用系统 CA 包校验 GitHub 证书（busybox 内建 TLS 不可用）
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+fatal() {
+    echo
+    echo "=============================================="
+    echo " INSTALLER-$1  $2"
+    echo " 安装已中止，15 秒后关机。"
+    echo "=============================================="
+    sleep 15
+    poweroff -f
+}
+
+msg() { echo "[installer] $*"; }
+
+# ---------- 1. 伪文件系统 ----------
+mount -t proc     none /proc   2>/dev/null
+mount -t sysfs    none /sys    2>/dev/null
+mount -t devtmpfs none /dev    2>/dev/null
+mkdir -p /dev/pts /tmp
+mount -t devpts none /dev/pts 2>/dev/null
+mount -t tmpfs  none /tmp      2>/dev/null
+mdev -s 2>/dev/null
+
+CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+arg() { echo "$CMDLINE" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -n1; }
+
+# ---------- 1.5 控制台 ----------
+# 脚本的 echo / read 必须落到真实存在的设备上：真机没有串口时
+# /dev/console 指向 ttyS0，界面全丢且 read 直接失败（随后静默关机，
+# 看起来就是"卡在内核日志最后一行"）。默认用 VT（tty0），只有 GRUB
+# 的串口项显式传 installer.console=serial 时才用串口。
+CONSEL=$(arg installer.console)
+if [ "$CONSEL" = "serial" ]; then
+    CON=/dev/ttyS0
+else
+    CON=/dev/tty0
+fi
+[ -c "$CON" ] || CON=/dev/console
+exec >"$CON" 2>&1 <"$CON"
+
+REPO=$(arg installer.repo); REPO=${REPO:-Machmagical-IT/Deshab-OS}
+TAG=$(arg installer.tag);   TAG=${TAG:-latest}
+ONESHOT=$(arg installer.url)
+
+clear 2>/dev/null
+echo "=============================================="
+echo "        DeshabOS Installer"
+echo "=============================================="
+msg "仓库   : $REPO"
+msg "版本   : $TAG"
+[ -n "$ONESHOT" ] && msg "直连URL: $ONESHOT"
+
+# ---------- 2. 组网 ----------
+net_up() {
+    static=$(arg ip)
+    for i in /sys/class/net/*; do
+        ifc=$(basename "$i")
+        [ "$ifc" = "lo" ] && continue
+        ip link set "$ifc" up 2>/dev/null || continue
+        if [ -n "$static" ]; then
+            # ip=<addr>/<prefix>[:gw]
+            addr=$(echo "$static" | cut -d: -f1)
+            gw=$(echo "$static"   | cut -d: -f2)
+            ip addr add "$addr" dev "$ifc" 2>/dev/null
+            [ -n "$gw" ] && ip route add default via "$gw" dev "$ifc" 2>/dev/null
+            echo "nameserver 223.5.5.5" > /etc/resolv.conf
+            echo "nameserver 8.8.8.8"  >> /etc/resolv.conf
+            IFACE=$ifc
+            msg "静态地址 $addr on $ifc"
+            return 0
+        fi
+        msg "DHCP on $ifc ..."
+        if udhcpc -i "$ifc" -n -q -t 6 -T 3 -s /etc/udhcpc.script >/dev/null 2>&1; then
+            IFACE=$ifc
+            msg "已联网: $(ip -4 addr show "$ifc" | grep -o 'inet [0-9./]*')"
+            return 0
+        fi
+    done
+    return 1
+}
+
+net_up || fatal E01 "未能在任何有线网卡上取得 IP（安装器不支持 Wi-Fi；请接网线/扩展坞，或在 cmdline 用 ip=<addr>/<prefix>[:gw] 配静态地址）"
+[ -s /etc/resolv.conf ] || printf 'nameserver 223.5.5.5\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+msg "DNS: $(tr '\n' ' ' < /etc/resolv.conf)"
+
+# ---------- 3. 解析资产清单 ----------
+: > /tmp/parturls
+: > /tmp/sums
+if [ -n "$ONESHOT" ]; then
+    echo "$ONESHOT" > /tmp/parturls
+    DLTAG="$TAG"
+else
+    msg "查询 GitHub API ..."
+    if ! dl list "$REPO" "$TAG" > /tmp/rel.out 2>/tmp/dl.err; then
+        cat /tmp/dl.err 2>/dev/null
+        fatal E02 "无法访问 GitHub API（$REPO / $TAG）"
+    fi
+    DLTAG=$(sed -n 's/^TAG //p' /tmp/rel.out | head -n1)
+    [ -n "$DLTAG" ] || fatal E03 "无法解析 release tag"
+    sed '/^TAG /d' /tmp/rel.out > /tmp/parturls
+    [ -s /tmp/parturls ] || fatal E04 "release $DLTAG 中没有 deshab-release 镜像资产"
+
+    SUMS_URL="https://github.com/$REPO/releases/download/$DLTAG/SHA256SUMS"
+    if dl get "$SUMS_URL" /tmp/sums 2>/dev/null; then
+        msg "已下载 SHA256SUMS"
+    else
+        msg "警告：未取到 SHA256SUMS，跳过逐卷校验"
+        : > /tmp/sums
+    fi
+fi
+
+NPARTS=$(wc -l < /tmp/parturls)
+msg "待写入资产: $NPARTS 个（$DLTAG）"
+
+# ---------- 4. 选择目标盘 ----------
+NEED_SECTORS=52428800    # 25GiB / 512B
+echo
+echo "可用磁盘："
+echo "  名称            容量      型号 / 可移动"
+for d in /sys/block/*; do
+    n=$(basename "$d")
+    case "$n" in
+        loop*|ram*|zram*|sr*|dm-*|md*|fd*) continue ;;
+    esac
+    sz=$(cat "$d/size" 2>/dev/null) || continue
+    [ "$sz" -gt 0 ] || continue
+    gib=$(( sz * 512 / 1024 / 1024 / 1024 ))
+    model=$(cat "$d/device/model" 2>/dev/null | sed 's/ *$//')
+    rem=$(cat "$d/removable" 2>/dev/null)
+    [ "$rem" = "1" ] && model="$model (可移动)"
+    printf "  /dev/%-11s %5s GiB  %s\n" "$n" "$gib" "$model"
+done
+echo
+printf "请输入目标磁盘名（例如 sda 或 nvme0n1，直接回车取消）: "
+read TGT <"$CON"
+[ -n "$TGT" ] || fatal E05 "用户取消"
+
+TGT=${TGT#/dev/}
+[ -b "/dev/$TGT" ] || fatal E06 "/dev/$TGT 不是块设备"
+TSZ=$(cat "/sys/block/$TGT/size" 2>/dev/null)
+[ -n "$TSZ" ] || fatal E07 "无法读取 /dev/$TGT 容量（可能是分区而非整盘）"
+if [ "$TSZ" -lt "$NEED_SECTORS" ]; then
+    fatal E08 "/dev/$TGT 只有 $(( TSZ * 512 / 1024 / 1024 / 1024 ))GiB，镜像需要 25GiB"
+fi
+
+echo
+echo "************************* 警告 *************************"
+echo " /dev/$TGT 上的分区表与全部数据将被永久抹除，且无法恢复。"
+echo " 即将写入 DeshabOS $DLTAG（25GiB）。"
+echo "********************************************************"
+printf "确认请输入大写 YES: "
+read ANS <"$CON"
+[ "$ANS" = "YES" ] || fatal E09 "未确认，已取消"
+
+# ---------- 5. 下载 + 校验 + 写盘 ----------
+OFF=0
+IDX=0
+while read -r U; do
+    IDX=$((IDX + 1))
+    NAME=$(basename "$U")
+    msg "[$IDX/$NPARTS] 下载 $NAME ..."
+    rm -f /tmp/part
+    dl get "$U" /tmp/part 2>/dev/null || fatal E10 "下载失败: $NAME"
+
+    SIZE=$(wc -c < /tmp/part)
+    if [ -s /tmp/sums ]; then
+        WANT=$(grep " $NAME\$" /tmp/sums | awk '{print $1}' | head -n1)
+        if [ -n "$WANT" ]; then
+            GOT=$(sha256sum /tmp/part | awk '{print $1}')
+            [ "$WANT" = "$GOT" ] || fatal E11 "SHA256 校验失败: $NAME"
+            msg "[$IDX/$NPARTS] 校验通过 ($SIZE 字节)"
+        fi
+    fi
+
+    dd if=/tmp/part of="/dev/$TGT" bs=1M seek="$OFF" conv=fsync 2>/dev/null \
+        || fatal E12 "写盘失败: $NAME"
+    OFF=$(( OFF + (SIZE + 1048575) / 1048576 ))
+    rm -f /tmp/part
+done < /tmp/parturls
+
+sync
+msg "写入完成，共 $(( OFF )) MiB"
+echo
+echo "=============================================="
+echo " DeshabOS 安装完成（$DLTAG）"
+echo " 请移除安装介质并重启，UEFI 固件会从目标盘引导"
+echo " BOOTX64.EFI -> utsm.elf"
+echo "=============================================="
+sleep 8
+poweroff -f

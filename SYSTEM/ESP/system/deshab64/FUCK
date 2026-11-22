@@ -1,4 +1,4 @@
-# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
+﻿# Deshab Kernel Configuration — dev 变体（build/configs/dev/FUCK）
 # build.ps1 -Variant dev 打包前注入 SYSTEM/system/deshab64/FUCK
 # 开发者模式：selftest 开、dev_mode 自动跑 shell.elf 测试、日志持久化、跳过向导直达桌面
 
@@ -7,6 +7,9 @@ vmm=1
 linux_guest=1
 windows_guest=0
 windows_autostart=0
+# 双 guest 后台装载：AP 跑 guest，BSP 先进桌面；0=退回进桌面前同步装载
+smp=1
+guest_background=1
 xj380_guest=0
 # F4: 分级自检 0=关 1=快速 2=全量（含 UTSM selftest；RFC 8439 KAT 已确定性对拍通过）
 selftest=1
@@ -69,6 +72,10 @@ tick_hz=100
 timeslice_ms=10
 demo_ms=1000
 demo_fault=0
+# R5：多核调度（smp=1 默认；AP 启动超时 ms；驱动任务是否允许迁移）
+smp=1
+ap_timeout_ms=1000
+migrate_drv_tasks=0
 
 [drr]
 watchdog_enabled=1

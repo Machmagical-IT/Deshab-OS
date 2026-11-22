@@ -35,21 +35,35 @@ typedef struct {
 #define DRR_LOG_FLAG_INTENT  0u
 #define DRR_LOG_FLAG_COMMIT  1u
 
-/* ---- Checkpoint Metadata Slot ---- */
+/* ---- Checkpoint Metadata Slot ----
+ * 提交协议（A/B）：
+ *   1. begin 选中 inactive 槽，写字段并置 active=0/seq=0；
+ *   2. finish 依次写 active=1 → seq=++ckpt_seq → CRC（唯一提交字，最后写）；
+ *   3. active_slot 指向最新提交槽；旧槽保持 active=1 作为 fallback。
+ * 恢复时两槽各自校验 magic/version/active/seq/CRC，取合法槽中 seq 最大者。
+ * crc 恒为尾字段，CRC 覆盖 [0, __builtin_offsetof(crc))。 */
 typedef struct {
     u64 magic;          /* DRR_CKPT_MAGIC */
     u32 version;
-    u32 active;         /* 0=inactive, 1=active */
-    drr_checkpoint_type type;
-    u64 global_epoch;
+    u32 active;         /* 0=preparing, 1=已提交 */
+    u32 type;           /* drr_checkpoint_type，定宽 u32 */
+    u32 reserved0;      /* 显式补齐，禁止隐式 padding 变化 */
+    u64 seq;            /* 单调提交序号，0=未提交 */
+    u64 global_epoch;   /* recovery generation（快照时刻） */
+    u64 snap_gen;       /* 绑定的快照区头 generation */
+    u64 snap_crc;       /* 绑定的快照区头 crc */
     u64 dirty_page_count;
     u64 mac_root;       /* MAC root hash of all sealed pages */
     u64 segment_count;
-    u64 crc;            /* CRC64 of the above */
+    u64 crc;            /* CRC64 of [0, offsetof(crc))，最后写入 */
 } drr_checkpoint_meta;
 
 #define DRR_CKPT_MAGIC    0x445252434B505421ULL  /* "DRRCKPT!" */
 #define DRR_CKPT_VERSION  1u
+#define DRR_CKPT_CRC_LEN  __builtin_offsetof(drr_checkpoint_meta, crc)
+_Static_assert(__builtin_offsetof(drr_checkpoint_meta, crc) + sizeof(u64) ==
+               sizeof(drr_checkpoint_meta),
+               "drr_checkpoint_meta: crc must be the trailing field");
 
 /* ---- Emergency Pool ---- */
 #define DRR_EMERGENCY_POOL_SIZE  (64ULL * 1024ULL)  /* 64KB 独立池 */
@@ -83,7 +97,10 @@ typedef struct {
     /* A/B checkpoint slots */
     drr_checkpoint_meta ckpt_a;
     drr_checkpoint_meta ckpt_b;
-    u32 active_slot;    /* 0=A, 1=B */
+    u32 active_slot;    /* 0=A, 1=B（提交成功后更新） */
+    u64 ckpt_seq;       /* 单调提交序号（每次 finish 前进） */
+    u32 ckpt_in_progress;
+    u32 ckpt_target;    /* begin 选中的槽（0=A, 1=B） */
 
     /* Root key */
     const u64 *root_key;
@@ -134,6 +151,9 @@ u64 drr_crc64(const void *data, u64 len);
  *  Phase 8 扩展：真实脏页快照 / 页级回滚 / 看门狗 / system rollback
  *  （尾部追加，不动既有结构与语义）
  * =================================================================== */
+
+/* 快照区数据页数（第 0 页为头 + 条目数组，其后为数据页） */
+#define DRR_SNAP_DATA_PAGES 128
 
 /* 快照区条目（快照区第 0 页：头(64B) + 条目数组顺序存放） */
 typedef struct {
@@ -194,9 +214,11 @@ void drr_set_sched_fault_cb(void (*cb)(u32 task_slot));
 int drr_rollback_segment(u32 seg_slot);
 
 /* system 级回滚（内存内全量恢复，可返回）：恢复快照区全部段的快照页。
- * 双槽皆坏 / 任一页校验失败 → 升级 drr_system_rollback（8042 复位，
- * 不返回）。成功返回恢复页数。与 drr_system_rollback()（最后手段复位）
- * 是两级：先试内存恢复，恢复不了才真重启。 */
+ * 双槽皆坏 / 任一页校验失败 / 槽与快照区代际不一致 → 升级
+ * drr_system_rollback（8042 复位，不返回）；复位被关闭（selftest dry-run）
+ * 时代际不一致返回 -5，不做任何页写入。成功返回恢复页数。
+ * 与 drr_system_rollback()（最后手段复位）是两级：先试内存恢复，恢复不了
+ * 才真重启。 */
 int drr_rollback_system(void);
 
 /* selftest 专用钩子（非生产路径）：破坏指定 slot（0=A,1=B）的 metadata
@@ -204,5 +226,12 @@ int drr_rollback_system(void);
 void drr_test_corrupt_slot(u32 slot);
 /* selftest 专用钩子（非生产路径）：读当前 active slot（0=A,1=B）。 */
 u32 drr_test_active_slot(void);
+/* selftest 专用钩子（非生产路径）：读指定 slot 的提交序号（0=未提交）。 */
+u64 drr_test_slot_seq(u32 slot);
+/* selftest 专用钩子（非生产路径）：读快照区头 generation（无快照区返回 0）。 */
+u64 drr_test_region_gen(void);
+/* selftest 专用钩子（非生产路径）：把快照区头 generation 加 1 并重算头
+ * CRC，制造「槽元数据与数据区代际不一致」的负向用例。 */
+void drr_test_bump_region_gen(void);
 
 #endif /* UTSM_DRR_H */

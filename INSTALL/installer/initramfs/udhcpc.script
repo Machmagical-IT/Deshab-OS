@@ -1,0 +1,12 @@
+#!/bin/busybox sh
+# udhcpc 回调（-s /etc/udhcpc.script）：只处理 bound/renew，写地址/路由/DNS。
+case "$1" in
+    bound|renew)
+        ip addr flush dev "$interface"
+        ip addr add "$ip/$mask" dev "$interface"
+        [ -n "$router" ] && ip route add default via "$router" dev "$interface"
+        : > /etc/resolv.conf
+        for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+        [ -s /etc/resolv.conf ] || echo "nameserver 223.5.5.5" >> /etc/resolv.conf
+        ;;
+esac

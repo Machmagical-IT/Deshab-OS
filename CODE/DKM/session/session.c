@@ -328,6 +328,22 @@ static int session_run(void) {
     milestone(2, "block API ready");
     milestone(3, "FUCK config loaded");
 
+    /* 内核的转圈任务必须在这里退场：它是优先级 0 的任务，每 16ms 直写
+     * 真实 fb 中心，桌面画出内容后仍会周期性覆盖。会话 Logo 的整屏重绘
+     * 会顺手清掉它留下的 banner 区。缺席 = 内核服务契约破坏。 */
+    {
+        void *fn = 0;
+        if (!g_api || !g_api->bus ||
+            g_api->bus->probe("kern.boot.dismiss", &fn, 0) != 0 || !fn) {
+            g_log->error("[session] kern.boot.dismiss missing");
+            g_log->panic("SESSION-E06 BOOT SPINNER DISMISS MISSING");
+            /* fallback：继续（转圈残留由后续整屏重绘覆盖），但任务不退出。 */
+        } else {
+            ((void (*)(void))fn)();
+            g_log->info("[session] boot spinner dismissed");
+        }
+    }
+
     /* 开机画面只显示 machmagic */
     if (show_logo && g_fb_addr) {
         splash_image(g_mm_logo_rgba, g_mm_logo_w, g_mm_logo_h, 3000, "machmagic.png");
@@ -400,6 +416,13 @@ static int session_run(void) {
      * 调度器不可用（spawn 返回 0）时回退到直接执行（永不返回）。 */
     if (svc("srv.desktop.spawn") && run_svc("srv.desktop.spawn") == 1) {
         g_log->info("[session] desktop spawned as task");
+        /* 桌面已经在 BSP 上跑；此时再把 guest 装载交给 AP（非阻塞）。 */
+        run_fn gs = (run_fn)svc("kern.guest.start");
+        if (gs) {
+            int grc = gs();
+            g_log->info(grc ? "[session] guest runner started on AP"
+                            : "[session] guest runner legacy path");
+        }
         return 1;
     }
     g_log->warn("[session] desktop spawn unavailable; running inline");

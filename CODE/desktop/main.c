@@ -352,7 +352,12 @@ void desktop_fatal(const char *sym) {
             }
         }
     }
-    for (;;) __asm__("cli; hlt");
+    for (;;)
+#ifdef DESHAB_HOST
+        host_fatal_halt(sym);
+#else
+        __asm__("cli; hlt");
+#endif
 }
 
 /* ============================================================
@@ -453,10 +458,15 @@ int desktop_reboot(void) {
         slog("[power] reboot returned");
     }
     slog("[power] ACPI reboot unavailable; falling back to 0xCF9");
+#ifdef DESHAB_HOST
+    host_demo_quit();
+    return -1;
+#else
     outb(0x64, 0xFE);
     outb(0xCF9, 0x06);
     for (;;) __asm__ volatile("hlt");
     return -1;
+#endif
 }
 
 /* P6b：把桌面主循环变成调度器任务。
@@ -493,7 +503,9 @@ static int desktop_run(void) {
         api->log->panic("INPUT-E01 KBD POLL SERVICE MISSING");
         return 0;
     }
+#ifndef DESHAB_HOST
     __asm__ volatile("sti" ::: "memory");
+#endif
     slog("input: kbd+mouse via service bus");
 
     /* lxc / pe 服务（P4e：经服务总线 kern.lxc.service / kern.pe.service，
@@ -656,29 +668,41 @@ static int desktop_run(void) {
         int need_redraw = 0;
         int moved = 0;
 
+        /* Guest 进度横幅：100ms 采样，有变化才重绘 */
+        if (guest_banner_tick()) need_redraw = 1;
+
         /* 整蛊系统：推进调度；可视类整蛊播放期间强制全屏重绘 */
         prank_tick();
         if (prank_wants_redraw()) need_redraw = 1;
 
         /* P8.1: 自动启动测试（先 ping guest，不可用直接报告，不浪费 3s 等待） */
+        /* 后台装载：guest 可能还没 READY，不能一次 ping 失败就放弃。 */
+        static u64 g_autotest_try_tsc = 0;
         if (g_tsc_per_sec && g_autotest_state == 0) {
             g_autotest_tsc = rdtsc();
+            g_autotest_try_tsc = 0;
             g_autotest_state = 1;
-            /* P8.1 Fix: 先检测 guest 可用性 */
-            int prc = lxc_guest_ping();
-            if (prc != 0) {
-                slog("[autotest] SKIP: Linux guest not running (no VMX/KVM)");
-                slog("[autotest] To test VSCode: use WSL2+KVM or Linux host with KVM");
-                g_autotest_state = 3;  /* 跳过测试 */
-            } else {
-                slog("[autotest] guest OK, waiting 90s before vscode_launch (KDE serial 2 first)");
-            }
         }
         if (g_autotest_state == 1 && g_tsc_per_sec) {
+            u64 now = rdtsc();
+            if (now - g_autotest_tsc >= (u64)g_tsc_per_sec * 90) {
+                slog("[autotest] SKIP: Linux guest not ready after 90s");
+                g_autotest_state = 3;
+            } else if (now >= g_autotest_try_tsc) {
+                g_autotest_try_tsc = now + g_tsc_per_sec;
+                if (lxc_guest_ping() == 0) {
+                    slog("[autotest] guest OK, waiting 90s before vscode_launch");
+                    g_autotest_tsc = now;
+                    g_autotest_state = 4;
+                }
+            }
+        }
+        if (g_autotest_state == 4 && g_tsc_per_sec) {
             u64 elapsed = rdtsc() - g_autotest_tsc;
             if (elapsed >= (u64)g_tsc_per_sec * 90) {
                 slog("[autotest] triggering vscode_launch");
                 g_autotest_state = 2;
+                g_autotest_tsc = rdtsc();
                 vscode_launch();
             }
         }

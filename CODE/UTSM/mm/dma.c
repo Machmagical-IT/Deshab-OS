@@ -2,6 +2,7 @@
 #include <utsm/log.h>
 #include <utsm/types.h>
 #include <utsm/panic.h>
+#include <utsm/spinlock.h>
 #include "../arch/x86_64/limine.h"
 
 #define PAGE_SIZE 4096ULL
@@ -32,6 +33,7 @@ static int g_dma_ready;
 static u64 g_high_start;                 /* 高内存区起点（2MB 对齐） */
 static u64 g_high_end;                   /* 高内存区终点（页对齐） */
 static u64 g_high_next;                  /* bump 指针 */
+static utsm_spinlock g_dma_lock;         /* AP guest_loader 与 BSP 桌面共享分配器 */
 
 static u64 align_up(u64 value, u64 alignment) {
     if (alignment < PAGE_SIZE) alignment = PAGE_SIZE;
@@ -139,6 +141,7 @@ int dma_alloc_pages(u64 page_count, u64 alignment, u64 max_phys, dkm_dma_buffer 
     u64 align_pages = alignment / PAGE_SIZE;
     if (align_pages == 0) align_pages = 1;
 
+    utsm_spin_lock(&g_dma_lock);
     u64 max_index = max_phys / PAGE_SIZE;
     u64 start = g_lowest_free_index;
     start = (start / align_pages) * align_pages;
@@ -158,10 +161,12 @@ int dma_alloc_pages(u64 page_count, u64 alignment, u64 max_phys, dkm_dma_buffer 
         out->virt = (void *)(g_hhdm_offset + phys);
         out->size = page_count * PAGE_SIZE;
 
+        utsm_spin_unlock(&g_dma_lock);
         u8 *p = (u8 *)out->virt;
         for (u64 i = 0; i < out->size; i++) p[i] = 0;
         return 0;
     }
+    utsm_spin_unlock(&g_dma_lock);
 
     log_warn("[DMA] alloc failed");
     log_hex64("[DMA] req pages=", page_count);
@@ -179,16 +184,20 @@ int dma_alloc_high_pages(u64 page_count, u64 alignment, dkm_dma_buffer *out) {
     if (g_high_end <= g_high_start) return -2;   /* 无高内存区可用 */
     if (alignment < PAGE_SIZE) alignment = PAGE_SIZE;
 
+    utsm_spin_lock(&g_dma_lock);
     u64 next = (g_high_next + alignment - 1ULL) & ~(alignment - 1ULL);
     u64 end = next + page_count * PAGE_SIZE;
     if (end < next || end > g_high_end) {
+        u64 free_bytes = g_high_end - g_high_next;
+        utsm_spin_unlock(&g_dma_lock);
         log_warn("[DMA] high alloc failed");
         log_hex64("[DMA] req pages=", page_count);
-        log_hex64("[DMA] high free bytes=", g_high_end - g_high_next);
+        log_hex64("[DMA] high free bytes=", free_bytes);
         return -2;
     }
 
     g_high_next = end;
+    utsm_spin_unlock(&g_dma_lock);
     out->phys = next;
     out->virt = (void *)(g_hhdm_offset + next);
     out->size = page_count * PAGE_SIZE;

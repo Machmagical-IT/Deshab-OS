@@ -83,6 +83,8 @@ void vm_machine_registry_init(void);
 struct vm_machine *vm_machine_create(const char *name, enum vm_profile profile,
                                      u32 vcpu_count);
 int vm_machine_activate(struct vm_machine *machine, u32 vcpu_id);
+/* 放弃当前 CPU 对 VMCS 的所有权（BSP → AP 交接前调用）。 */
+void vm_machine_release_cpu(void);
 struct vm_machine *vm_machine_active(void);
 struct vm_machine *vm_machine_find_profile(enum vm_profile profile);
 struct vm_vcpu *vm_vcpu_active(void);

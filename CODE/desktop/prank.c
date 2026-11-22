@@ -54,6 +54,7 @@ enum { PK_NONE = 0, PK_BSOD, PK_INVERT, PK_HANG,
 static int  s_kind  = PK_NONE;
 static u64  s_start = 0;
 static u64  s_dur   = 0;
+static int  s_need_clear = 0;  /* 1 = 可视整蛊刚结束，需要一次全屏重绘擦掉叠加层 */
 
 static u64  s_next  = 0;      /* 下次自动整蛊的 TSC 时刻 */
 static int  s_armed = 0;
@@ -179,6 +180,7 @@ void prank_boot_demo_start(void) {
 
 void prank_tick(void) {
     if (!g_prank_enabled) {
+        if (s_kind != PK_NONE && s_kind != PK_GARBLE) s_need_clear = 1;
         s_kind = PK_NONE;
         s_demo = 0;
         s_armed = 0;
@@ -190,6 +192,7 @@ void prank_tick(void) {
 
     if (s_kind != PK_NONE) {
         if (now - s_start >= s_dur) {
+            if (s_kind != PK_GARBLE) s_need_clear = 1;
             s_kind = PK_NONE;
             if (s_demo) {
                 s_qi++;
@@ -225,6 +228,7 @@ int prank_active(void) { return s_kind != PK_NONE; }
 
 /* 是否需要在整蛊期间强制全屏重绘（打字乱码纯作用于输入，无需重绘）。 */
 int prank_wants_redraw(void) {
+    if (s_need_clear) return 1;   /* 结束后补一帧全屏重绘，擦掉残留叠加层 */
     return s_kind != PK_NONE && s_kind != PK_GARBLE;
 }
 
@@ -479,6 +483,9 @@ static void draw_shutdown(du_context *ctx, int pct) {
  *  对外绘制入口（compositor 在光标之前调用）
  * ============================================================ */
 void prank_draw(du_context *ctx) {
+    /* 本函数只在 redraw_all() 内部被调用：走到这里说明本帧已经整屏重绘过，
+     * 无论这一帧画不画叠加层，残留标记都可以清掉。 */
+    s_need_clear = 0;
     if (s_kind == PK_NONE) return;
 
     u64 el = rdtsc() - s_start;

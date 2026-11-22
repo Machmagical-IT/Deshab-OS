@@ -59,6 +59,14 @@ static const u8 cursor_shape[24][24] = {
 
 static int bcd2bin(u8 v) { return (v >> 4) * 10 + (v & 0xF); }
 
+#ifdef DESHAB_HOST
+/* 宿主演示：RTC/TSC 由宿主提供（无 0x70/0x71 特权端口访问） */
+void rtc_read(int *yy, int *mo, int *dd, int *hh, int *mi, int *ss) {
+    host_rtc_read(yy, mo, dd, hh, mi, ss);
+}
+int rtc_day_sec(void) { return host_rtc_day_sec(); }
+void tsc_calibrate(void) { g_tsc_per_sec = host_tsc_calibrate(); }
+#else
 void rtc_read(int *yy, int *mo, int *dd, int *hh, int *mi, int *ss) {
     outb(0x70, 0x00); *ss = bcd2bin(inb(0x71));
     outb(0x70, 0x02); *mi = bcd2bin(inb(0x71));
@@ -73,6 +81,7 @@ int rtc_day_sec(void) {
     rtc_read(&y, &mo, &d, &h, &mi, &s);
     return h * 3600 + mi * 60 + s;
 }
+#endif
 
 /* 格式化 HH:MM:SS */
 void fmt_hms(char *out, int sec) {
@@ -83,6 +92,7 @@ void fmt_hms(char *out, int sec) {
 }
 
 /* 校准 TSC（约 1 秒）：用于双击间隔判定 */
+#ifndef DESHAB_HOST
 void tsc_calibrate(void) {
     int s0 = rtc_day_sec();
     while (rtc_day_sec() == s0) __asm__("pause");
@@ -91,6 +101,7 @@ void tsc_calibrate(void) {
     while (rtc_day_sec() == s1) __asm__("pause");
     g_tsc_per_sec = rdtsc() - t0;
 }
+#endif
 
 /* ============================================================
  *  光标管理
@@ -192,9 +203,19 @@ int dt_kbd_poll(u8 *sc) {
 void ps2_mouse_init(void) {
     if (!g_input.mouse_poll)
         slog("mouse: srv.input.mouse.poll missing (INPUT-E02, mouse disabled)");
+    /* 光标初值与驱动快照对齐：驱动相对包模式下从 fb 中心起步，
+     * 消费者若保留自己的 (400,300) 起点，可达下界会少掉近半屏。 */
+    if (g_input.mouse_valid) {
+        g_mouse_x = g_input.mouse_x;
+        g_mouse_y = g_input.mouse_y;
+        if (g_mouse_x < 0) g_mouse_x = 0;
+        if (g_mouse_y < 0) g_mouse_y = 0;
+        if (g_mouse_x >= (int)g_fb_w - CURSOR_SIZE) g_mouse_x = (int)g_fb_w - CURSOR_SIZE;
+        if (g_mouse_y >= (int)g_fb_h - CURSOR_SIZE) g_mouse_y = (int)g_fb_h - CURSOR_SIZE;
+    }
 }
 
-/* 返回 1 = 有新鼠标数据包（相对位移 + 按钮位已更新）。 */
+/* 返回 1 = 有新鼠标数据包（驱动坐标已更新）。 */
 int ps2_mouse_poll(void) {
     int dx = 0, dy = 0;
     u32 btns = 0;
@@ -206,13 +227,10 @@ int ps2_mouse_poll(void) {
         slog("mouse first pkt via srv.input.mouse.poll");
     }
 
-    if (g_input.mouse_abs) {
-        g_mouse_x = g_input.mouse_x;
-        g_mouse_y = g_input.mouse_y;
-    } else {
-        g_mouse_x += dx;
-        g_mouse_y += dy;
-    }
+    /* 驱动坐标是唯一真值（相对包模式下由驱动按 fb 中心累加）。
+     * 用它的差分再累加到消费方自己的起点，两边原点不同会导致半屏不可达。 */
+    g_mouse_x = g_input.mouse_x;
+    g_mouse_y = g_input.mouse_y;
     if (g_mouse_x < 0) g_mouse_x = 0;
     if (g_mouse_y < 0) g_mouse_y = 0;
     if (g_mouse_x >= (int)g_fb_w - CURSOR_SIZE) g_mouse_x = (int)g_fb_w - CURSOR_SIZE;

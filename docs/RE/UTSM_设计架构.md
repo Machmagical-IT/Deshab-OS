@@ -314,23 +314,30 @@ Checkpoint Metadata Slot A
 Checkpoint Metadata Slot B
 ```
 
-写入规则：
+写入规则（C 实现：`drr_checkpoint_begin/finish`）：
 
 ```text
-写 inactive slot
-写 metadata / dirty index / MAC root / CRC
-flush
-原子切换 active slot
-旧 slot 作为 fallback
+写 inactive slot 的字段（active=0, seq=0）
+写 metadata / dirty index / MAC root / snap_gen / snap_crc
+写 active = 1
+写 seq = ++ckpt_seq
+计算并写 CRC（覆盖 crc 之前的最终字节，最后一条写 = 提交字）
+active_slot 指向最新提交槽（旧槽保持 active=1 作为 fallback）
 ```
 
 恢复规则：
 
 ```text
-active slot 有效 -> 使用 active
-active slot 无效 -> fallback 另一个 slot
-双槽都无效 -> system rollback
+两槽各自校验 magic + version + active + seq + CRC
+合法槽中 seq 最大者胜出（不盲信 RAM active_slot）
+被选槽与 active_slot 不同 → fallback 日志并对齐
+双槽都无效 → system rollback
 ```
+
+快照区绑定：槽记录 `snap_gen` / `snap_crc`，回滚前与快照区头（generation +
+crc）比对；不一致时拒绝恢复（页级 -2、段级 POISONED、system 级按零降级升级
+复位）。单快照区下 A/B 只保证**元数据**稳定点，跨 checkpoint 的旧**数据**稳定点
+需要快照双 bank（未实现）。
 
 ### 8.3 DRR Emergency Pool
 

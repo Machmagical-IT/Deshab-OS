@@ -247,11 +247,13 @@ build.ps1: 编译 UTSM/工具/驱动，把 SYSTEM/{ESP,DATA,WIN} 打成 GPT 三�
   - ISO/deshab-dev.img      开发者模式（dev_mode=1，自动跑 shell.elf 测试，调试全开，QEMU 验证选项，panic=strict）
   - ISO/deshab-release.img  发布版（dev_mode=0，进桌面+登录，调试零开销，真机安全选项，panic=strict）
   - ISO/deshab-realtest.img 真机测试版（release 同款真机选项 + 登录路径，panic=strict 即启用 panic）
-  参数 -Variant dev|release|realtest|both|all（默认 both = dev+release；all = 三者）。both/all 构建后恢复 SYSTEM 为 dev 配置。
+  - ISO/deshab-ne.img       NE 版（No-panic Edition：release 同款真机选项 + 登录路径，panic=fallback）
+  参数 -Variant dev|release|realtest|ne|both|all（默认 both = dev+release；all = 四者）。both/all 构建后恢复 SYSTEM 为 dev 配置。
   每张镜像固定 25GiB：p1 ESP 7GiB、p2 DATA 3GiB、p3 NTFS 拿走余下约 15GiB。有 SYSTEM/windows/deshab-windows.wim 时两张镜像都把 WIM 装进 p3。
-  配置模板在 build/configs/{dev,release,realtest}/（FUCK + firstInit.txt），打包前注入到 SYSTEM。
-  realtest/FUCK 由 release/FUCK 复制而来，仅头注释与 [panic] mode 不同；改 release 真机选项须同步 realtest。
-ISO/run_qemu.bat [dev|release|realtest]: 用 QEMU + UEFI 固件启动对应镜像（默认 dev），串口输出到 stdio。
+  配置模板在 build/configs/{dev,release,realtest,ne}/（FUCK + firstInit.txt），打包前注入到 SYSTEM。
+  realtest/FUCK 由 release/FUCK 复制而来，仅头注释与 [panic] mode 不同；ne/FUCK 同样复制自 release，仅 [panic] mode=fallback；改 release 真机选项须同步三份。
+  运行期改 [panic] mode（strict|fallback）即可在 NE 镜像上恢复严格 panic，无需重新打包。
+ISO/run_qemu.bat [dev|release|realtest|ne]: 用 QEMU + UEFI 固件启动对应镜像（默认 dev），串口输出到 stdio。
 ISO/run_qemu_kvm.sh: 默认 12G 内存（Limine 会把 SYSTEM/boot 里的 rootfs 模块装进内存）。
 build.ps1 自动把 Git usr/bin 加入 PATH（sh.exe + mkdir），解决 make `mkdir -p` 在 cmd.exe 下失败的问题。
 ```
@@ -412,12 +414,12 @@ manifest 中全部外部 `.drv` 均为真实 DKM 驱动并可加载执行。第�
 - UTSM/内核态：`panic_full("<SERIES-E##> <SYM>", "<msg>", 0)`（莲花崩溃屏，见 CODE/UTSM/kernel/panic.c）。
 - DKM 驱动态：`g_log->panic("<DRV>-E## <SYM>")`（经 kernel_api.panic 槽，禁止直连内核符号）。
 - DSK：`dsk_fatal("<SERIES-E##> <SYM>")`；FirstInit/login：各自 `*_fatal()`。
-- 错误码系列：`FS-E`（文件系统/DSK 调度）、`ELF-E`、`HCALL-E`、`DRR-E`、`SCH-E`、`DKM-E`、`PE-E`、`LNX-E`、`VNET/ATH/XHC/E1K/NVME-E`（驱动）、`PKG-E`、`BRAND-E`、`NET-E`（FirstInit）、`LOGIN-E`。新模块按 `<MODULE>-E##` 注册到 docs/STATUS.md。
+- 错误码系列：`FS-E`（文件系统/DSK 调度）、`ELF-E`、`HCALL-E`、`DRR-E`、`SCH-E`、`DKM-E`、`PE-E`、`LNX-E`、`VNET/ATH/XHC/E1K/NVME-E`（驱动）、`PKG-E`、`BRAND-E`、`NET-E`（FirstInit）、`LOGIN-E`、`SMP-E`（AP 启动/所有权）、`GUEST-E`（后台 guest 运行器/邮箱）。新模块按 `<MODULE>-E##` 注册到 docs/STATUS.md。
 
 ### 3. 改动节奏（防"一次性插完"幻觉）
 - 每次只处理 **一个文件** 的 STUB→panic，改完输出：改动行号 + 剩余 STUB 计数。
 - 骨架允许"不接线"（无人调用的 skeleton 函数），但接线后行为必须是 panic。
-- 例外白名单（设计内双路径回退，允许非 panic）：APIC 自验失败回 PIC、块设备缺失回 boot module、KDE 回落 native、VMX/bzImage/kernel.krl 未配置跳过、ps2mouse 探测不到 vmmouse 回 PS/2 相对包（vmmouse 是 QEMU vmport 的绝对指针，真机没有这个后门端口）。新增白名单项必须改本文件并说明理由。
+- 例外白名单（设计内双路径回退，允许非 panic）：APIC 自验失败回 PIC、块设备缺失回 boot module、KDE 回落 native、VMX/bzImage/kernel.krl 未配置跳过、ps2mouse 探测不到 vmmouse 回 PS/2 相对包（vmmouse 是 QEMU vmport 的绝对指针，真机没有这个后门端口）；`[boot] smp=0` / `guest_background=0` 时双 guest 后台装载退回旧的进桌面前同步路径（AP 不参与）；桌面 `kern.guest.progress` 缺席时不画进度横幅（旧内核兼容）。新增白名单项必须改本文件并说明理由。
 - **panic 双模式（FUCK `[panic] mode=strict|fallback`，默认 strict）**：strict = 本规约原样执行。fallback = 全局白名单开关，用于真机/演示"带病看全貌"：
   - UTSM `panic_full(sym,msg,NULL)` 只打 `[PANIC:FALLBACK]` + 错误码 + 命中计数后返回，调用点走紧随其后的备用路径（跳过该能力/驱动/段/页面）；DKM `kernel_api.panic` / `kern.log.panic` 同样返回驱动，驱动 init 返回非零。
   - 模式经 `DSK_BOOT_FLAG_PANIC_FALLBACK (1<<4)` 下传，DSK/FirstInit/login/desktop 的 `*_fatal` 同样只留串口后返回；DSK ext4 内部 fatal 经 `__builtin_setjmp/longjmp` 中止本次操作 → 只用 FAT32 ESP。

@@ -2,10 +2,11 @@
 #
 # Linux/macOS (native or WSL):
 #   make dev          # build kernels+apps+drivers, inject dev config, pack ISO/deshab-dev.img (panic=strict)
-#   make release      # same, release config -> ISO/deshab-release.img (panic=fallback)
+#   make release      # same, release config -> ISO/deshab-release.img (panic=strict)
 #   make realtest     # real-machine test config, release options + panic=strict
+#   make ne           # NE (No-panic Edition): release options + panic=fallback (FUCK 可改)
 #   make both         # dev + release
-#   make all          # dev + release + realtest (SYSTEM restored to dev config)
+#   make all          # dev + release + realtest + ne (SYSTEM restored to dev config)
 #   make kernels apps drivers   # compile only
 #
 # Requirements: clang + ld.lld (LLVM), GNU make, python3 + Pillow (logo),
@@ -53,15 +54,16 @@ DRV_SRCS := CODE/DKM/console_fb/console_fb.c:SYSTEM/ESP/driver/console/console_f
 
 DRV_OUTS := $(foreach s,$(DRV_SRCS),$(ROOT)/$(word 2,$(subst :, ,$(s))))
 
-.PHONY: all both dev release realtest kernels apps drivers \
-        inject-dev inject-release inject-realtest \
-        iso-dev iso-release iso-realtest clean
+.PHONY: all both dev release realtest ne kernels apps drivers \
+        inject-dev inject-release inject-realtest inject-ne \
+        iso-dev iso-release iso-realtest iso-ne clean
 
 # iso-* 共享 SYSTEM/ 注入点，-j 下必须串行打包
 all: kernels apps drivers
 	@$(MAKE) --no-print-directory iso-dev
 	@$(MAKE) --no-print-directory iso-release
 	@$(MAKE) --no-print-directory iso-realtest
+	@$(MAKE) --no-print-directory iso-ne
 	@$(MAKE) --no-print-directory inject-dev
 
 both: kernels apps drivers
@@ -120,6 +122,7 @@ iso-%: inject-%
 dev: kernels apps drivers iso-dev
 release: kernels apps drivers iso-release
 realtest: kernels apps drivers iso-realtest
+ne: kernels apps drivers iso-ne
 
 clean:
 	@for d in $(KERNELS) $(APPS); do $(MAKE) -C $$d -f MAKEFILE clean >/dev/null 2>&1 || true; done

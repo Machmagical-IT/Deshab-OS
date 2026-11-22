@@ -1,0 +1,197 @@
+﻿# Deshab Kernel Configuration — ne 变体（build/configs/ne/FUCK）
+# build.ps1 -Variant ne 打包前注入 SYSTEM/system/deshab64/FUCK
+# NE 版（No-panic Edition）：release 同款真机选项 + 登录路径，
+# 唯一差异是 [panic] mode=fallback —— panic 点只记串口坐标后走备用路径，
+# 不显示莲花屏停机。需要严格 panic 时把下方 mode 改成 strict 即可。
+
+[boot]
+vmm=0
+linux_guest=0
+windows_guest=0
+windows_autostart=0
+smp=1
+guest_background=1
+xj380_guest=0
+# F4: 分级自检（快速档，不含 UTSM selftest）
+selftest=1
+dev_mode=0
+la57_guard=0
+mcfg_check=0
+max_phys_addr_bits=0
+# GOP 分辨率（0=自动）。引导器只选显存需求 ≤8MiB 的模式（桌面双缓冲上限），
+# 自动优先级 1280x800 > 1280x720 > 1366x768 > 1600x900 > 1600x1200 > 1024x768。
+# 需要固定分辨率时填 gop_width/gop_height（两个都要非 0 才生效）。
+gop_width=0
+gop_height=0
+disk_log=0
+
+[drivers]
+timer=1
+apic=1
+acpi=1
+pci=1
+console_fb=1
+ahci=1
+nvme=1
+ehci=1
+xhci=1
+bootfs=1
+vfs=1
+fat32=1
+devfs=1
+e1000=1
+virtio_net=1
+# ath9k=0：原生 Atheros 驱动仅支持 AR928x，其他厂商（Intel/Realtek/MediaTek）
+# 无匹配设备时 driver_init 返回非零 → DKM-E39 开机 panic。普通网卡走
+# linuxguest 后端（guest 内 mt76/iwlwifi/rtw88 + wpa_supplicant，状态回传）。
+ath9k=0
+mt7920=1
+# wlan=0：框架骨架，在有无线控制器的机器上会注册设备，其 scan/connect
+# 调用即 NETWL-E10/E11 panic。等 linuxguest 后端落地前先关闭。
+wlan=0
+ps2kbd=1
+ioapic_init=1
+lapic_enable=1
+apic_route=1
+apic_route_legacy=1
+nvme_msi=1
+apic_diag=0
+# Intel HDA 音频（srv.audio.play/stop/info）；无控制器时静默就绪
+hda=1
+# hda_selftest=1：init 末尾播 440Hz 0.25s 并打印 rc（无音频环境可用串口判定）
+hda_selftest=0
+
+[utsm]
+max_segments=1024
+max_capabilities=256
+max_pckc_keys=8
+dirty_shard_pages=1024
+arena_size_mb=64
+drr_emergency_pool_kb=64
+drr_recovery_log_size=4096
+drr_heartbeat_interval=0
+
+[sched]
+enable=1
+tick_hz=100
+timeslice_ms=10
+demo_ms=0
+demo_fault=0
+# R5：多核调度（smp=1 默认；AP 启动超时 ms；驱动任务是否允许迁移）
+smp=1
+ap_timeout_ms=1000
+migrate_drv_tasks=0
+
+[drr]
+watchdog_enabled=1
+
+# === panic 策略 ===
+# mode=strict   ：未实现/异常一律 panic（莲花屏停机），STUB 规约默认行为。
+# mode=fallback ：panic 点只记串口坐标 [PANIC:FALLBACK] 后走备用路径继续启动
+#                 （跳过该能力/驱动/页面）；CPU 异常、LA57、DSK 跳转失败仍停机。
+# 非 fallback 的任何值均按 strict 处理。
+[panic]
+# NE：panic 点只回退不 panic（[PANIC:FALLBACK] 串口留痕后继续启动）。
+# 想恢复严格模式改成 mode=strict 即可，无需重新打包代码。
+mode=fallback
+
+# === SAS-R0 启动期能力证明（attest） ===
+# require_<name>=1（默认）而能力未就绪 → 启动即莲花屏 panic。
+# NE + mode=fallback：不阻断启动，只打 [PANIC:FALLBACK] + [ATTEST] fallback 日志后继续。
+# 当前仍需豁免的项 = STATUS.md ⬜/🔶 未落地项；实现后逐项删除豁免行。
+[attest]
+require_sealed_mem=1
+require_pckc_derive=1
+require_sched=1
+require_drr=1
+require_fs_fat32_rw=1
+require_fs_ext4_rw=1
+# require_net_wired=0：当前原生驱动仅覆盖 Intel 8254x(e1000)/virtio-net。
+# 测试机为 Realtek 8168 有线 + MediaTek MT7920 无线，均无原生驱动 →
+# net_total=0。属白名单①（该机器不具备受支持网卡），待 linuxguest 后端
+# （guest 内发行版驱动）落地后删除本豁免行。实现后逐项删除。
+require_net_wired=0
+# NET-E01 wlan 栈未实现（linuxguest 后端落地后删除）
+require_net_wlan=0
+# VMX 为 guest 能力，真机不强制
+require_vmm_vmx=0
+# DRR-E31 Phase 9
+require_drr_real_mac=0
+# PKG-E10
+require_pkg=0
+# BRAND-E10
+require_brand_anim=0
+# DKM-E60
+require_dkm_hot_unload=0
+# DKM-E61
+require_dkm_api_export=0
+# NVME-E30
+require_nvme_rw=0
+# VNET-E30
+require_virtio_net=0
+
+[dsk]
+show_logo=1
+skip_login=0
+# F5: release 走正常路径（向导/登录生效）
+skip_firstinit=0
+mouse_init=1
+netman=1
+session=native
+
+# === "极差用户体验" 整蛊系统 ===
+# enable=1 打开总开关；下列各项 =0 可单独关闭。
+# 触发：开机进桌面后 boot_demo_sec 秒串烧演示 + 使用中每 interval_sec 秒随机一个。
+[prank]
+enable=1
+# 进桌面后串烧演示秒数，0=关
+boot_demo_sec=5
+# 使用中自动整蛊间隔（秒），0=关
+interval_sec=120
+# 假蓝屏（Win 风格）
+fake_bsod=1
+# 全屏反色闪烁
+invert_flash=1
+# 假"程序未响应"对话框
+fake_hang=1
+# 打字乱码（按键被随机重映射）
+garble_typing=1
+# 任务栏图标乱飞
+taskbar_fly=1
+# 假"系统即将关机"倒计时
+fake_shutdown=1
+
+[debug]
+enabled=0
+log_level=0
+probe_enable=0
+probe_capacity=4096
+stat_summary_interval=0
+utsm_trace=0
+vmm_trace=0
+dkm_trace=0
+dsk_trace=0
+block_trace=0
+net_trace=0
+input_trace=0
+color_log=0
+
+[compat]
+lib_path=lib
+linux_lib_guest_path=/usr/lib/deshab
+linux_lib_sync=0
+pe_dll_search=1
+
+[zts]
+# ZTS 热更新子系统（srv.zts.*；模块仓库 SYSTEM/zts → ESP /zts）
+enable=1
+autoload=1
+require_signature=0
+selftest=0
+
+[zt5]
+# ZT5 作为 UTSM VMX guest 子系统；运行需要 nested VMX（WSL2+KVM）。
+# enable 由 P3 阶段接通后改为 1。
+enable=0
+mode=headless
+ram_mb=512

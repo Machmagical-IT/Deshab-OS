@@ -29,6 +29,8 @@
 #include <utsm/block.h>
 #include <utsm/pe.h>
 #include <utsm/linux_compat.h>
+#include <utsm/guest_runner.h>
+#include <utsm/guest_progress.h>
 #include <utsm/zt5_loader.h>
 #include "../kernel/ini_parser.h"
 
@@ -42,6 +44,14 @@ const void *utsm_probe_info_get(void);
 static dkm_bus_service g_services[DKM_BUS_MAX_SERVICES];
 static u32 g_service_count;
 static struct dkm_driver_handle *g_current_provider; /* NULL = 内核 */
+static volatile int g_bus_frozen;   /* guest_runner 启动后总线只读 */
+
+/* 冻结总线：之后 register/unregister 一律 BUS-E06 panic。
+ * probe 仍可被 AP/BSP 并发调用（只读）。 */
+void dkm_bus_freeze(void) {
+    g_bus_frozen = 1;
+    log_info("[BUS] frozen (read-only for guest runner)");
+}
 
 /* ---- 名字工具 ---- */
 
@@ -73,6 +83,11 @@ static int bus_find(const char *name) {
 /* ---- 总线原语（BUS-E 全部 panic，零降级） ---- */
 
 static int bus_register_impl(const char *name, u32 version, void *fn) {
+    if (g_bus_frozen) {
+        panic_full("BUS-E06 BUS FROZEN",
+                   "dkm_bus: service registration after the bus was frozen for the AP guest runner", 0);
+        return -1;
+    }
     if (!name || !fn || !name[0]) {
         panic_full("BUS-E01 INVALID SERVICE NAME",
                    "dkm_bus: null/empty service name or fn", 0);
@@ -313,6 +328,9 @@ void dkm_bus_init(void) {
     /* PE / Linux 兼容层服务（替代 reserved[4]/reserved[5]） */
     bus_seed("kern.pe.service",  (void *)pe_get_service);
     bus_seed("kern.lxc.service", (void *)linux_compat_get_service);
+    /* 双 guest 后台装载：AP 运行器 + 桌面进度横幅 */
+    bus_seed("kern.guest.start",    (void *)guest_runner_start);
+    bus_seed("kern.guest.progress", (void *)guest_progress_get);
     /* Probe 缓冲描述（替代 reserved[6]；P4b shell $probe 消费） */
     bus_seed("kern.probe.info",  (void *)utsm_probe_info_get);
     /* 按名加载（session.drv 的排序拉手，P3 接 FUCK 过滤） */

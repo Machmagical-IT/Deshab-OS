@@ -1,4 +1,7 @@
 #include <utsm/log.h>
+#include <utsm/spinlock.h>
+
+static utsm_spinlock g_log_lock;
 
 /* ---- 内存日志缓冲区（实机启动日志持久化） ----
  * 默认启用捕获：所有日志同时写串口和内存缓冲。
@@ -21,11 +24,7 @@ u32 log_get_length(void) {
     return g_log_len;
 }
 
-static void log_emit(const char *s) {
-    /* Phase7: 日志行临界区——抢占可能把一行日志切成两半（串口与
-     * BOOTLOG 缓冲都会花），pushfq/popfq 保存并恢复本上下文的 IF。 */
-    u64 flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+static void log_emit_raw(const char *s) {
     serial_write(s);
     if (g_log_capture_on && s) {
         while (*s) {
@@ -34,13 +33,6 @@ static void log_emit(const char *s) {
             }
             s++;
         }
-    }
-    /* BUG-GP-IRET: 只恢复 IF，不做全量 popfq。全量 popfq 会把进入本
-     * 函数前 flags 里的历史污染位（如 NT=1）原样写回 RFLAGS 并在上下文
-     * 间传播（NT=1 时下一次 iretq 直接 #GP(0)）。本临界区的语义仅仅是
-     * "保存并恢复 IF"。 */
-    if (flags & (1ULL << 9)) {        /* 恢复进入前的 IF */
-        __asm__ volatile("sti" ::: "memory");
     }
 }
 
@@ -59,11 +51,9 @@ void log_color_enable(int enable) {
     if (!enable) g_log_color = 0;
 }
 
-/* 串口带色输出 + 缓冲纯文本（临界区内） */
+/* 串口带色输出 + 缓冲纯文本（调用方持有 g_log_lock） */
 static void log_emit_colored(const char *color, const char *a,
                              const char *b, const char *c) {
-    u64 flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     serial_write(color);
     serial_write(a);
     if (b) serial_write(b);
@@ -85,20 +75,20 @@ static void log_emit_colored(const char *color, const char *a,
             g_log_buf[g_log_len++] = '\n';
         }
     }
-    if (flags & (1ULL << 9)) {
-        __asm__ volatile("sti" ::: "memory");
-    }
 }
 
 static void log_line(const char *level, const char *msg) {
+    /* 整行一把锁：避免 BSP/AP 的日志把一行拆成两半。 */
+    utsm_spin_lock(&g_log_lock);
     if (g_log_color && g_log_color_on) {
         log_emit_colored(g_log_color, level, " ", msg);
-        return;
+    } else {
+        log_emit_raw(level);
+        log_emit_raw(" ");
+        log_emit_raw(msg);
+        log_emit_raw("\n");
     }
-    log_emit(level);
-    log_emit(" ");
-    log_emit(msg);
-    log_emit("\n");
+    utsm_spin_unlock(&g_log_lock);
 }
 
 /* 初始化画面的转圈挂在日志上：启动期几乎每一步都打日志。 */
@@ -128,12 +118,14 @@ void log_hex64(const char *prefix, u64 value) {
         buf[2 + i] = hex[(value >> ((15 - i) * 4)) & 0xf];
     }
     buf[18] = 0;
+    utsm_spin_lock(&g_log_lock);
     if (g_log_color && g_log_color_on) {
         log_emit_colored(g_log_color, prefix, buf, 0);
     } else {
-        log_emit(prefix);
-        log_emit(buf);
-        log_emit("\n");
+        log_emit_raw(prefix);
+        log_emit_raw(buf);
+        log_emit_raw("\n");
     }
+    utsm_spin_unlock(&g_log_lock);
     boot_status_pump();
 }

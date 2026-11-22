@@ -105,9 +105,13 @@ int vmx_supported(void) {
     return (ecx & (1U << 5)) != 0;   /* CPUID.1:ECX[5] = VMX */
 }
 
-/* ===== VMXON region ===== */
+/* ===== VMXON region（每 CPU 一份） ===== */
 
-static u64 g_vmxon_phys;
+#define VMX_MAX_CPUS 2
+static u8 g_vmxon_region[VMX_MAX_CPUS][4096] __attribute__((aligned(4096)));
+static u64 g_vmxon_phys[VMX_MAX_CPUS];
+static int g_vmx_enabled_cpu[VMX_MAX_CPUS];
+static u32 g_vmx_owner_cpu;
 static u64 g_vmcs_revision;
 static u64 g_vmx_basic;
 static int g_vmx_enabled;
@@ -217,49 +221,45 @@ static int vmx_truly_available(void) {
 
 /* P8.5: VMX 指令成功条件是 CF=0 且 ZF=0（即 ja）。
  * 旧代码只查 CF（jnc）：VMfailInvalid（ZF=1, CF=0）会被误判为成功。 */
-int vmx_enable(void) {
-    if (g_vmx_enabled) return 0;
+int vmx_cpu_enable(u32 cpu_index) {
+    if (cpu_index >= VMX_MAX_CPUS) {
+        panic_full("VMX-E06 INVALID CPU INDEX",
+                   "vmx_cpu_enable received a cpu index outside VMX_MAX_CPUS", 0);
+        return -1;
+    }
+    if (g_vmx_enabled_cpu[cpu_index]) return 0;
 
     if (!vmx_truly_available()) {
         log_warn("[VMX] VMX not truly available, skipping VMX init");
         return -1;
     }
 
-    /* 读 IA32_VMX_BASIC，获取 VMCS revision ID 与 region 大小 */
-    g_vmx_basic = vmx_read_msr(IA32_VMX_BASIC);
-    g_vmcs_revision = g_vmx_basic & 0x7FFFFFFFULL;
-    u32 vmcs_size = (u32)((g_vmx_basic >> 32) & 0x1FFF);
-    if (vmcs_size == 0) vmcs_size = 4096;
+    /* BSP 首次读取 VMX_BASIC；AP 复用同一 revision。 */
+    if (g_vmx_basic == 0) {
+        g_vmx_basic = vmx_read_msr(IA32_VMX_BASIC);
+        g_vmcs_revision = g_vmx_basic & 0x7FFFFFFFULL;
+        log_hex64("[VMX] VMX_BASIC=", g_vmx_basic);
+        log_hex64("[VMX] VMCS revision=", g_vmcs_revision);
+    }
 
-    log_hex64("[VMX] VMX_BASIC=", g_vmx_basic);
-    log_hex64("[VMX] VMCS revision=", g_vmcs_revision);
-
-    /* 分配 VMXON region（4KB 对齐，物理页） */
-    dkm_dma_buffer vmxon_buf;
-    if (dma_alloc_pages(1, EPT_PAGE_SIZE, 0x100000000ULL, &vmxon_buf) != 0) {
-        log_error("[VMX] failed to alloc VMXON region");
-        panic_full("VMX-E03 ALLOC VMXON REGION FAILED", "dma_alloc_pages failed for the vmxon region", 0);
+    u64 phys = vmx_kernel_virt_to_phys(g_vmxon_region[cpu_index]);
+    if (!phys) {
+        panic_full("VMX-E03 ALLOC VMXON REGION FAILED",
+                   "could not resolve the per-cpu vmxon region physical address", 0);
         return -2;
     }
-    g_vmxon_phys = vmxon_buf.phys;
-
-    /* 在 VMXON region 偏移 0 写入 VMCS revision ID */
-    u32 *vmxon_ptr = (u32 *)vmxon_buf.virt;
+    g_vmxon_phys[cpu_index] = phys;
+    u32 *vmxon_ptr = (u32 *)g_vmxon_region[cpu_index];
     vmxon_ptr[0] = (u32)g_vmcs_revision;
-    log_hex64("[VMX] VMXON phys=", g_vmxon_phys);
+    log_hex64("[VMX] VMXON phys=", phys);
 
-    /* 设置 CR4.VMXE */
+    /* 设置 CR4.VMXE / CR0 固定位 */
     u64 cr4 = vmx_required_cr4();
     write_cr4(cr4);
-    log_hex64("[VMX] CR4=", cr4);
-
-    /* 确保 CR0 满足 VMX 要求（这里只读不写，UEFI 已配置好） */
-    /* P8.3 Fix: ensure CR0 meets VMX requirements before VMXON */
     u64 cr0 = vmx_required_cr0();
     write_cr0(cr0);
-    log_hex64("[VMX] CR0=", cr0);
 
-    /* 执行 vmxon */
+    /* 执行 vmxon（操作数是内存中的物理地址） */
     int err;
     __asm__ volatile(
         "vmxon %1\n"
@@ -272,26 +272,41 @@ int vmx_enable(void) {
         "mov $1, %0\n"
         "3:\n"
         : "=r"(err)
-        : "m"(g_vmxon_phys)
+        : "m"(g_vmxon_phys[cpu_index])
         : "memory"
     );
 
     if (err) {
-        /* 第二次尝试：读 vmx instruction error 通过 VMCS 不适用 vmxon；
-         * 简化：返回失败。 */
         log_error("[VMX] vmxon failed");
-        panic_full("VMX-E04 VMXON FAILED", "the vmxon instruction failed to enter vmx root mode", 0);
+        panic_full("VMX-E04 VMXON FAILED",
+                   "the vmxon instruction failed to enter vmx root mode", 0);
         return -3;
     }
 
+    g_vmx_enabled_cpu[cpu_index] = 1;
     g_vmx_enabled = 1;
+    g_vmx_owner_cpu = cpu_index;
     log_info("[VMX] VMX root mode enabled");
+    log_hex64("[VMX]   cpu=", cpu_index);
     return 0;
+}
+
+int vmx_enable(void) {
+    return vmx_cpu_enable(0);
+}
+
+int vmx_cpu_enabled(u32 cpu_index) {
+    return cpu_index < VMX_MAX_CPUS && g_vmx_enabled_cpu[cpu_index];
+}
+
+u32 vmx_cpu_owner(void) {
+    return g_vmx_owner_cpu;
 }
 
 int vmx_disable(void) {
     if (!g_vmx_enabled) return 0;
     __asm__ volatile("vmxoff" ::: "memory");
+    for (u32 i = 0; i < VMX_MAX_CPUS; i++) g_vmx_enabled_cpu[i] = 0;
     g_vmx_enabled = 0;
     /* 清 CR4.VMXE */
     u64 cr4 = read_cr4();

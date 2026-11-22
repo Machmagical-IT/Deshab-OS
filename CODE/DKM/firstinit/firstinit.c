@@ -632,8 +632,9 @@ static int read_field(u32 *fb, i64 card_x, i64 card_y, int field, char *pc, char
             }
             if (mdx != 0 || mdy != 0) {
                 cursor_erase(fb);
-                *mx += mdx;         /* 驱动坐标已是屏幕坐标系（Y 向下） */
-                *my += mdy;
+                /* 驱动坐标是唯一真值（相对包模式下由驱动按 fb 中心累加并钳位） */
+                *mx = g_input.mouse_x;
+                *my = g_input.mouse_y;
                 if (*mx < 0) *mx = 0;
                 if (*my < 0) *my = 0;
                 if ((u64)*mx >= fb_w) *mx = (i64)fb_w - 1;
@@ -867,7 +868,8 @@ static void read_prefs_page(u32 *fb, i64 card_x, i64 card_y, setup_prefs *prefs,
         if (dkm_input_mouse_step(&g_input, &mdx, &mdy, &btns)) {
             if (mdx || mdy) {
                 cursor_erase(fb);
-                *mx += mdx; *my += mdy;
+                *mx = g_input.mouse_x;
+                *my = g_input.mouse_y;
                 if (*mx < 0) *mx = 0;
                 if (*my < 0) *my = 0;
                 if ((u64)*mx >= fb_w) *mx = (i64)fb_w - 1;
@@ -1211,7 +1213,8 @@ static void read_network_page(u32 *fb, i64 card_x, i64 card_y, setup_net *net, i
         if (dkm_input_mouse_step(&g_input, &mdx, &mdy, &btns)) {
             if (mdx || mdy) {
                 cursor_erase(fb);
-                *mx += mdx; *my += mdy;
+                *mx = g_input.mouse_x;
+                *my = g_input.mouse_y;
                 if (*mx < 0) *mx = 0; if (*my < 0) *my = 0;
                 if ((u64)*mx >= fb_w) *mx = (i64)fb_w - 1;
                 if ((u64)*my >= fb_h) *my = (i64)fb_h - 1;
@@ -1610,6 +1613,9 @@ static int firstinit_run(void) {
     logl("[FI] fadein done");
     logl("[FirstInit] mouse via srv.input.mouse.poll (ps2mouse.drv owns PS/2)");
     i64 mx = cx, my = cy;
+    /* 光标初值与驱动快照对齐：驱动相对包模式下从 fb 中心起步，
+     * 消费方保留自己的起点会让可达下界少掉近半屏。 */
+    if (g_input.mouse_valid) { mx = g_input.mouse_x; my = g_input.mouse_y; }
     {
         int field = 0;
         for (;;) {
@@ -1645,8 +1651,8 @@ static int firstinit_run(void) {
                     if (dkm_input_mouse_step(&g_input, &mdx, &mdy, &btns)) {
                         if (mdx != 0 || mdy != 0) {
                             cursor_erase(fb);
-                            mx += mdx;
-                            my += mdy;
+                            mx = g_input.mouse_x;
+                            my = g_input.mouse_y;
                             if (mx < 0) mx = 0;
                             if (my < 0) my = 0;
                             if ((u64)mx >= fb_w) mx = (i64)fb_w - 1;

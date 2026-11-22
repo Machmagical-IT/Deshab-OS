@@ -17,6 +17,7 @@
 #include <utsm/dkm.h>
 #include <utsm/crypto.h>
 #include <utsm/blake2b.h>
+#include <utsm/smp.h>
 
 extern void outb(u16 port, u8 value);
 
@@ -32,40 +33,73 @@ static void drr_memcpy(void *dst, const void *src, u64 n) {
     while (n--) *d++ = *s++;
 }
 
-/* ---- CRC64-ECMA ---- */
+/* ---- CRC64-ECMA（CRC-64/XZ：反射多项式 0xC96C5795D7870F42，init/xorout 全 1）
+ * KAT：crc64("123456789", 9) == 0x995DC9BBDF1939FA（selftest DRR-0 校验） ---- */
 static const u64 crc64_table[256] = {
-    0x0000000000000000ULL, 0x42F0E1EBA5EA001AULL, 0x85E1C3D753D46D34ULL, 0xC711223CF63E6D2EULL,
-    0x493366450E42ECDFULL, 0x0BC387AEABA8ECC5ULL, 0xCCD2A5925D9681EBULL, 0x8E224479F87C81F1ULL,
-    0x9266CC8A1C85D9BEULL, 0xD0962D61B96FD9A4ULL, 0x17870F5D4F51B48AULL, 0x5577EEB6EABBB490ULL,
-    0xDB55AACF12C73561ULL, 0x99A54B24B72D357BULL, 0x5EB4691841135855ULL, 0x1C4488F3E4F9584FULL,
-    0x2644C6D0383BF54AULL, 0x64B4273B9DD1F550ULL, 0xA3A505076BEF987EULL, 0xE155E4ECCE059864ULL,
-    0x6F77A09536791995ULL, 0x2D87417E9393198FULL, 0xEA96634265AD74A1ULL, 0xA86682A9C04774BBULL,
-    0xB4220A5A24BE2CF4ULL, 0xF6D2EBB181542CEEULL, 0x31C3C98D776A41C0ULL, 0x73332866D28041DAULL,
-    0xFD116C1F2AFCC02BULL, 0xBFE18DF48F16C031ULL, 0x78F0AFC87928AD1FULL, 0x3A004E23DCC2AD05ULL,
-    0x4C898D607077A834ULL, 0x0E796C8BD19DA82EULL, 0xC9684EB723A3C500ULL, 0x8B98AF5C8649C51AULL,
-    0x05BAEB257E3544EBULL, 0x474A0ACEDBDF44F1ULL, 0x805B28F22DE129DFULL, 0xC2ABC919880B29C5ULL,
-    0xDEEF41EA6CF2718AULL, 0x9C1FA001C9187190ULL, 0x5B0E823D3F261CBEULL, 0x19FE63D69ACC1CA4ULL,
-    0x97DC27AF62B09D55ULL, 0xD52CC644C75A9D4FULL, 0x123DE4783164F061ULL, 0x50CD0593948EF07BULL,
-    0x6ACD4BB0484C5D7EULL, 0x283DAA5BECA65D64ULL, 0xEF2C88671B98304AULL, 0xADDC698CBE723050ULL,
-    0x23FE2DF5460EB1A1ULL, 0x610ECC1EE3E4B1BBULL, 0xA61FEE2215DADC95ULL, 0xE4EF0FC9B030DC8FULL,
-    0xF8AB873A54C984C0ULL, 0xBA5B66D1F12384DAULL, 0x7D4A44ED071DE9F4ULL, 0x3FBAA506A2F7E9EEULL,
-    0xB198E17F5A8B681FULL, 0xF3680094FF616805ULL, 0x347922A8095F052BULL, 0x7689C343ACB50531ULL,
-    0x98131AE0E0ED2F68ULL, 0xDAE3FB0B45072F72ULL, 0x1DF2D937B339425CULL, 0x5F0238DC16D34246ULL,
-    0xD1207CA5EEAFC3B7ULL, 0x93D09D4E4B45C3ADULL, 0x54C1B172BD7BAE83ULL, 0x163150991891AE99ULL,
-    0x0A75D66AFC68F6D6ULL, 0x488537815982F6CCULL, 0x8F9415BDAFBC9BE2ULL, 0xCD64F4560A569BF8ULL,
-    0x4346B02FF22A1A09ULL, 0x01B651C457C01A13ULL, 0xC6A773F8A1FE773DULL, 0x8457921304147727ULL,
-    0xBE57DC30D8D6DA22ULL, 0xFCA73DDB7D3CDA38ULL, 0x3BB61FE78B02B716ULL, 0x7946FE0C2EE8B70CULL,
-    0xF764BA75D69436FDULL, 0xB5945B9E737E36E7ULL, 0x728579A285405BC9ULL, 0x3075984920AA5BD3ULL,
-    0x2C3110BAC453039CULL, 0x6EC1F15161B90386ULL, 0xA9D0D36D97876EA8ULL, 0xEB203286326D6EB2ULL,
-    0x650276FFCA11EF43ULL, 0x27F297146FFBEF59ULL, 0xE0E3B52899C58277ULL, 0xA21354C33C2F826DULL,
-    0xD49A9780909A875CULL, 0x966A766B35708746ULL, 0x517B5457C34EEA68ULL, 0x138BB5BC66A4EA72ULL,
-    0x9DA9F1C59ED86B83ULL, 0xDF59102E3B326B99ULL, 0x18483212CD0C06B7ULL, 0x5AB8D3F968E606ADULL,
-    0x46FC5B0A8C1F5EE2ULL, 0x040CBA4129F55EF8ULL, 0xC31D98DDDFCB33D6ULL, 0x81ED79367A2133CCULL,
-    0x0FCF3D4F825DB23DULL, 0x4D3FDCA427B7B227ULL, 0x8A2EFE98D189DF09ULL, 0xC8DE1F737463DF13ULL,
-    0xF2DE5150A8A17216ULL, 0xB02EB0BB0D4B720CULL, 0x773F9287FB751F22ULL, 0x35CF736C5E9F1F38ULL,
-    0xBBED3715A6E39EC9ULL, 0xF91DD6FE03099ED3ULL, 0x3E0CF4C2F537F3FDULL, 0x7CFC152950DDF3E7ULL,
-    0x60B89DDAB424ABA8ULL, 0x22487C3111CEABB2ULL, 0xE5595E0DE7F0C69CULL, 0xA7A9BFE6421AC686ULL,
-    0x298BFB9FBA664777ULL, 0x6B7B1A741F8C476DULL, 0xAC6A3848E9B22A43ULL, 0xEE9AD9A34C582A59ULL,
+    0x0000000000000000ULL, 0xB32E4CBE03A75F6FULL, 0xF4843657A840A05BULL, 0x47AA7AE9ABE7FF34ULL,
+    0x7BD0C384FF8F5E33ULL, 0xC8FE8F3AFC28015CULL, 0x8F54F5D357CFFE68ULL, 0x3C7AB96D5468A107ULL,
+    0xF7A18709FF1EBC66ULL, 0x448FCBB7FCB9E309ULL, 0x0325B15E575E1C3DULL, 0xB00BFDE054F94352ULL,
+    0x8C71448D0091E255ULL, 0x3F5F08330336BD3AULL, 0x78F572DAA8D1420EULL, 0xCBDB3E64AB761D61ULL,
+    0x7D9BA13851336649ULL, 0xCEB5ED8652943926ULL, 0x891F976FF973C612ULL, 0x3A31DBD1FAD4997DULL,
+    0x064B62BCAEBC387AULL, 0xB5652E02AD1B6715ULL, 0xF2CF54EB06FC9821ULL, 0x41E11855055BC74EULL,
+    0x8A3A2631AE2DDA2FULL, 0x39146A8FAD8A8540ULL, 0x7EBE1066066D7A74ULL, 0xCD905CD805CA251BULL,
+    0xF1EAE5B551A2841CULL, 0x42C4A90B5205DB73ULL, 0x056ED3E2F9E22447ULL, 0xB6409F5CFA457B28ULL,
+    0xFB374270A266CC92ULL, 0x48190ECEA1C193FDULL, 0x0FB374270A266CC9ULL, 0xBC9D3899098133A6ULL,
+    0x80E781F45DE992A1ULL, 0x33C9CD4A5E4ECDCEULL, 0x7463B7A3F5A932FAULL, 0xC74DFB1DF60E6D95ULL,
+    0x0C96C5795D7870F4ULL, 0xBFB889C75EDF2F9BULL, 0xF812F32EF538D0AFULL, 0x4B3CBF90F69F8FC0ULL,
+    0x774606FDA2F72EC7ULL, 0xC4684A43A15071A8ULL, 0x83C230AA0AB78E9CULL, 0x30EC7C140910D1F3ULL,
+    0x86ACE348F355AADBULL, 0x3582AFF6F0F2F5B4ULL, 0x7228D51F5B150A80ULL, 0xC10699A158B255EFULL,
+    0xFD7C20CC0CDAF4E8ULL, 0x4E526C720F7DAB87ULL, 0x09F8169BA49A54B3ULL, 0xBAD65A25A73D0BDCULL,
+    0x710D64410C4B16BDULL, 0xC22328FF0FEC49D2ULL, 0x85895216A40BB6E6ULL, 0x36A71EA8A7ACE989ULL,
+    0x0ADDA7C5F3C4488EULL, 0xB9F3EB7BF06317E1ULL, 0xFE5991925B84E8D5ULL, 0x4D77DD2C5823B7BAULL,
+    0x64B62BCAEBC387A1ULL, 0xD7986774E864D8CEULL, 0x90321D9D438327FAULL, 0x231C512340247895ULL,
+    0x1F66E84E144CD992ULL, 0xAC48A4F017EB86FDULL, 0xEBE2DE19BC0C79C9ULL, 0x58CC92A7BFAB26A6ULL,
+    0x9317ACC314DD3BC7ULL, 0x2039E07D177A64A8ULL, 0x67939A94BC9D9B9CULL, 0xD4BDD62ABF3AC4F3ULL,
+    0xE8C76F47EB5265F4ULL, 0x5BE923F9E8F53A9BULL, 0x1C4359104312C5AFULL, 0xAF6D15AE40B59AC0ULL,
+    0x192D8AF2BAF0E1E8ULL, 0xAA03C64CB957BE87ULL, 0xEDA9BCA512B041B3ULL, 0x5E87F01B11171EDCULL,
+    0x62FD4976457FBFDBULL, 0xD1D305C846D8E0B4ULL, 0x96797F21ED3F1F80ULL, 0x2557339FEE9840EFULL,
+    0xEE8C0DFB45EE5D8EULL, 0x5DA24145464902E1ULL, 0x1A083BACEDAEFDD5ULL, 0xA9267712EE09A2BAULL,
+    0x955CCE7FBA6103BDULL, 0x267282C1B9C65CD2ULL, 0x61D8F8281221A3E6ULL, 0xD2F6B4961186FC89ULL,
+    0x9F8169BA49A54B33ULL, 0x2CAF25044A02145CULL, 0x6B055FEDE1E5EB68ULL, 0xD82B1353E242B407ULL,
+    0xE451AA3EB62A1500ULL, 0x577FE680B58D4A6FULL, 0x10D59C691E6AB55BULL, 0xA3FBD0D71DCDEA34ULL,
+    0x6820EEB3B6BBF755ULL, 0xDB0EA20DB51CA83AULL, 0x9CA4D8E41EFB570EULL, 0x2F8A945A1D5C0861ULL,
+    0x13F02D374934A966ULL, 0xA0DE61894A93F609ULL, 0xE7741B60E174093DULL, 0x545A57DEE2D35652ULL,
+    0xE21AC88218962D7AULL, 0x5134843C1B317215ULL, 0x169EFED5B0D68D21ULL, 0xA5B0B26BB371D24EULL,
+    0x99CA0B06E7197349ULL, 0x2AE447B8E4BE2C26ULL, 0x6D4E3D514F59D312ULL, 0xDE6071EF4CFE8C7DULL,
+    0x15BB4F8BE788911CULL, 0xA6950335E42FCE73ULL, 0xE13F79DC4FC83147ULL, 0x521135624C6F6E28ULL,
+    0x6E6B8C0F1807CF2FULL, 0xDD45C0B11BA09040ULL, 0x9AEFBA58B0476F74ULL, 0x29C1F6E6B3E0301BULL,
+    0xC96C5795D7870F42ULL, 0x7A421B2BD420502DULL, 0x3DE861C27FC7AF19ULL, 0x8EC62D7C7C60F076ULL,
+    0xB2BC941128085171ULL, 0x0192D8AF2BAF0E1EULL, 0x4638A2468048F12AULL, 0xF516EEF883EFAE45ULL,
+    0x3ECDD09C2899B324ULL, 0x8DE39C222B3EEC4BULL, 0xCA49E6CB80D9137FULL, 0x7967AA75837E4C10ULL,
+    0x451D1318D716ED17ULL, 0xF6335FA6D4B1B278ULL, 0xB199254F7F564D4CULL, 0x02B769F17CF11223ULL,
+    0xB4F7F6AD86B4690BULL, 0x07D9BA1385133664ULL, 0x4073C0FA2EF4C950ULL, 0xF35D8C442D53963FULL,
+    0xCF273529793B3738ULL, 0x7C0979977A9C6857ULL, 0x3BA3037ED17B9763ULL, 0x888D4FC0D2DCC80CULL,
+    0x435671A479AAD56DULL, 0xF0783D1A7A0D8A02ULL, 0xB7D247F3D1EA7536ULL, 0x04FC0B4DD24D2A59ULL,
+    0x3886B22086258B5EULL, 0x8BA8FE9E8582D431ULL, 0xCC0284772E652B05ULL, 0x7F2CC8C92DC2746AULL,
+    0x325B15E575E1C3D0ULL, 0x8175595B76469CBFULL, 0xC6DF23B2DDA1638BULL, 0x75F16F0CDE063CE4ULL,
+    0x498BD6618A6E9DE3ULL, 0xFAA59ADF89C9C28CULL, 0xBD0FE036222E3DB8ULL, 0x0E21AC88218962D7ULL,
+    0xC5FA92EC8AFF7FB6ULL, 0x76D4DE52895820D9ULL, 0x317EA4BB22BFDFEDULL, 0x8250E80521188082ULL,
+    0xBE2A516875702185ULL, 0x0D041DD676D77EEAULL, 0x4AAE673FDD3081DEULL, 0xF9802B81DE97DEB1ULL,
+    0x4FC0B4DD24D2A599ULL, 0xFCEEF8632775FAF6ULL, 0xBB44828A8C9205C2ULL, 0x086ACE348F355AADULL,
+    0x34107759DB5DFBAAULL, 0x873E3BE7D8FAA4C5ULL, 0xC094410E731D5BF1ULL, 0x73BA0DB070BA049EULL,
+    0xB86133D4DBCC19FFULL, 0x0B4F7F6AD86B4690ULL, 0x4CE50583738CB9A4ULL, 0xFFCB493D702BE6CBULL,
+    0xC3B1F050244347CCULL, 0x709FBCEE27E418A3ULL, 0x3735C6078C03E797ULL, 0x841B8AB98FA4B8F8ULL,
+    0xADDA7C5F3C4488E3ULL, 0x1EF430E13FE3D78CULL, 0x595E4A08940428B8ULL, 0xEA7006B697A377D7ULL,
+    0xD60ABFDBC3CBD6D0ULL, 0x6524F365C06C89BFULL, 0x228E898C6B8B768BULL, 0x91A0C532682C29E4ULL,
+    0x5A7BFB56C35A3485ULL, 0xE955B7E8C0FD6BEAULL, 0xAEFFCD016B1A94DEULL, 0x1DD181BF68BDCBB1ULL,
+    0x21AB38D23CD56AB6ULL, 0x9285746C3F7235D9ULL, 0xD52F0E859495CAEDULL, 0x6601423B97329582ULL,
+    0xD041DD676D77EEAAULL, 0x636F91D96ED0B1C5ULL, 0x24C5EB30C5374EF1ULL, 0x97EBA78EC690119EULL,
+    0xAB911EE392F8B099ULL, 0x18BF525D915FEFF6ULL, 0x5F1528B43AB810C2ULL, 0xEC3B640A391F4FADULL,
+    0x27E05A6E926952CCULL, 0x94CE16D091CE0DA3ULL, 0xD3646C393A29F297ULL, 0x604A2087398EADF8ULL,
+    0x5C3099EA6DE60CFFULL, 0xEF1ED5546E415390ULL, 0xA8B4AFBDC5A6ACA4ULL, 0x1B9AE303C601F3CBULL,
+    0x56ED3E2F9E224471ULL, 0xE5C372919D851B1EULL, 0xA26908783662E42AULL, 0x114744C635C5BB45ULL,
+    0x2D3DFDAB61AD1A42ULL, 0x9E13B115620A452DULL, 0xD9B9CBFCC9EDBA19ULL, 0x6A978742CA4AE576ULL,
+    0xA14CB926613CF817ULL, 0x1262F598629BA778ULL, 0x55C88F71C97C584CULL, 0xE6E6C3CFCADB0723ULL,
+    0xDA9C7AA29EB3A624ULL, 0x69B2361C9D14F94BULL, 0x2E184CF536F3067FULL, 0x9D36004B35545910ULL,
+    0x2B769F17CF112238ULL, 0x9858D3A9CCB67D57ULL, 0xDFF2A94067518263ULL, 0x6CDCE5FE64F6DD0CULL,
+    0x50A65C93309E7C0BULL, 0xE388102D33392364ULL, 0xA4226AC498DEDC50ULL, 0x170C267A9B79833FULL,
+    0xDCD7181E300F9E5EULL, 0x6FF954A033A8C131ULL, 0x28532E49984F3E05ULL, 0x9B7D62F79BE8616AULL,
+    0xA707DB9ACF80C06DULL, 0x14299724CC279F02ULL, 0x5383EDCD67C06036ULL, 0xE0ADA17364673F59ULL,
 };
 
 u64 drr_crc64(const void *data, u64 len) {
@@ -278,14 +312,17 @@ void drr_init(void) {
     g_drr.meta_slab = pool_alloc_internal(DRR_META_SLAB_SIZE, 64);
     g_drr.meta_slab_offset = 0;
 
-    /* 初始化 A/B slot */
+    /* 初始化 A/B slot：两槽都未提交（active=0, seq=0）。
+     * 首次 checkpoint 之前不存在稳定点，recover 返回 -2 是真实语义。 */
     drr_memzero(&g_drr.ckpt_a, sizeof(drr_checkpoint_meta));
     drr_memzero(&g_drr.ckpt_b, sizeof(drr_checkpoint_meta));
     g_drr.ckpt_a.magic = DRR_CKPT_MAGIC;
     g_drr.ckpt_a.version = DRR_CKPT_VERSION;
-    g_drr.ckpt_a.active = 1;
     g_drr.ckpt_b.magic = DRR_CKPT_MAGIC;
     g_drr.ckpt_b.version = DRR_CKPT_VERSION;
+    g_drr.ckpt_seq = 0;
+    g_drr.ckpt_in_progress = 0;
+    g_drr.ckpt_target = 0;
 
     g_drr.initialized = 1;
     log_hex64("[DRR]   pool_limit=", g_drr.pool_limit);
@@ -302,9 +339,9 @@ void drr_init(void) {
         g_drr_wd[wdi].last_kick_tick = 0;
     }
     {
-        /* page0 = 头 + 条目数组，其后 128 页快照数据（共 129 页） */
+        /* page0 = 头 + 条目数组，其后 DRR_SNAP_DATA_PAGES 页快照数据 */
         dkm_dma_buffer buf;
-        if (dma_alloc_pages(1 + 128, 4096, 0xFFFFFFFFULL, &buf) == 0 && buf.virt) {
+        if (dma_alloc_pages(1 + DRR_SNAP_DATA_PAGES, 4096, 0xFFFFFFFFULL, &buf) == 0 && buf.virt) {
             g_snap_region = buf;
             u32 cap = (u32)((4096 - 64) / sizeof(drr_ckpt_page_entry));
             drr_snap_header *h = (drr_snap_header *)buf.virt;
@@ -313,10 +350,12 @@ void drr_init(void) {
             h->version = DRR_SNAP_VERSION;
             h->capacity = cap;
             h->used = 0;
+            h->generation = 0;
+            h->crc = drr_crc64(h, __builtin_offsetof(drr_snap_header, crc));
             g_snap_capacity = cap;
             g_snap_ok = 1;
             log_info("[DRR] snapshot region ok");
-            log_hex64("[DRR]   pages=", 1 + 128);
+            log_hex64("[DRR]   pages=", 1 + DRR_SNAP_DATA_PAGES);
         } else {
             /* 严格错误策略插桩：快照区是 DRR 页回滚的前提，缺失即降级
              * metadata-only——按零降级原则直接 panic（DRR-E01）。 */
@@ -463,55 +502,58 @@ void drr_log_write_commit(u32 segment_slot, u64 offset, u64 len) {
 }
 
 /* ---- Checkpoint ---- */
+static drr_checkpoint_meta *ckpt_slot(u32 slot) {
+    return slot == 0 ? &g_drr.ckpt_a : &g_drr.ckpt_b;
+}
+
+static drr_checkpoint_meta *ckpt_target(void) {
+    return ckpt_slot(g_drr.ckpt_target);
+}
+
 int drr_checkpoint_begin(drr_checkpoint_type type) {
     if (!g_drr.initialized) return -1;
 
-    /* 选择 inactive slot */
-    drr_checkpoint_meta *target;
-    if (g_drr.active_slot == 0) {
-        target = &g_drr.ckpt_b;
-    } else {
-        target = &g_drr.ckpt_a;
-    }
+    /* 目标 = 非 active 槽（提交成功后才翻转 active_slot） */
+    u32 target_slot = g_drr.active_slot ? 0u : 1u;
+    drr_checkpoint_meta *target = ckpt_slot(target_slot);
 
     target->magic = DRR_CKPT_MAGIC;
     target->version = DRR_CKPT_VERSION;
-    target->active = 0; /* 写入时为 inactive */
-    target->type = type;
+    target->active = 0; /* 写入时为 preparing */
+    target->type = (u32)type;
+    target->reserved0 = 0;
+    target->seq = 0;
     target->global_epoch = g_drr.recovery_generation;
+    target->snap_gen = 0;
+    target->snap_crc = 0;
     target->dirty_page_count = 0;
     target->mac_root = 0;
     target->segment_count = 0;
     target->crc = 0;
 
+    g_drr.ckpt_target = target_slot;
+    g_drr.ckpt_in_progress = 1;
     return 0;
 }
 
 int drr_checkpoint_finish(void) {
     if (!g_drr.initialized) return -1;
+    if (!g_drr.ckpt_in_progress) return -1;   /* 没有 begin 的 finish 不提交 */
 
-    /* 写入 inactive slot 的 CRC */
-    drr_checkpoint_meta *target;
-    if (g_drr.active_slot == 0) {
-        target = &g_drr.ckpt_b;
-    } else {
-        target = &g_drr.ckpt_a;
-    }
+    drr_checkpoint_meta *target = ckpt_target();
+    u32 target_slot = g_drr.ckpt_target;
 
-    /* 计算 CRC（不含 crc 字段本身） */
-    target->crc = drr_crc64(target,
-        sizeof(drr_checkpoint_meta) - sizeof(u64));
-
-    /* 原子切换 active slot */
+    /* 提交字顺序：active → seq → CRC（最后一条写）。
+     * 任何中断点都至少保留一个 CRC 合法的槽：旧槽保持已提交态，新槽在
+     * CRC 写入前不可通过 ckpt_slot_valid。 */
     target->active = 1;
-    /* 旧 slot 标记 inactive */
-    if (g_drr.active_slot == 0) {
-        g_drr.ckpt_a.active = 0;
-        g_drr.active_slot = 1;
-    } else {
-        g_drr.ckpt_b.active = 0;
-        g_drr.active_slot = 0;
-    }
+    target->seq = ++g_drr.ckpt_seq;
+    target->crc = drr_crc64(target, DRR_CKPT_CRC_LEN);
+
+    /* 旧槽保留 active=1 作为 fallback（提交位语义 = 已提交，不代表「当前」）；
+     * active_slot 只表示最近一次提交，恢复仍按 seq 取最新。 */
+    g_drr.active_slot = target_slot;
+    g_drr.ckpt_in_progress = 0;
 
     /* 增加 recovery generation */
     g_drr.recovery_generation++;
@@ -522,43 +564,59 @@ int drr_checkpoint_finish(void) {
     return 0;
 }
 
-/* R4: 槽位有效性 = magic + version + CRC 三重校验（CRC 字段不参与）。
- * active 槽额外要求 active 标志；fallback 槽按 CRC 说话（§8.2 "旧 slot
- * 作为 fallback"——finish 切换时旧槽 active 已清 0，不能作为否定依据）。 */
-static int ckpt_slot_valid(const drr_checkpoint_meta *s, int require_active) {
+/* 槽位有效性 = magic + version + active + seq!=0 + CRC 全通过。
+ * CRC 覆盖 [0, offsetof(crc))，即提交后的最终字节（active/seq 均已写入）。 */
+static int ckpt_slot_valid(const drr_checkpoint_meta *s) {
     if (s->magic != DRR_CKPT_MAGIC || s->version != DRR_CKPT_VERSION) return 0;
-    if (require_active && s->active != 1) return 0;
+    if (s->active != 1 || s->seq == 0) return 0;
     u64 expected_crc = s->crc;
     drr_checkpoint_meta tmp = *s;
     tmp.crc = 0;
-    return drr_crc64(&tmp, sizeof(drr_checkpoint_meta) - sizeof(u64)) == expected_crc;
+    return drr_crc64(&tmp, DRR_CKPT_CRC_LEN) == expected_crc;
 }
 
 int drr_checkpoint_recover(drr_checkpoint_meta *out_meta) {
     if (!g_drr.initialized || !out_meta) return -1;
 
-    /* 尝试 active slot */
-    drr_checkpoint_meta *active = (g_drr.active_slot == 0) ?
-        &g_drr.ckpt_a : &g_drr.ckpt_b;
-    drr_checkpoint_meta *fallback = (g_drr.active_slot == 0) ?
-        &g_drr.ckpt_b : &g_drr.ckpt_a;
-    u32 fallback_slot_id = (g_drr.active_slot == 0) ? 1u : 0u;
-
-    if (ckpt_slot_valid(active, 1)) {
-        drr_memcpy(out_meta, active, sizeof(drr_checkpoint_meta));
-        return 0;
-    }
-
-    /* active 无效（CRC 破坏/半写），尝试 fallback（旧稳定点） */
-    if (ckpt_slot_valid(fallback, 0)) {
-        log_warn("[DRR] recover fallback slot");
-        log_hex64("[DRR]   fallback_slot=", fallback_slot_id);
-        drr_memcpy(out_meta, fallback, sizeof(drr_checkpoint_meta));
-        return 0;
-    }
+    const drr_checkpoint_meta *slot_a = &g_drr.ckpt_a;
+    const drr_checkpoint_meta *slot_b = &g_drr.ckpt_b;
+    int valid_a = ckpt_slot_valid(slot_a);
+    int valid_b = ckpt_slot_valid(slot_b);
 
     /* 双槽都无效 */
-    return -2;
+    if (!valid_a && !valid_b) return -2;
+
+    /* 合法槽中取 seq 最大者；seq 相同优先 RAM active_slot */
+    const drr_checkpoint_meta *chosen;
+    u32 chosen_slot;
+    if (valid_a && valid_b) {
+        if (slot_a->seq > slot_b->seq) {
+            chosen = slot_a;
+            chosen_slot = 0;
+        } else if (slot_b->seq > slot_a->seq) {
+            chosen = slot_b;
+            chosen_slot = 1;
+        } else {
+            chosen_slot = g_drr.active_slot ? 1u : 0u;
+            chosen = ckpt_slot(chosen_slot);
+        }
+    } else if (valid_a) {
+        chosen = slot_a;
+        chosen_slot = 0;
+    } else {
+        chosen = slot_b;
+        chosen_slot = 1;
+    }
+
+    if (chosen_slot != g_drr.active_slot) {
+        log_warn("[DRR] recover fallback slot");
+        log_hex64("[DRR]   fallback_slot=", chosen_slot);
+        /* RAM 指针与真实最新稳定点对齐，后续 checkpoint 写另一槽 */
+        g_drr.active_slot = chosen_slot;
+    }
+
+    drr_memcpy(out_meta, chosen, sizeof(drr_checkpoint_meta));
+    return 0;
 }
 
 /* ---- Heartbeat ---- */
@@ -579,7 +637,7 @@ int drr_ckpt_snapshot_dirty(void) {
     if (!g_drr.initialized) return -1;
     if (!g_snap_ok) return -2;   /* metadata-only 模式不支持页快照 */
 
-    drr_checkpoint_begin(DRR_CKPT_DIRTY_PAGE);
+    if (drr_checkpoint_begin(DRR_CKPT_DIRTY_PAGE) != 0) return -1;
     drr_snap_header *h = snap_header();
     drr_ckpt_page_entry *entries = snap_entries();
     u32 used = 0;
@@ -597,20 +655,23 @@ int drr_ckpt_snapshot_dirty(void) {
                 u64 word = shard->bitmap[w];
                 while (word && used < g_snap_capacity) {
                     u64 bit = (u64)__builtin_ctzll(word);
-                    u64 page = w * 64 + bit;
-                    u8 *src = desc->cipher_base + page * UTSM_PAGE_SIZE;
-                    u8 *dst = snap_page_ptr(used);
-                    drr_memcpy(dst, src, UTSM_PAGE_SIZE);
-                    entries[used].seg_slot = slot;
-                    entries[used].page_index = (u32)page;
-                    entries[used].cipher_vaddr = (u64)src;
-                    entries[used].crc = drr_crc64(dst, UTSM_PAGE_SIZE);
-                    entries[used].key_epoch = desc->key_epoch;
-                    entries[used].mac = utsm_page_mac(g_drr.root_key, slot, page,
-                                                      desc->key_epoch, dst);
-                    entries[used].region_idx = used;
-                    entries[used].used = 1;
-                    used++;
+                    u64 local_page = w * 64 + bit;
+                    u64 page = shard->page_base + local_page;   /* 段内页号 */
+                    if (local_page < shard->page_count) {
+                        u8 *src = desc->cipher_base + page * UTSM_PAGE_SIZE;
+                        u8 *dst = snap_page_ptr(used);
+                        drr_memcpy(dst, src, UTSM_PAGE_SIZE);
+                        entries[used].seg_slot = slot;
+                        entries[used].page_index = (u32)page;
+                        entries[used].cipher_vaddr = (u64)src;
+                        entries[used].crc = drr_crc64(dst, UTSM_PAGE_SIZE);
+                        entries[used].key_epoch = desc->key_epoch;
+                        entries[used].mac = utsm_page_mac(g_drr.root_key, slot, page,
+                                                          desc->key_epoch, dst);
+                        entries[used].region_idx = used;
+                        entries[used].used = 1;
+                        used++;
+                    }
                     /* 快照成功才清脏位；区满时保留脏位（部分提交，下轮重试） */
                     shard->bitmap[w] &= ~(1ULL << bit);
                     if (shard->dirty_count > 0) shard->dirty_count--;
@@ -624,14 +685,16 @@ int drr_ckpt_snapshot_dirty(void) {
         if (used >= g_snap_capacity) break;
     }
 
-    /* 区域头（crc 不含自身字段） */
+    /* 区域头（crc 不含自身字段），先定稿数据区再提交元数据 */
     h->used = used;
     h->generation = (u32)g_drr.recovery_generation;
-    h->crc = drr_crc64(h, sizeof(drr_snap_header) - sizeof(u64));
+    h->crc = drr_crc64(h, __builtin_offsetof(drr_snap_header, crc));
 
-    /* 元数据 + A/B 原子切换（begin 已选好 inactive slot，同一表达式取回） */
-    drr_checkpoint_meta *target = (g_drr.active_slot == 0) ? &g_drr.ckpt_b : &g_drr.ckpt_a;
+    /* 元数据 + A/B 原子切换（只认 begin 选中的槽，不再二次推导） */
+    drr_checkpoint_meta *target = ckpt_target();
     target->dirty_page_count = used;
+    target->snap_gen = (u64)h->generation;
+    target->snap_crc = h->crc;
     /* Phase 9: mac_root = keyed BLAKE2b 链（root_key 派生，绑定全部页 MAC） */
     {
         u8 kb[32];
@@ -652,27 +715,52 @@ int drr_ckpt_snapshot_dirty(void) {
         target->mac_root = utsm_load64_le(chain);
     }
     target->segment_count = 0;
-    drr_checkpoint_finish();
+    if (drr_checkpoint_finish() != 0) {
+        log_error("[DRR] checkpoint finish failed");
+        return -2;
+    }
 
     log_info("[DRR] ckpt snapshot ok");
     log_hex64("[DRR]   pages=", used);
     return (int)used;
 }
 
+/* 槽元数据与快照区一致性：区域头自校验 + generation/crc 双绑定。
+ * 单快照区下，槽与数据区必须同代际才允许回滚（跨代际旧数据稳定点需要
+ * 双 bank，属后续项）；不一致时调用方按各自策略拒绝。 */
+static int snap_region_matches(const drr_checkpoint_meta *m) {
+    if (!m || !g_snap_ok) return 0;
+    drr_snap_header *h = snap_header();
+    if (h->magic != DRR_SNAP_MAGIC || h->version != DRR_SNAP_VERSION) return 0;
+    if (h->used > h->capacity || h->capacity > g_snap_capacity) return 0;
+    if (drr_crc64(h, __builtin_offsetof(drr_snap_header, crc)) != h->crc) return 0;
+    return m->snap_gen == (u64)h->generation && m->snap_crc == h->crc;
+}
+
+/* 条目校验失败：段隔离（POISONED）+ 日志，不写内存 */
+static void rollback_fail_entry(const drr_ckpt_page_entry *e,
+                                utsm_segment_desc *d, const char *what) {
+    if (d) d->state = UTSM_SEG_POISONED;
+    log_error(what);
+    log_hex64("[DRR]   seg_slot=", e->seg_slot);
+    log_hex64("[DRR]   page=", e->page_index);
+}
+
 /* R4: 共享恢复核心。seg_slot_filter == DRR_ROLLBACK_ALL_SEGMENTS 表示
  * 全部段（system 级），否则只恢复该段的快照页。
- * 前置：caller 已完成 initialized/snap_ok/meta 校验。
- * 返回恢复页数；*out_failed 置 1 表示任一页 CRC/MAC 校验失败（该段已
- * POISONED，与页级路径策略一致：数据损坏不 panic，段隔离）。 */
+ * 前置：caller 已完成 initialized/snap_ok/meta/代际校验。
+ * 返回恢复页数；*out_failed 置 1 表示任一页校验失败（该段已 POISONED，
+ * 与页级路径策略一致：数据损坏不 panic，段隔离）。 */
 #define DRR_ROLLBACK_ALL_SEGMENTS 0xFFFFFFFFu
 static int rollback_entries(u32 seg_slot_filter, int *out_failed) {
     drr_snap_header *h = snap_header();
-    if (h->magic != DRR_SNAP_MAGIC || h->version != DRR_SNAP_VERSION) {
+    if (h->magic != DRR_SNAP_MAGIC || h->version != DRR_SNAP_VERSION ||
+        h->used > h->capacity || h->capacity > g_snap_capacity ||
+        drr_crc64(h, __builtin_offsetof(drr_snap_header, crc)) != h->crc) {
         *out_failed = 1;
         return 0;
     }
     u32 used = h->used;
-    if (used > h->capacity) used = h->capacity;
 
     drr_ckpt_page_entry *entries = snap_entries();
 
@@ -690,14 +778,36 @@ static int rollback_entries(u32 seg_slot_filter, int *out_failed) {
         drr_ckpt_page_entry *e = &entries[i];
         if (seg_slot_filter != DRR_ROLLBACK_ALL_SEGMENTS &&
             e->seg_slot != seg_slot_filter) continue;
-        u8 *snap = snap_page_ptr(e->region_idx);
         utsm_segment_desc *d = utsm_get_segment(e->seg_slot);
+
+        /* 条目结构校验：used 标记 + 区域页号上界 + 段内页号 + 目标地址重算 */
+        if (e->used != 1 || e->region_idx >= DRR_SNAP_DATA_PAGES) {
+            *out_failed = 1;
+            rollback_fail_entry(e, d, "[DRR] rollback entry invalid");
+            continue;
+        }
+        u8 *snap = snap_page_ptr(e->region_idx);
+        if (!d) {
+            *out_failed = 1;
+            rollback_fail_entry(e, d, "[DRR] rollback segment missing");
+            continue;
+        }
+        u64 seg_pages = d->cipher_length / UTSM_PAGE_SIZE;
+        if ((u64)e->page_index >= seg_pages) {
+            *out_failed = 1;
+            rollback_fail_entry(e, d, "[DRR] rollback page out of segment");
+            continue;
+        }
+        u8 *dst = d->cipher_base + (u64)e->page_index * UTSM_PAGE_SIZE;
+        if ((u64)dst != e->cipher_vaddr) {
+            *out_failed = 1;
+            rollback_fail_entry(e, d, "[DRR] rollback target vaddr mismatch");
+            continue;
+        }
+
         if (drr_crc64(snap, UTSM_PAGE_SIZE) != e->crc) {
             *out_failed = 1;
-            if (d) d->state = UTSM_SEG_POISONED;
-            log_error("[DRR] rollback crc fail");
-            log_hex64("[DRR]   seg_slot=", e->seg_slot);
-            log_hex64("[DRR]   page=", e->page_index);
+            rollback_fail_entry(e, d, "[DRR] rollback crc fail");
             continue;
         }
         /* Phase 9: 页 MAC 校验（伪造/跨纪元重放/区域篡改在此被拒） */
@@ -705,24 +815,28 @@ static int rollback_entries(u32 seg_slot_filter, int *out_failed) {
                                 e->key_epoch, snap);
         if (mac != e->mac) {
             *out_failed = 1;
-            if (d) d->state = UTSM_SEG_POISONED;
-            log_error("[DRR] rollback mac fail");
-            log_hex64("[DRR]   seg_slot=", e->seg_slot);
-            log_hex64("[DRR]   page=", e->page_index);
+            rollback_fail_entry(e, d, "[DRR] rollback mac fail");
             continue;
         }
-        drr_memcpy((void *)e->cipher_vaddr, snap, UTSM_PAGE_SIZE);
+        drr_memcpy(dst, snap, UTSM_PAGE_SIZE);
         restored++;
-        /* 清除该页脏位（P2 之类的回写不再被误判为未 checkpoint） */
-        if (d && d->dirty_shard_count > 0 && d->dirty_shards && d->dirty_shards[0].bitmap) {
-            utsm_dirty_shard *sh = &d->dirty_shards[0];
+        /* 清除该页脏位（P2 之类的回写不再被误判为未 checkpoint）：
+         * 按 page_base 在全部 shard 中定位，而不是只认 shards[0]。 */
+        if (d->dirty_shards && d->dirty_shard_count > 0) {
             u64 page = e->page_index;
-            if (page < sh->page_count && (sh->bitmap[page / 64] & (1ULL << (page % 64)))) {
-                sh->bitmap[page / 64] &= ~(1ULL << (page % 64));
-                if (sh->dirty_count > 0) sh->dirty_count--;
+            for (u32 si = 0; si < d->dirty_shard_count; si++) {
+                utsm_dirty_shard *sh = &d->dirty_shards[si];
+                if (!sh->bitmap) continue;
+                if (page < sh->page_base || page >= sh->page_base + sh->page_count) continue;
+                u64 local = page - sh->page_base;
+                if (sh->bitmap[local / 64] & (1ULL << (local % 64))) {
+                    sh->bitmap[local / 64] &= ~(1ULL << (local % 64));
+                    if (sh->dirty_count > 0) sh->dirty_count--;
+                }
+                break;
             }
         }
-        if (d && d->state == UTSM_SEG_RECOVERING) d->state = UTSM_SEG_ACTIVE;
+        if (d->state == UTSM_SEG_RECOVERING) d->state = UTSM_SEG_ACTIVE;
     }
     return (int)restored;
 }
@@ -733,6 +847,12 @@ int drr_rollback_pages(void) {
     drr_checkpoint_meta meta;
     if (drr_checkpoint_recover(&meta) != 0) return -3;
     if (meta.type != DRR_CKPT_DIRTY_PAGE) return -4;
+    if (!snap_region_matches(&meta)) {
+        log_error("[DRR] snapshot generation mismatch");
+        log_hex64("[DRR]   meta_snap_gen=", meta.snap_gen);
+        log_hex64("[DRR]   region_gen=", (u64)snap_header()->generation);
+        return -2;
+    }
 
     int failed = 0;
     int restored = rollback_entries(DRR_ROLLBACK_ALL_SEGMENTS, &failed);
@@ -757,6 +877,15 @@ int drr_rollback_segment(u32 seg_slot) {
     if (meta.type != DRR_CKPT_DIRTY_PAGE) {
         panic_full("DRR-E04 SEGMENT ROLLBACK UNAVAILABLE",
                    "no dirty-page checkpoint: no ciphertext snapshot to restore", 0);
+    }
+    if (!snap_region_matches(&meta)) {
+        utsm_segment_desc *d = utsm_get_segment(seg_slot);
+        if (d) d->state = UTSM_SEG_POISONED;
+        log_error("[DRR] snapshot generation mismatch");
+        log_hex64("[DRR]   meta_snap_gen=", meta.snap_gen);
+        log_hex64("[DRR]   region_gen=", (u64)snap_header()->generation);
+        log_hex64("[DRR]   seg_slot=", seg_slot);
+        return -2;
     }
 
     /* 快照区无该段条目：无法恢复 → 段 POISONED，调用方决定升级 */
@@ -805,6 +934,18 @@ int drr_rollback_system(void) {
         log_error("[DRR-E05 SYSTEM ROLLBACK ESCALATED]");
         drr_system_rollback("system rollback: no dirty-page checkpoint");
     }
+    if (!snap_region_matches(&meta)) {
+        log_error("[DRR] snapshot generation mismatch");
+        log_hex64("[DRR]   meta_snap_gen=", meta.snap_gen);
+        log_hex64("[DRR]   region_gen=", (u64)snap_header()->generation);
+        if (!g_reboot_enabled) {
+            /* selftest/dry-run：拒绝不一致恢复，不写任何页 */
+            return -5;
+        }
+        log_error("[DRR-E05 SYSTEM ROLLBACK ESCALATED]");
+        drr_system_rollback("system rollback: snapshot generation mismatch");
+        return -5;
+    }
 
     int failed = 0;
     int restored = rollback_entries(DRR_ROLLBACK_ALL_SEGMENTS, &failed);
@@ -826,6 +967,23 @@ void drr_test_corrupt_slot(u32 slot) {
     }
 }
 
+u64 drr_test_slot_seq(u32 slot) {
+    if (slot > 1) return 0;
+    return ckpt_slot(slot)->seq;
+}
+
+u64 drr_test_region_gen(void) {
+    if (!g_snap_ok) return 0;
+    return (u64)snap_header()->generation;
+}
+
+void drr_test_bump_region_gen(void) {
+    if (!g_snap_ok) return;
+    drr_snap_header *h = snap_header();
+    h->generation++;
+    h->crc = drr_crc64(h, __builtin_offsetof(drr_snap_header, crc));
+}
+
 u32 drr_test_active_slot(void) {
     return g_drr.active_slot;
 }
@@ -836,6 +994,7 @@ void drr_system_rollback(const char *reason) {
     log_hex64("[DRR]   generation=", g_drr.recovery_generation);
     log_hex64("[DRR]   heartbeat=", g_drr.heartbeat_counter);
     log_error("[DRR] rebooting (8042 reset)");
+    smp_halt_others();      /* R5：复位前停住其它 CPU */
     for (;;) {
         __asm__ volatile("cli");
         outb(0x64, 0xFE);   /* 8042 复位（A20 gate 已无关紧要） */

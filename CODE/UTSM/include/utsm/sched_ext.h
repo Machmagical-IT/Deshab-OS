@@ -47,6 +47,9 @@ void utsm_sched_quiesce(void);
  * FUCK [sched] demo_ms=0 时为空操作。 */
 void utsm_sched_demo_window(void);
 
+/* 调度入口（R5 AP resched IPI 也用）：当前任务重新入队并选下一个。 */
+void utsm_sched_schedule(void);
+
 /* 协作让出（当前任务重新入队并切换） */
 void utsm_sched_yield(void);
 
@@ -80,5 +83,31 @@ void utsm_task_main(u64 slot);
 int utsm_sched_selftest_runqueue(void);
 int utsm_sched_selftest_blockwake(void);
 int utsm_sched_debug_ready_count(u32 cpu_id);
+
+/* ---- R5：per-CPU 多核支持 ---- */
+
+/* BSP 为 AP 预建 idle 任务（返回 slot；入队 READY） */
+int  utsm_sched_create_idle_for_cpu(u32 cpu);
+
+/* AP 入口：绑定 idle 任务到自身 rsp 并置 RUNNING */
+void utsm_sched_ap_bind_idle(u32 cpu, u64 rsp);
+
+/* 在本 CPU（IPI 上下文）把当前任务退回队列并切到 idle（park 用） */
+void utsm_sched_park_cpu(void);
+
+/* idle CPU 从其它 CPU 偷一个可迁移 READY 任务；返回 1 = 成功 */
+int  utsm_sched_balance(u32 dst_cpu);
+
+/* 配置：驱动任务是否可迁移（FUCK [sched] migrate_drv_tasks） */
+void utsm_sched_set_migrate_drv(int on);
+
+/* selftest 钩子：允许指定任务迁移（清 NO_MIGRATE） */
+void utsm_sched_test_allow_migrate(u32 slot);
+
+/* 每 CPU tick 计数（观察用） */
+u32  utsm_sched_debug_cpu_ticks(u32 cpu);
+
+/* R5 硬验收：两任务各 1000 帧在双 CPU 并发执行、无双重执行 */
+int  utsm_sched_selftest_smp(void);
 
 #endif /* UTSM_SCHED_EXT_H */

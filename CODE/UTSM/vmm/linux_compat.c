@@ -23,6 +23,8 @@
 #include <utsm/virtio_mmio.h>   /* VSCode Phase 2: virtio_input_push_* */
 #include <utsm/log.h>
 #include <utsm/types.h>
+#include <utsm/guest_runner.h>
+#include <utsm/guest_progress.h>
 #include <utsm/block.h>
 #include <ipc_proto.h>
 #include "../../tools/fat32_io.h"
@@ -68,6 +70,12 @@ void linux_compat_init(void) {
 /* ===== 服务方法 ===== */
 
 static int lxc_is_available(void) {
+    if (!guest_runner_on_owner_cpu()) {
+        /* BSP：不投邮箱（避免桌面启动时被 AP 装载阻塞），直接看进度槽。 */
+        const utsm_guest_progress_table *t = guest_progress_get();
+        if (!t || t->magic != GUEST_PROGRESS_MAGIC) return 0;
+        return t->slot[GUEST_SLOT_LINUX].phase == GUEST_PHASE_READY;
+    }
     return (g_compat_ready && linux_is_parked() && ipc_shm_is_ready()) ? 1 : 0;
 }
 
@@ -170,6 +178,16 @@ static int lxc_exec_internal(const char *path, int argc,
                              u32 timeout_sec,
                              char *stdout_buf, u64 stdout_cap, u64 *stdout_len,
                              u64 *exit_code) {
+    if (!guest_runner_on_owner_cpu()) {
+        if (!lxc_is_available()) return -1;
+        u64 a[8] = {
+            (u64)path, (u64)(u32)argc, (u64)argv, (u64)stdout_buf,
+            stdout_cap, (u64)stdout_len, (u64)exit_code, (u64)flags
+        };
+        return (int)guest_runner_call(
+            (flags & UTSM_EXEC_FLAG_ASYNC) ? GUEST_OP_EXEC_ASYNC : GUEST_OP_EXEC,
+            a, 8);
+    }
     if (!lxc_is_available()) {
         return -1;
     }
@@ -255,6 +273,19 @@ static int lxc_exec_async(const char *path, int argc,
 }
 
 static int lxc_status(char *buf, u64 cap) {
+    if (!guest_runner_on_owner_cpu()) {
+        if (!lxc_is_available()) {
+            if (!buf || cap == 0) return 0;
+            const char *s = "linux_compat: guest loading";
+            u64 n = my_strlen(s);
+            if (n >= cap) n = cap - 1;
+            my_memcpy(buf, s, n);
+            buf[n] = 0;
+            return (int)n;
+        }
+        u64 a[2] = { (u64)buf, cap };
+        return (int)guest_runner_call(GUEST_OP_STATUS, a, 2);
+    }
     if (!buf || cap == 0) return 0;
     const char *s;
     if (!g_compat_ready) {
@@ -348,6 +379,11 @@ static u64 lxc_pool_copyout(char *buf, u64 cap, u32 data_len) {
 }
 
 static int lxc_file_list(const char *path, char *buf, u64 cap, u64 *out_len) {
+    if (!guest_runner_on_owner_cpu()) {
+        if (!lxc_is_available()) { if (out_len) *out_len = 0; return -1; }
+        u64 a[4] = { (u64)path, (u64)buf, cap, (u64)out_len };
+        return (int)guest_runner_call(GUEST_OP_FILE_LIST, a, 4);
+    }
     struct ipc_file_response resp;
     /* 请求的容量取调用方缓冲与 pool 容量的较小值 */
     u32 want = (cap > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (u32)cap;
@@ -370,6 +406,16 @@ static int lxc_file_list(const char *path, char *buf, u64 cap, u64 *out_len) {
 
 static int lxc_file_read(const char *path, u64 offset, char *buf, u64 cap,
                          u64 *out_len, u64 *out_total) {
+    if (!guest_runner_on_owner_cpu()) {
+        if (!lxc_is_available()) {
+            if (out_len) *out_len = 0;
+            if (out_total) *out_total = 0;
+            return -1;
+        }
+        u64 a[6] = { (u64)path, offset, (u64)buf, cap,
+                     (u64)out_len, (u64)out_total };
+        return (int)guest_runner_call(GUEST_OP_FILE_READ, a, 6);
+    }
     struct ipc_file_response resp;
     u32 want = (cap > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (u32)cap;
     int rc = lxc_file_roundtrip(UTSM_MSG_FILE_READ_REQUEST, path, offset, want, &resp);
@@ -394,6 +440,11 @@ static int lxc_file_read(const char *path, u64 offset, char *buf, u64 cap,
  * 单次最多搬运 payload pool 容量（~1MB），大文件由调用方循环推进 offset。 */
 static int lxc_file_write(const char *path, u64 offset, const char *buf,
                           u64 len, u64 *out_written) {
+    if (!guest_runner_on_owner_cpu()) {
+        if (!lxc_is_available()) { if (out_written) *out_written = 0; return -1; }
+        u64 a[5] = { (u64)path, offset, (u64)buf, len, (u64)out_written };
+        return (int)guest_runner_call(GUEST_OP_FILE_WRITE, a, 5);
+    }
     if (!lxc_is_available()) return -1;
     if (!path || (!buf && len > 0)) return -1;
 
@@ -475,6 +526,11 @@ static u8 g_pull_stage[262144];
  * 再一次 f32_write_root_file 落盘。 */
 static int lxc_file_pull(const char *linux_path, const char *fat32_name,
                          u64 *out_size) {
+    if (!guest_runner_on_owner_cpu()) {
+        if (!lxc_is_available()) { if (out_size) *out_size = 0; return -1; }
+        u64 a[3] = { (u64)linux_path, (u64)fat32_name, (u64)out_size };
+        return (int)guest_runner_call(GUEST_OP_FILE_PULL, a, 3);
+    }
     if (!lxc_is_available()) return -1;
     if (!linux_path || !fat32_name) return -1;
     int rc = lxc_f32_ensure();
@@ -507,6 +563,11 @@ static int lxc_file_pull(const char *linux_path, const char *fat32_name,
  * 首块 offset=0 → daemon 侧 O_TRUNC，实现整文件替换语义。 */
 static int lxc_file_push(const char *fat32_name, const char *linux_path,
                          u64 *out_size) {
+    if (!guest_runner_on_owner_cpu()) {
+        if (!lxc_is_available()) { if (out_size) *out_size = 0; return -1; }
+        u64 a[3] = { (u64)fat32_name, (u64)linux_path, (u64)out_size };
+        return (int)guest_runner_call(GUEST_OP_FILE_PUSH, a, 3);
+    }
     if (!lxc_is_available()) return -1;
     if (!fat32_name || !linux_path) return -1;
 
@@ -603,6 +664,11 @@ static int lxc_gpu_get_scanout_info(struct linux_compat_scanout_info *out) {
 }
 
 static int lxc_run_slice(void) {
+    if (!guest_runner_on_owner_cpu()) {
+        /* 非阻塞：AP 忙（Windows 启动）时桌面不被拖住。 */
+        u64 a[1] = { 0 };
+        return (int)guest_runner_call_ex(GUEST_OP_RUN_SLICE, a, 1, 0);
+    }
     if (!lxc_is_available()) return -1;
     return linux_resume();
 }
@@ -628,6 +694,45 @@ static const linux_compat_service g_lxc_service = {
 
 const linux_compat_service *linux_compat_get_service(void) {
     return &g_lxc_service;
+}
+
+/* ===== AP 侧邮箱分发（guest_runner.c 调用） ===== */
+i64 linux_compat_ap_dispatch(u32 op, const u64 *args, u32 nargs) {
+    (void)nargs;
+    switch (op) {
+    case GUEST_OP_IS_AVAILABLE:
+        return lxc_is_available();
+    case GUEST_OP_EXEC:
+    case GUEST_OP_EXEC_ASYNC:
+        return lxc_exec_internal((const char *)args[0], (int)args[1],
+                                 (const char *const *)args[2],
+                                 (u32)args[7], 0,
+                                 (char *)args[3], args[4],
+                                 (u64 *)args[5], (u64 *)args[6]);
+    case GUEST_OP_FILE_LIST:
+        return lxc_file_list((const char *)args[0], (char *)args[1], args[2],
+                             (u64 *)args[3]);
+    case GUEST_OP_FILE_READ:
+        return lxc_file_read((const char *)args[0], args[1], (char *)args[2],
+                             args[3], (u64 *)args[4], (u64 *)args[5]);
+    case GUEST_OP_FILE_WRITE:
+        return lxc_file_write((const char *)args[0], args[1],
+                              (const char *)args[2], args[3], (u64 *)args[4]);
+    case GUEST_OP_FILE_PULL:
+        return lxc_file_pull((const char *)args[0], (const char *)args[1],
+                             (u64 *)args[2]);
+    case GUEST_OP_FILE_PUSH:
+        return lxc_file_push((const char *)args[0], (const char *)args[1],
+                             (u64 *)args[2]);
+    case GUEST_OP_STATUS:
+        return lxc_status((char *)args[0], args[1]);
+    case GUEST_OP_RUN_SLICE:
+        return lxc_run_slice();
+    default:
+        panic_full("GUEST-E03 UNKNOWN MAILBOX OP",
+                   "linux_compat_ap_dispatch received an unknown mailbox op", 0);
+        return -1;
+    }
 }
 
 /* ===== Phase 2: SYSTEM/lib .so 全量推送到 Linux guest =====

@@ -70,7 +70,7 @@ DKM-BUS     按名服务总线（kern.* / srv.* 双向注册-消费）——万�
 
 ## 构建
 
-> Windows 走 `build.bat`；Linux/macOS 用根目录 [Makefile](Makefile)（`make dev|release|realtest`，打包需 mkfs.vfat/mkfs.ext4）。
+> Windows 走 `build.bat`；Linux/macOS 用根目录 [Makefile](Makefile)（`make dev|release|realtest|ne`，打包需 mkfs.vfat/mkfs.ext4）。
 
 ```powershell
 # Windows：LLVM Clang + ld.lld + Python/Pillow + QEMU + WSL(mkfs)

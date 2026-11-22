@@ -174,7 +174,7 @@ static void vmcs_setup_host_state(void) {
     vmx_vmcs_write(VMCS_HOST_GS_SELECTOR, 0);
 
     vmx_vmcs_write(VMCS_HOST_FS_BASE, 0);
-    vmx_vmcs_write(VMCS_HOST_GS_BASE, 0);
+    vmx_vmcs_write(VMCS_HOST_GS_BASE, vmx_read_msr(0xC0000101));
 
     /* Host GDT/IDT base + TR（VM-Exit 后 CPU 加载 host TR，必须有效） */
     {

@@ -102,11 +102,19 @@ static void bash_execute(bash_state *s, const char *cmd) {
         bash_puts(s, "uid=0(root) gid=0(root)\n", KS_TEXT_PRIMARY);
     } else if (cmd[0]=='r'&&cmd[1]=='e'&&cmd[2]=='b') {
         bash_puts(s, "Rebooting...\n", KS_ACCENT2);
+#ifdef DESHAB_HOST
+        host_demo_quit();
+#else
         outb(0x64, 0xFE);
         for(;;) __asm__("hlt");
+#endif
     } else if (cmd[0]=='h'&&cmd[1]=='a'&&cmd[2]=='l'&&cmd[3]=='t') {
         bash_puts(s, "Halted.\n", KS_ACCENT2);
+#ifdef DESHAB_HOST
+        host_demo_quit();
+#else
         for(;;) __asm__("hlt");
+#endif
     } else {
         bash_puts(s, "unknown: ", KS_DANGER);
         bash_puts(s, cmd, KS_DANGER);

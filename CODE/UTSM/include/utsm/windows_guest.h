@@ -30,6 +30,7 @@ int windows_guest_launch(void);
 
 int windows_platform_init(struct vm_machine *machine);
 u32 windows_platform_disk_reads(void);
+u32 windows_platform_disk_writes(void);
 int windows_platform_string_io(u16 port, int is_in, u32 size, u64 count,
                                 u64 linear, int down);
 int windows_platform_io(u16 port, int is_in, u32 size, u64 value,

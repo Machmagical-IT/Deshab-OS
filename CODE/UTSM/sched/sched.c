@@ -25,6 +25,9 @@
 #include <utsm/drr.h>
 #include <utsm/lapic_timer.h>
 #include <utsm/dkm.h>
+#include <utsm/percpu.h>
+#include <utsm/spinlock.h>
+#include <utsm/smp.h>
 
 void utsm_sched_switch(utsm_sched_tcb *prev, utsm_sched_tcb *next); /* switch.S */
 void utsm_task_trampoline(void);                                    /* switch.S */
@@ -46,15 +49,44 @@ static utsm_sched_run_queue *g_rq_ptrs[UTSM_SCHED_MAX_CPUS];
 static struct task_aux      g_task_aux[UTSM_SCHED_MAX_TASKS];
 
 static volatile int g_sched_enabled = 0;
-static volatile int g_switch_lock   = 0;
 static u64 g_uptime_ns      = 0;
 static u64 g_tick_ns        = 10ULL * 1000ULL * 1000ULL;   /* 100Hz */
 static u64 g_timeslice_ns   = 10ULL * 1000ULL * 1000ULL;   /* 10ms */
 static u32 g_cfg_tick_hz    = 100;
 static u32 g_demo_ms        = 1000;
 static int g_demo_fault     = 0;
-static int g_wake_pending   = 0;
 static u32 g_bootstrap_slot = UTSM_SCHED_INVALID_SLOT;
+
+/* R5：全局调度锁（TCB 表 + 全部 runqueue 都在它保护下）。
+ * 锁纪律：持锁不切换/不睡眠/不打印；switch 前必须释放。 */
+static utsm_spinlock g_sched_lock;
+
+/* R5：驱动任务是否允许跨 CPU 迁移（FUCK [sched] migrate_drv_tasks，默认 0）。
+ * 默认钉在创建时的 CPU 上，避免未按 SMP 审计的驱动被并发执行。 */
+static int g_migrate_drv_tasks = 0;
+
+static inline utsm_sched_run_queue *rq_of(u32 cpu) {
+    if (cpu >= UTSM_MAX_CPUS) return 0;
+    utsm_percpu *pc = &g_percpu[cpu];
+    if (pc->rq) return (utsm_sched_run_queue *)pc->rq;
+    return (cpu == 0) ? &g_runqueues[0] : 0;
+}
+
+static inline utsm_sched_run_queue *this_rq(void) {
+    return rq_of(utsm_cpu_index());
+}
+
+static inline u32 this_cpu_i(void) {
+    return utsm_cpu_index();
+}
+
+void utsm_sched_set_migrate_drv(int on) { g_migrate_drv_tasks = on ? 1 : 0; }
+
+/* 释放调度锁但保持 IF=0：用于 switch 前（IF 由调用方 switch 后恢复）。
+ * 不依赖 spinlock.h 的入口集合，避免与并行维护的头文件产生耦合。 */
+static inline void sched_unlock_keep_cli(void) {
+    __atomic_store_n(&g_sched_lock.v, 0u, __ATOMIC_RELEASE);
+}
 
 /* ---- switch.S 依赖的 TCB/arch 布局断言 ---- */
 #define OFFS(t, m) ((u32)__builtin_offsetof(t, m))
@@ -89,7 +121,13 @@ int utsm_sched_init(void) {
         g_task_aux[i].stack_base = 0;
         g_task_aux[i].run_start_ns = 0;
     }
-    for (u32 c = 0; c < UTSM_SCHED_MAX_CPUS; c++) g_rq_ptrs[c] = &g_runqueues[c];
+    for (u32 c = 0; c < UTSM_SCHED_MAX_CPUS; c++) {
+        g_rq_ptrs[c] = &g_runqueues[c];
+        g_percpu[c].rq = 0;
+        g_percpu[c].current_slot = UTSM_SCHED_INVALID_SLOT;
+        g_percpu[c].idle_slot = UTSM_SCHED_INVALID_SLOT;
+        g_percpu[c].need_resched = 0;
+    }
     g_sched_enabled = 0;
     g_uptime_ns = 0;
     g_bootstrap_slot = UTSM_SCHED_INVALID_SLOT;
@@ -112,6 +150,8 @@ int utsm_sched_cpu_init(u32 cpu_id, utsm_sched_run_queue *queue) {
     rq->idle_task_slot = UTSM_SCHED_INVALID_SLOT;
     rq->ready_count = 0;
     g_rq_ptrs[cpu_id] = rq;
+    g_percpu[cpu_id].rq = rq;
+    g_percpu[cpu_id].current_slot = UTSM_SCHED_INVALID_SLOT;
     return UTSM_SCHED_OK;
 }
 
@@ -181,33 +221,37 @@ static void rq_unlink(utsm_sched_run_queue *rq, utsm_sched_tcb *t) {
     if (rq->ready_count > 0) rq->ready_count--;
 }
 
-int utsm_sched_enqueue(u32 cpu_id, utsm_sched_tcb *task) {
+static int enqueue_locked(u32 cpu_id, utsm_sched_tcb *task) {
     if (!task || cpu_id >= UTSM_SCHED_MAX_CPUS) return UTSM_SCHED_ERR_INVALID;
+    utsm_sched_run_queue *rq = rq_of(cpu_id);
+    if (!rq) return UTSM_SCHED_ERR_INVALID;
     if (task->state == UTSM_SCHED_TASK_READY ||
         task->state == UTSM_SCHED_TASK_RUNNING) {
         return UTSM_SCHED_ERR_STATE;
     }
     task->assigned_cpu = cpu_id;
     task->state = UTSM_SCHED_TASK_READY;
-    rq_link(g_rq_ptrs[cpu_id], task);
+    rq_link(rq, task);
     return UTSM_SCHED_OK;
 }
 
-int utsm_sched_dequeue(utsm_sched_tcb *task) {
+static int dequeue_locked(utsm_sched_tcb *task) {
     if (!task) return UTSM_SCHED_ERR_INVALID;
     if (task->state != UTSM_SCHED_TASK_READY) return UTSM_SCHED_OK;  /* 幂等 */
-    rq_unlink(g_rq_ptrs[task->assigned_cpu], task);
+    utsm_sched_run_queue *rq = rq_of(task->assigned_cpu);
+    if (rq) rq_unlink(rq, task);
     return UTSM_SCHED_OK;
 }
 
-int utsm_sched_block(utsm_sched_tcb *task, u32 blocked_state) {
+static int block_locked(utsm_sched_tcb *task, u32 blocked_state) {
     if (!task) return UTSM_SCHED_ERR_INVALID;
     if (blocked_state != UTSM_SCHED_TASK_BLOCKED &&
         blocked_state != UTSM_SCHED_TASK_SLEEPING) {
         return UTSM_SCHED_ERR_INVALID;
     }
     if (task->state == UTSM_SCHED_TASK_READY) {
-        rq_unlink(g_rq_ptrs[task->assigned_cpu], task);
+        utsm_sched_run_queue *rq = rq_of(task->assigned_cpu);
+        if (rq) rq_unlink(rq, task);
     } else if (task->state != UTSM_SCHED_TASK_RUNNING) {
         return UTSM_SCHED_ERR_STATE;
     }
@@ -215,20 +259,20 @@ int utsm_sched_block(utsm_sched_tcb *task, u32 blocked_state) {
     return UTSM_SCHED_OK;
 }
 
-int utsm_sched_wake(utsm_sched_tcb *task) {
+static int wake_locked(utsm_sched_tcb *task) {
     if (!task) return UTSM_SCHED_ERR_INVALID;
     if (task->state != UTSM_SCHED_TASK_BLOCKED &&
         task->state != UTSM_SCHED_TASK_SLEEPING) {
         return UTSM_SCHED_ERR_STATE;
     }
-    return utsm_sched_enqueue(task->assigned_cpu, task);
+    return enqueue_locked(task->assigned_cpu, task);
 }
 
 /* pick 即出队；纯队列操作，不改 current_task_slot（selftest 依赖此语义） */
-int utsm_sched_pick_next(u32 cpu_id, utsm_sched_tcb **out_task) {
+static int pick_next_locked(u32 cpu_id, utsm_sched_tcb **out_task) {
     if (!out_task || cpu_id >= UTSM_SCHED_MAX_CPUS) return UTSM_SCHED_ERR_INVALID;
-    utsm_sched_run_queue *rq = g_rq_ptrs[cpu_id];
-    if (rq->ready_bitmap == 0) {
+    utsm_sched_run_queue *rq = rq_of(cpu_id);
+    if (!rq || rq->ready_bitmap == 0) {
         *out_task = 0;
         return UTSM_SCHED_ERR_NO_TASK;
     }
@@ -247,23 +291,83 @@ int utsm_sched_pick_next(u32 cpu_id, utsm_sched_tcb **out_task) {
     return UTSM_SCHED_OK;
 }
 
+int utsm_sched_enqueue(u32 cpu_id, utsm_sched_tcb *task) {
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    int rc = enqueue_locked(cpu_id, task);
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    if (rc == UTSM_SCHED_OK && cpu_id != this_cpu_i()) smp_request_resched(cpu_id);
+    return rc;
+}
+
+int utsm_sched_dequeue(utsm_sched_tcb *task) {
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    int rc = dequeue_locked(task);
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    return rc;
+}
+
+int utsm_sched_block(utsm_sched_tcb *task, u32 blocked_state) {
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    int rc = block_locked(task, blocked_state);
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    return rc;
+}
+
+int utsm_sched_wake(utsm_sched_tcb *task) {
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    int rc = wake_locked(task);
+    u32 cpu = task ? task->assigned_cpu : 0;
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    if (rc == UTSM_SCHED_OK && cpu != this_cpu_i()) smp_request_resched(cpu);
+    return rc;
+}
+
+int utsm_sched_pick_next(u32 cpu_id, utsm_sched_tcb **out_task) {
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    int rc = pick_next_locked(cpu_id, out_task);
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    return rc;
+}
+
 int utsm_sched_tick(u32 cpu_id, u64 elapsed_ns, utsm_sched_tcb **out_preempted_task) {
     if (out_preempted_task) *out_preempted_task = 0;
-    g_wake_pending = 0;
-    g_uptime_ns += elapsed_ns;
 
-    /* 唤醒到期 sleeper（非热路径：任务数 <= 64 线性扫描） */
-    for (u32 i = 0; i < UTSM_SCHED_MAX_TASKS; i++) {
-        utsm_sched_tcb *t = &g_task_table[i];
-        if (t->state == UTSM_SCHED_TASK_SLEEPING &&
-            t->wake_deadline_ns != 0 && t->wake_deadline_ns <= g_uptime_ns) {
-            t->wake_deadline_ns = 0;
-            utsm_sched_wake(t);
-            g_wake_pending = 1;
+    /* 时间与 sleeper 只由 CPU0 推进/扫描（全局时钟唯一来源，避免多核翻倍）。
+     * 其它 CPU 的唤醒需求通过 smp_request_resched 的 IPI 体现。 */
+    if (cpu_id == 0) {
+        g_uptime_ns += elapsed_ns;
+        u64 flags;
+        utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+        /* 唤醒到期 sleeper（非热路径：任务数 <= 64 线性扫描） */
+        for (u32 i = 0; i < UTSM_SCHED_MAX_TASKS; i++) {
+            utsm_sched_tcb *t = &g_task_table[i];
+            if (t->state == UTSM_SCHED_TASK_SLEEPING &&
+                t->wake_deadline_ns != 0 && t->wake_deadline_ns <= g_uptime_ns) {
+                t->wake_deadline_ns = 0;
+                wake_locked(t);
+                u32 ac = t->assigned_cpu;
+                utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+                if (ac != 0) smp_request_resched(ac);
+                utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+            }
         }
+        utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
     }
 
-    utsm_sched_run_queue *rq = g_rq_ptrs[cpu_id];
+    utsm_sched_run_queue *rq = rq_of(cpu_id);
+    if (!rq) return UTSM_SCHED_OK;
+
+    /* 空闲 CPU 从别的 CPU 偷一个可迁移 READY 任务（负载均衡） */
+    if (rq->ready_count == 0) {
+        if (utsm_sched_balance(cpu_id) > 0)
+            utsm_this_cpu()->need_resched = 1;
+    }
+
     u32 cur_slot = rq->current_task_slot;
     if (cur_slot == UTSM_SCHED_INVALID_SLOT) return UTSM_SCHED_OK;
     utsm_sched_tcb *cur = &g_task_table[cur_slot];
@@ -273,6 +377,59 @@ int utsm_sched_tick(u32 cpu_id, u64 elapsed_ns, utsm_sched_tcb **out_preempted_t
         *out_preempted_task = cur;
     }
     return UTSM_SCHED_OK;
+}
+
+/* ===================================================================
+ *  R5：负载均衡（idle steal）与迁移约束
+ * =================================================================== */
+
+/* 某任务是否允许迁移到 cpu：READY、非 idle、非 NO_MIGRATE、affinity 允许。 */
+static int task_migratable(const utsm_sched_tcb *t, u32 cpu) {
+    if (t->state != UTSM_SCHED_TASK_READY) return 0;
+    if (t->flags & (UTSM_SCHED_TASK_F_NO_MIGRATE | UTSM_SCHED_TASK_F_IDLE)) return 0;
+    if (cpu >= 64u) return 0;
+    if (!(t->affinity_mask & (1ULL << cpu))) return 0;
+    return 1;
+}
+
+/* 从其它 CPU 的 runqueue 偷一个最高优先级的可迁移任务到 dst；返回 1 = 偷到。 */
+int utsm_sched_balance(u32 dst_cpu) {
+    utsm_sched_run_queue *dst = rq_of(dst_cpu);
+    if (!dst || utsm_cpu_index() != dst_cpu) return 0;
+
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    u32 n = g_cpu_count ? g_cpu_count : 1;
+    int stole = 0;
+
+    for (u32 k = 1; k < n && !stole; k++) {
+        u32 src_cpu = (dst_cpu + k) % n;
+        utsm_sched_run_queue *src = rq_of(src_cpu);
+        if (!src || src->ready_count == 0) continue;
+
+        u64 bm = src->ready_bitmap;
+        while (bm) {
+            u32 p = (u32)__builtin_ctzll(bm);
+            bm &= bm - 1;
+            u32 slot = src->head[p];
+            u32 guard = 0;
+            while (slot < UTSM_SCHED_MAX_TASKS && guard++ < UTSM_SCHED_MAX_TASKS) {
+                utsm_sched_tcb *t = &g_task_table[slot];
+                u32 next = t->runq_next;
+                if (task_migratable(t, dst_cpu)) {
+                    rq_unlink(src, t);
+                    rq_link(dst, t);
+                    t->assigned_cpu = dst_cpu;
+                    stole = 1;
+                    break;
+                }
+                slot = next;
+            }
+            if (stole) break;
+        }
+    }
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    return stole;
 }
 
 /* ===================================================================
@@ -310,6 +467,7 @@ int utsm_sched_bootstrap_init(void) {
     g_task_aux[slot].stack_base = 0;
     g_task_aux[slot].run_start_ns = 0;
     g_rq_ptrs[0]->current_task_slot = slot;
+    g_percpu[0].current_slot = slot;
     g_bootstrap_slot = slot;
 
     log_info("[SCHED] bootstrap bound");
@@ -317,26 +475,41 @@ int utsm_sched_bootstrap_init(void) {
     return (int)slot;
 }
 
+/* 新任务选 CPU：优先当前 CPU（缓存热度），否则选 ready_count 最少的在线 CPU。 */
+static u32 pick_cpu_for_new_task(void) {
+    u32 self = this_cpu_i();
+    u32 best = self;
+    utsm_sched_run_queue *brq = rq_of(best);
+    u32 best_load = brq ? brq->ready_count : 0xFFFFFFFFu;
+    u32 n = g_cpu_count ? g_cpu_count : 1;
+    for (u32 c = 0; c < n; c++) {
+        utsm_sched_run_queue *rq = rq_of(c);
+        if (!rq) continue;
+        if (rq->ready_count < best_load) { best = c; best_load = rq->ready_count; }
+    }
+    return best;
+}
+
 int utsm_task_create(u32 process_slot, u32 priority, void (*entry)(void *), void *arg) {
     if (!entry || priority >= UTSM_SCHED_PRIORITY_COUNT) return UTSM_SCHED_ERR_INVALID;
 
-    /* P6b：抢占可能已开启（task_create 供 session 在运行期建长驻任务）。
-     * 建表+入队必须原子，否则 tick 落在半成品 TCB 上会调度到未初始化任务。 */
+    /* 抢占可能已开启（task_create 供 session 在运行期建长驻任务）。
+     * SMP 下建表+入队必须持调度锁，否则其它 CPU 的 tick 会看到半成品 TCB。 */
     u64 flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
 
     u32 slot = UTSM_SCHED_MAX_TASKS;
     for (u32 i = 0; i < UTSM_SCHED_MAX_TASKS; i++) {
         if (g_task_table[i].state == UTSM_SCHED_TASK_UNUSED) { slot = i; break; }
     }
     if (slot == UTSM_SCHED_MAX_TASKS) {
-        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
         return UTSM_SCHED_ERR_NO_TASK;
     }
 
     void *stack = kmem_alloc_page(4);   /* 16KB 任务栈（arena，非 DMA 资源） */
     if (!stack) {
-        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
         return UTSM_SCHED_ERR_NO_TASK;
     }
     u64 top = ((u64)stack + 4 * UTSM_PAGE_SIZE) & ~15ULL;
@@ -344,10 +517,11 @@ int utsm_task_create(u32 process_slot, u32 priority, void (*entry)(void *), void
     utsm_sched_tcb *t = &g_task_table[slot];
     int rc = utsm_sched_task_init(t, 0x1000ULL + slot, process_slot, priority, ~0ULL);
     if (rc != UTSM_SCHED_OK) {
-        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
         return rc;
     }
     t->flags = UTSM_SCHED_TASK_F_KERNEL;
+    if (!g_migrate_drv_tasks) t->flags |= UTSM_SCHED_TASK_F_NO_MIGRATE;
 
     /* crypto_context 指针：切换路径唯一触碰的加密状态 */
     if (process_slot != UTSM_SCHED_NO_PROCESS) {
@@ -373,9 +547,15 @@ int utsm_task_create(u32 process_slot, u32 priority, void (*entry)(void *), void
     g_task_aux[slot].stack_base = (u64)stack;
     g_task_aux[slot].run_start_ns = 0;
 
-    rc = utsm_sched_enqueue(0, t);
-    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
-    if (rc != UTSM_SCHED_OK) return rc;
+    /* 选 CPU 并入队（锁自函数入口持有；全程无切换/打印） */
+    u32 cpu = pick_cpu_for_new_task();
+    rc = enqueue_locked(cpu, t);
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    if (rc != UTSM_SCHED_OK) {
+        t->state = UTSM_SCHED_TASK_UNUSED;
+        return rc;
+    }
+    if (cpu != this_cpu_i()) smp_request_resched(cpu);
     return (int)slot;
 }
 
@@ -392,14 +572,16 @@ void utsm_task_main(u64 slot) {
 }
 
 void utsm_sched_schedule(void) {
-    utsm_sched_run_queue *rq = g_rq_ptrs[0];
+    utsm_percpu *pc = utsm_this_cpu();
+    if (pc->parked) return;
+    utsm_sched_run_queue *rq = this_rq();
+    if (!rq) return;
     u32 cur_slot = rq->current_task_slot;
     if (cur_slot == UTSM_SCHED_INVALID_SLOT) return;
     utsm_sched_tcb *cur = &g_task_table[cur_slot];
 
     u64 flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    g_switch_lock = 1;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
 
     if (cur->state == UTSM_SCHED_TASK_RUNNING) {
         cur->state = UTSM_SCHED_TASK_READY;
@@ -407,34 +589,35 @@ void utsm_sched_schedule(void) {
     }
 
     utsm_sched_tcb *next = 0;
-    int rc = utsm_sched_pick_next(0, &next);
+    int rc = pick_next_locked(pc->self, &next);
     if (rc != UTSM_SCHED_OK || !next) {
         if (cur->state == UTSM_SCHED_TASK_READY) {
             /* 仅当前任务可运行：取回继续 */
             rq_unlink(rq, cur);
             cur->state = UTSM_SCHED_TASK_RUNNING;
             g_task_aux[cur_slot].run_start_ns = g_uptime_ns;
-            g_switch_lock = 0;
-            __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+            sched_unlock_keep_cli();
+            utsm_irq_restore(flags);
             return;
         }
         /* 当前任务不可运行且无任务可切换 → 恢复根接管 */
-        g_switch_lock = 0;
+        sched_unlock_keep_cli();
         drr_system_rollback("scheduler: no runnable task");
         for (;;) { __asm__ volatile("cli; hlt"); }
     }
     if (next == cur) {
         cur->state = UTSM_SCHED_TASK_RUNNING;
         g_task_aux[cur_slot].run_start_ns = g_uptime_ns;
-        g_switch_lock = 0;
-        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+        sched_unlock_keep_cli();
+        utsm_irq_restore(flags);
         return;
     }
 
     rq->current_task_slot = task_slot_of(next);
-    g_switch_lock = 0;
-    utsm_sched_switch(cur, next);   /* 切走；恢复点在下一行 */
-    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+    pc->current_slot = task_slot_of(next);
+    sched_unlock_keep_cli();
+    utsm_sched_switch(cur, next);   /* 切走；恢复点在下一行（IF 保持关闭） */
+    utsm_irq_restore(flags);
 }
 
 void utsm_sched_yield(void) {
@@ -442,17 +625,40 @@ void utsm_sched_yield(void) {
 }
 
 void utsm_sched_sleep_ms(u32 ms) {
-    utsm_sched_run_queue *rq = g_rq_ptrs[0];
+    utsm_sched_run_queue *rq = this_rq();
+    if (!rq) return;
     u32 cur_slot = rq->current_task_slot;
     if (cur_slot == UTSM_SCHED_INVALID_SLOT) return;
     utsm_sched_tcb *cur = &g_task_table[cur_slot];
+
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
     cur->wake_deadline_ns = g_uptime_ns + (u64)ms * 1000000ULL;
-    utsm_sched_block(cur, UTSM_SCHED_TASK_SLEEPING);
+    block_locked(cur, UTSM_SCHED_TASK_SLEEPING);
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
     utsm_sched_schedule();
 }
 
+/* 选出下一个可切换任务；队列空时回退到本 CPU 的 idle 任务。
+ * 调用方必须持有 g_sched_lock。返回 0 成功，<0 无任务。 */
+static int pick_or_idle_locked(u32 cpu, utsm_sched_tcb **out) {
+    *out = 0;
+    if (pick_next_locked(cpu, out) == UTSM_SCHED_OK && *out) return 0;
+    u32 idle = g_percpu[cpu].idle_slot;
+    if (idle < UTSM_SCHED_MAX_TASKS &&
+        g_task_table[idle].state == UTSM_SCHED_TASK_READY) {
+        rq_unlink(rq_of(cpu), &g_task_table[idle]);
+        g_task_table[idle].state = UTSM_SCHED_TASK_RUNNING;
+        *out = &g_task_table[idle];
+        return 0;
+    }
+    return -1;
+}
+
 void utsm_sched_task_exit(void) {
-    utsm_sched_run_queue *rq = g_rq_ptrs[0];
+    u32 cpu = this_cpu_i();
+    utsm_sched_run_queue *rq = this_rq();
+    if (!rq) for (;;) { __asm__ volatile("cli; hlt"); }
     u32 cur_slot = rq->current_task_slot;
     if (cur_slot == UTSM_SCHED_INVALID_SLOT) {
         for (;;) { __asm__ volatile("cli; hlt"); }
@@ -465,15 +671,27 @@ void utsm_sched_task_exit(void) {
     drr_watchdog_unregister(cur_slot);   /* 防止看门狗对已退出任务误报 */
     cur->state = UTSM_SCHED_TASK_ZOMBIE;
 
-    __asm__ volatile("cli" ::: "memory");
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
     utsm_sched_tcb *next = 0;
-    if (utsm_sched_pick_next(0, &next) != UTSM_SCHED_OK || !next) {
+    if (pick_or_idle_locked(cpu, &next) != 0 || !next) {
+        sched_unlock_keep_cli();
         drr_system_rollback("scheduler: no task after exit");
         for (;;) { __asm__ volatile("cli; hlt"); }
     }
     rq->current_task_slot = task_slot_of(next);
+    g_percpu[cpu].current_slot = task_slot_of(next);
+    sched_unlock_keep_cli();
     utsm_sched_switch(cur, next);   /* 不返回 */
     for (;;) { __asm__ volatile("cli; hlt"); }
+}
+
+/* 任务当前是否跑在某个 CPU 上；返回 CPU 索引或 -1。 */
+static int task_running_cpu(u32 slot) {
+    for (u32 c = 0; c < UTSM_MAX_CPUS; c++) {
+        if (g_percpu[c].rq && g_percpu[c].current_slot == slot) return (int)c;
+    }
+    return -1;
 }
 
 int utsm_sched_task_kill(u32 task_slot) {
@@ -487,8 +705,12 @@ int utsm_sched_task_kill(u32 task_slot) {
     utsm_crypto_context *cc = (utsm_crypto_context *)t->crypto_context;
     if (cc) cc->crypto_epoch++;
     drr_watchdog_unregister(task_slot);
-    utsm_sched_dequeue(t);
+
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    dequeue_locked(t);
     t->state = UTSM_SCHED_TASK_ZOMBIE;
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
     return UTSM_SCHED_OK;
 }
 
@@ -497,31 +719,51 @@ void utsm_sched_fault_task(u32 task_slot) {
     utsm_sched_tcb *t = &g_task_table[task_slot];
     if (t->state == UTSM_SCHED_TASK_UNUSED || t->state == UTSM_SCHED_TASK_ZOMBIE) return;
 
+    int rcpu = task_running_cpu(task_slot);
+    u32 self = this_cpu_i();
+
+    if (rcpu >= 0 && (u32)rcpu != self) {
+        /* 任务正在别的 CPU 上跑：本上下文不能切换它。
+         * 仅留痕，由该 CPU 的异常/tick 路径自行收尾（不伪造状态）。 */
+        log_warn("[SCHED] fault on remote cpu, deferred");
+        log_hex64("[SCHED]   slot=", task_slot);
+        log_hex64("[SCHED]   cpu=", (u64)rcpu);
+        return;
+    }
+
     utsm_crypto_context *cc = (utsm_crypto_context *)t->crypto_context;
     if (cc) cc->crypto_epoch++;
     drr_watchdog_unregister(task_slot);
-    t->state = UTSM_SCHED_TASK_FAULTED;
-    utsm_sched_dequeue(t);
 
-    utsm_sched_run_queue *rq = g_rq_ptrs[0];
-    if (rq->current_task_slot == task_slot) {
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    t->state = UTSM_SCHED_TASK_FAULTED;
+    dequeue_locked(t);
+
+    utsm_sched_run_queue *rq = this_rq();
+    if (rq && rq->current_task_slot == task_slot) {
         /* fault 任务是当前任务（tick/异常上下文）：杀掉并切走，不返回 */
         t->state = UTSM_SCHED_TASK_ZOMBIE;
-        __asm__ volatile("cli" ::: "memory");
         utsm_sched_tcb *next = 0;
-        if (utsm_sched_pick_next(0, &next) != UTSM_SCHED_OK || !next) {
+        if (pick_or_idle_locked(self, &next) != 0 || !next) {
+            sched_unlock_keep_cli();
             drr_system_rollback("scheduler: no task after fault");
             for (;;) { __asm__ volatile("cli; hlt"); }
         }
         rq->current_task_slot = task_slot_of(next);
+        g_percpu[self].current_slot = task_slot_of(next);
+        sched_unlock_keep_cli();
         utsm_sched_switch(t, next);
         for (;;) { __asm__ volatile("cli; hlt"); }
     }
     t->state = UTSM_SCHED_TASK_ZOMBIE;
+    sched_unlock_keep_cli();
+    utsm_irq_restore(flags);
 }
 
 u32 utsm_sched_current_slot(void) {
-    return g_rq_ptrs[0]->current_task_slot;
+    utsm_sched_run_queue *rq = this_rq();
+    return rq ? rq->current_task_slot : UTSM_SCHED_INVALID_SLOT;
 }
 
 /* ===================================================================
@@ -531,12 +773,20 @@ u32 utsm_sched_current_slot(void) {
 static int utsm_tick_handler(u8 vector) {
     (void)vector;
     lapic_timer_eoi();          /* EOI 先行：切换不得悬挂 in-service 位 */
-    drr_heartbeat_tick();
+    u32 cpu = utsm_cpu_index();
+    utsm_percpu *pc = &g_percpu[cpu];
+    pc->tick_count++;
+    pc->heartbeat_ns = g_uptime_ns;
+
+    if (cpu == 0) drr_heartbeat_tick();
     if (!g_sched_enabled) return 1;
-    drr_watchdog_check();       /* 可能杀当前任务并切换（不返回） */
+    if (pc->parked) return 1;   /* 停驻期间不调度（任务已退回队列） */
+    if (cpu == 0) drr_watchdog_check();   /* 可能杀当前任务并切换（不返回） */
+
     utsm_sched_tcb *preempted = 0;
-    utsm_sched_tick(0, g_tick_ns, &preempted);
-    if (preempted || g_wake_pending) {
+    utsm_sched_tick(cpu, g_tick_ns, &preempted);
+    if (preempted || pc->need_resched) {
+        pc->need_resched = 0;
         utsm_sched_schedule();
     }
     return 1;                   /* 自负 EOI 全责（idt.c 约定） */
@@ -545,8 +795,12 @@ static int utsm_tick_handler(u8 vector) {
 static int utsm_sched_exc_hook(u64 vector, u64 err, u64 rip) {
     (void)err;
     if (!g_sched_enabled) return 0;   /* 原路径：全量日志 + 停机 */
-    u32 cur = g_rq_ptrs[0]->current_task_slot;
-    if (cur == UTSM_SCHED_INVALID_SLOT || cur == g_bootstrap_slot) return 0;
+    u32 cpu = utsm_cpu_index();
+    u32 cur = utsm_sched_current_slot();
+    if (cur == UTSM_SCHED_INVALID_SLOT || cur == g_bootstrap_slot ||
+        cur == g_percpu[cpu].idle_slot) {
+        return 0;
+    }
     /* 任务级 fault：DRR 接管（页级回滚 + 杀任务 + 切换），本函数不返回 */
     log_error("[SCHED] task fault");
     log_hex64("[SCHED]   vector=", vector);
@@ -580,6 +834,9 @@ int utsm_sched_enable(u32 tick_hz) {
     g_sched_enabled = 1;
     log_info("[SCHED] enable (LAPIC timer)");
     log_hex64("[SCHED]   tick_hz=", tick_hz);
+
+    /* R5：BSP 就绪后让每个 AP 编程自身 LAPIC timer */
+    smp_start_cpu_timers();
     return 0;
 }
 
@@ -589,6 +846,7 @@ void utsm_sched_quiesce(void) {
     idt_set_exception_hook(0);          /* 恢复 DSK 阶段异常诊断行为 */
     drr_set_sched_fault_cb(0);
     lapic_timer_stop();
+    smp_park_aps();                     /* R5：AP 一并停驻（停 timer + 退回 idle） */
     for (u32 i = 0; i < UTSM_SCHED_MAX_TASKS; i++) {
         if (i == g_bootstrap_slot) continue;
         utsm_sched_tcb *t = &g_task_table[i];
@@ -776,4 +1034,181 @@ int utsm_sched_selftest_blockwake(void) {
 int utsm_sched_debug_ready_count(u32 cpu_id) {
     if (cpu_id >= UTSM_SCHED_MAX_CPUS) return -1;
     return (int)g_rq_ptrs[cpu_id]->ready_count;
+}
+
+/* ===================================================================
+ *  R5：per-CPU idle 任务 / park / SMP selftest
+ * =================================================================== */
+
+/* BSP 为 AP 预建 idle 任务（入队 READY；AP 入口再绑定自身 rsp）。 */
+int utsm_sched_create_idle_for_cpu(u32 cpu) {
+    if (cpu == 0 || cpu >= UTSM_MAX_CPUS || cpu >= UTSM_SCHED_MAX_CPUS)
+        return UTSM_SCHED_ERR_INVALID;
+    utsm_sched_run_queue *rq = rq_of(cpu);
+    if (!rq) return UTSM_SCHED_ERR_INVALID;
+
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    u32 slot = UTSM_SCHED_MAX_TASKS;
+    for (u32 i = 0; i < UTSM_SCHED_MAX_TASKS; i++) {
+        if (g_task_table[i].state == UTSM_SCHED_TASK_UNUSED) { slot = i; break; }
+    }
+    if (slot == UTSM_SCHED_MAX_TASKS) {
+        utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+        return UTSM_SCHED_ERR_NO_TASK;
+    }
+    utsm_sched_tcb *t = &g_task_table[slot];
+    utsm_sched_task_init(t, 0x8000ULL + cpu, UTSM_SCHED_NO_PROCESS,
+                         UTSM_SCHED_PRIORITY_LOWEST, 1ULL << cpu);
+    t->flags = UTSM_SCHED_TASK_F_KERNEL | UTSM_SCHED_TASK_F_NO_MIGRATE |
+               UTSM_SCHED_TASK_F_IDLE;
+    t->state = UTSM_SCHED_TASK_READY;
+    rq_link(rq, t);
+    rq->idle_task_slot = slot;
+    g_percpu[cpu].idle_slot = slot;
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+    return (int)slot;
+}
+
+/* AP 入口：把 idle 任务绑定到自身当前 rsp 并置 RUNNING。 */
+void utsm_sched_ap_bind_idle(u32 cpu, u64 rsp) {
+    utsm_sched_run_queue *rq = rq_of(cpu);
+    u32 slot = g_percpu[cpu].idle_slot;
+    if (!rq || slot >= UTSM_SCHED_MAX_TASKS) return;
+
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    utsm_sched_tcb *t = &g_task_table[slot];
+    if (t->state == UTSM_SCHED_TASK_READY) rq_unlink(rq, t);
+    t->state = UTSM_SCHED_TASK_RUNNING;
+    t->arch.rsp = rsp;
+    rq->current_task_slot = slot;
+    g_percpu[cpu].current_slot = slot;
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+}
+
+/* 在本 CPU（IPI 上下文）把当前任务退回 runqueue 并切到 idle。 */
+void utsm_sched_park_cpu(void) {
+    u32 cpu = this_cpu_i();
+    utsm_sched_run_queue *rq = this_rq();
+    if (!rq) return;
+    u32 idle = g_percpu[cpu].idle_slot;
+    if (idle >= UTSM_SCHED_MAX_TASKS) return;
+
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    u32 cur = rq->current_task_slot;
+    if (cur == UTSM_SCHED_INVALID_SLOT || cur == idle) {
+        sched_unlock_keep_cli();
+        utsm_irq_restore(flags);
+        return;
+    }
+    utsm_sched_tcb *t = &g_task_table[cur];
+    if (t->state == UTSM_SCHED_TASK_RUNNING) {
+        t->state = UTSM_SCHED_TASK_READY;
+        rq_link(rq, t);
+    }
+    utsm_sched_tcb *it = &g_task_table[idle];
+    if (it->state == UTSM_SCHED_TASK_READY) rq_unlink(rq, it);
+    it->state = UTSM_SCHED_TASK_RUNNING;
+    rq->current_task_slot = idle;
+    g_percpu[cpu].current_slot = idle;
+    sched_unlock_keep_cli();
+
+    utsm_sched_switch(t, it);
+    utsm_irq_restore(flags);
+}
+
+/* selftest 钩子：允许指定任务迁移（清 NO_MIGRATE，affinity 全开）。 */
+void utsm_sched_test_allow_migrate(u32 slot) {
+    if (slot >= UTSM_SCHED_MAX_TASKS) return;
+    u64 flags;
+    utsm_spin_lock_irqsave(&g_sched_lock, &flags);
+    g_task_table[slot].flags &= ~UTSM_SCHED_TASK_F_NO_MIGRATE;
+    g_task_table[slot].affinity_mask = ~0ULL;
+    utsm_spin_unlock_irqrestore(&g_sched_lock, flags);
+}
+
+u32 utsm_sched_debug_cpu_ticks(u32 cpu) {
+    if (cpu >= UTSM_MAX_CPUS) return 0;
+    return (u32)g_percpu[cpu].tick_count;
+}
+
+/* ---- SMP selftest：两任务 1000 帧，双 CPU 并发且无双重执行 ---- */
+static volatile u32 g_smp_done[2];
+static volatile u32 g_smp_busy[2];
+static volatile u32 g_smp_frames[2];
+static volatile u32 g_smp_cpu_runs[UTSM_MAX_CPUS];
+
+static void smp_test_task(void *arg) {
+    u32 id = (u32)(u64)arg;
+    for (u32 i = 0; i < 1000; i++) {
+        if (__atomic_exchange_n(&g_smp_busy[id], 1u, __ATOMIC_ACQ_REL)) {
+            panic_full("TST-E49 SMP DOUBLE EXECUTION",
+                       "smp selftest: same task ran concurrently", 0);
+        }
+        g_smp_cpu_runs[utsm_cpu_index()]++;
+        g_smp_frames[id]++;
+        __atomic_store_n(&g_smp_busy[id], 0u, __ATOMIC_RELEASE);
+        if ((i & 0x7Fu) == 0) utsm_sched_yield();
+    }
+    __atomic_store_n(&g_smp_done[id], 1u, __ATOMIC_RELEASE);
+}
+
+int utsm_sched_selftest_smp(void) {
+    u32 n = g_cpu_count ? g_cpu_count : 1;
+    if (n < 2) {
+        log_info("[SCHED] smp selftest skipped (single cpu)");
+        return 0;
+    }
+    if (utsm_sched_enable(0) != 0) return -1;
+
+    g_smp_done[0] = g_smp_done[1] = 0;
+    g_smp_busy[0] = g_smp_busy[1] = 0;
+    g_smp_frames[0] = g_smp_frames[1] = 0;
+    for (u32 c = 0; c < UTSM_MAX_CPUS; c++) g_smp_cpu_runs[c] = 0;
+
+    int a = utsm_task_create(UTSM_SCHED_NO_PROCESS, 10, smp_test_task, (void *)0ULL);
+    int b = utsm_task_create(UTSM_SCHED_NO_PROCESS, 10, smp_test_task, (void *)1ULL);
+    if (a < 0 || b < 0) return -2;
+    utsm_sched_test_allow_migrate((u32)a);
+    utsm_sched_test_allow_migrate((u32)b);
+    smp_request_resched(0);
+    for (u32 c = 1; c < n; c++) smp_request_resched(c);
+
+    /* 等两任务跑完（上限约 3 秒；tick 计数作时基，避免死等） */
+    u32 start_ticks = utsm_sched_debug_cpu_ticks(0);
+    for (;;) {
+        if (__atomic_load_n(&g_smp_done[0], __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&g_smp_done[1], __ATOMIC_ACQUIRE)) break;
+        __asm__ volatile("pause");
+        u32 now = utsm_sched_debug_cpu_ticks(0);
+        if (now - start_ticks > 300u) {
+            log_error("[SCHED] smp selftest timeout");
+            log_hex64("[SCHED]   done0=", g_smp_done[0]);
+            log_hex64("[SCHED]   done1=", g_smp_done[1]);
+            panic_full("TST-E48 SMP BOTH CPU EXEC FAILED",
+                       "smp selftest: tasks did not finish on two cpus", 0);
+            return -3;
+        }
+    }
+
+    if (g_smp_frames[0] != 1000u || g_smp_frames[1] != 1000u) {
+        panic_full("TST-E50 SMP FRAME SEQUENCE BROKEN",
+                   "smp selftest: frame count mismatch", 0);
+        return -4;
+    }
+    u32 used_cpus = 0;
+    for (u32 c = 0; c < n; c++) if (g_smp_cpu_runs[c]) used_cpus++;
+    log_hex64("[SCHED] smp selftest cpus=", used_cpus);
+    for (u32 c = 0; c < n; c++) {
+        log_hex64("[SCHED]   cpu_runs=", g_smp_cpu_runs[c]);
+    }
+    if (used_cpus < 2) {
+        panic_full("TST-E48 SMP BOTH CPU EXEC FAILED",
+                   "smp selftest: only one cpu executed tasks", 0);
+        return -5;
+    }
+    log_info("[SCHED] smp selftest ok");
+    return 0;
 }

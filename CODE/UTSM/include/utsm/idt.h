@@ -5,6 +5,14 @@
 
 void idt_init(void);
 
+/* 按当前 g_idt 重新加载 IDTR（AP 复用 BSP 构建的 256 项门）。
+ * 不清空、不重装 handler，仅 lidt。R5 的 AP 入口与 idt_load_this_cpu
+ * 都走这条路径。 */
+void idt_reload(void);
+
+/* R5：AP 入口把同一张全局 IDT 装到本 CPU 的 IDTR（= idt_reload）。 */
+void idt_load_this_cpu(void);
+
 /* 将 IDT 所有 256 个条目替换为安全 halt stub (cli; hlt)。
  * 用于 UTSM→DSK 跳转前，防止 DSK 运行期间过期 UTSM handler
  * 被 spurious IRQ / 异常触发导致三重故障重启。 */

@@ -420,18 +420,15 @@ static void cursor_draw(u32 *fb, int mx, int my) {
     }
 }
 
-/* P6b：鼠标状态经 srv.input.mouse.poll 取快照，绝对坐标转增量。 */
+/* P6b：鼠标状态经 srv.input.mouse.poll 取快照；驱动坐标即唯一真值。 */
 static int ps2_mouse_poll(void) {
     int dx = 0, dy = 0;
     u32 btns = 0;
     if (!dkm_input_mouse_step(&g_input, &dx, &dy, &btns)) return 0;
-    if (g_input.mouse_abs) {
-        g_mouse_x = g_input.mouse_x;
-        g_mouse_y = g_input.mouse_y;
-    } else {
-        g_mouse_x += dx;
-        g_mouse_y += dy;
-    }
+    /* 相对包模式下驱动从 fb 中心起步并自行钳位；消费方再用差分累加
+     * 到自己的起点（400,300）会让屏幕下半/右半不可达。 */
+    g_mouse_x = g_input.mouse_x;
+    g_mouse_y = g_input.mouse_y;
     if (g_mouse_x < 0) g_mouse_x = 0;
     if (g_mouse_y < 0) g_mouse_y = 0;
     if (g_mouse_x >= (int)fb_w - CURSZ) g_mouse_x = (int)fb_w - CURSZ;
@@ -738,6 +735,16 @@ static int login_run(void) {
     fb_p = g_api->fb_pitch;
 
     logl("[login] framebuffer ready");
+
+    /* 光标初值与驱动快照对齐（避免首包从 400,300 跳到驱动位置）。 */
+    if (g_input.mouse_valid) {
+        g_mouse_x = g_input.mouse_x;
+        g_mouse_y = g_input.mouse_y;
+        if (g_mouse_x < 0) g_mouse_x = 0;
+        if (g_mouse_y < 0) g_mouse_y = 0;
+        if (g_mouse_x >= (int)fb_w - CURSZ) g_mouse_x = (int)fb_w - CURSZ;
+        if (g_mouse_y >= (int)fb_h - CURSZ) g_mouse_y = (int)fb_h - CURSZ;
+    }
 
     /* P4d：USER.CONF 经服务总线自读（不再经 ctx->reserved[0/1]） */
     const u8 *conf_buf = 0;

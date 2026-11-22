@@ -357,6 +357,7 @@ static void redraw_all_fluent(void) {
     dock_draw();
     menubar_draw_menus();
     taskbar_cards_draw();
+    guest_banner_draw();
 
     /* 进场：顶栏从屏幕上方滑下，Dock 从下方升起。reveal=0 时这两条带回到壁纸。 */
     if (g_boot_reveal < 256) {

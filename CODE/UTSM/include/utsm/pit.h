@@ -10,6 +10,9 @@
 /* 编程 ch0 单发 ms 毫秒（>54ms 截断到 54ms） */
 void pit_oneshot_ms(u32 ms);
 
+/* 编程 ch0 单发 us 微秒（R5：INIT-SIPI 的 200µs 间隔；<1µs 按 1µs） */
+void pit_oneshot_us(u32 us);
+
 /* latch 并返回 ch0 当前递减计数（16 位） */
 u16 pit_latch_count(void);
 

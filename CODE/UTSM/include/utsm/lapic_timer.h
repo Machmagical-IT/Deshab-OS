@@ -38,5 +38,28 @@ void lapic_timer_eoi(void);
 /* guest 执行期间屏蔽(on=1)/恢复(on=0)主机可屏蔽中断（TPR 抬高/归零）。 */
 void lapic_irq_quiesce(int on);
 
+/* ---- R5 SMP 扩展 ---- */
+
+/* BSP 校准是否完成（1 = g_init_count 可用，AP 才能编程自身定时器）。 */
+int  lapic_timer_ready(void);
+
+/* AP：SVR 使能 + TPR=0 + 按 BSP 校准值编程（LVT 保持 mask）。 */
+void lapic_timer_this_cpu_init(void);
+
+/* AP：解 mask 开始周期投递（须先 this_cpu_init）。 */
+void lapic_timer_this_cpu_start(void);
+
+/* AP：停本 CPU 定时器（mask + INIT_CNT=0）。 */
+void lapic_timer_this_cpu_stop(void);
+
+/* 发送固定投递模式 IPI（物理目的地址）。 */
+void lapic_send_ipi(u32 apic_id, u8 vector);
+
+/* 直接写 ICR（AP 启动序列用：INIT/SIPI 需要 delivery mode 位）。
+ * icr_low 由调用方组装（vector | delivery<<8 | level<<14 | trigger<<15）。 */
+void lapic_send_icr(u32 apic_id, u32 icr_low);
+
+/* 本 CPU 的 Local APIC ID（MMIO 未映射时回退 CPUID.01H）。 */
+u32  lapic_id_this_cpu(void);
 
 #endif /* UTSM_LAPIC_TIMER_H */

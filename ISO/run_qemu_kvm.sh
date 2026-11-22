@@ -30,6 +30,7 @@ case "$VARIANT" in
     1) VARIANT=dev ;;
     2) VARIANT=release ;;
     3) VARIANT=realtest ;;
+    4) VARIANT=ne ;;
 esac
 IMG="${IMG_OVERRIDE:-$SCRIPT_DIR/deshab-${VARIANT}.img}"
 SATA_IMG="${SATA_IMG_OVERRIDE:-$SCRIPT_DIR/../.build_tmp/sata_fat32_dsk.img}"
@@ -41,6 +42,17 @@ if [[ ! -f "$IMG" ]]; then
     echo "[qemu] Run build.bat first (default builds both dev and release),"
     echo "[qemu] or build dev only: build.bat -Variant dev"
     exit 1
+fi
+
+# Same image must not be opened by two VMs: the launcher uses file.locking=off,
+# so concurrent QEMU instances would corrupt each other's writes.
+if pgrep -f qemu-system-x86_64 >/dev/null 2>&1 && \
+   pgrep -af qemu-system-x86_64 2>/dev/null | grep -Fq -- "file=$IMG"; then
+    echo "[qemu] Already running with this image:"
+    echo "[qemu]   $IMG"
+    echo "[qemu] Reusing the existing instance (close its window to restart)."
+    # 0 = 不用再启动；run_qemu.bat 的自动聚焦会把已有窗口拉到前台
+    exit 0
 fi
 
 # Locate qemu-system-x86_64

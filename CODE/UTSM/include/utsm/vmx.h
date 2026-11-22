@@ -220,6 +220,7 @@
 #define SEC_EXEC_ENABLE_RDTSCP           (1ULL << 3)
 #define SEC_EXEC_ENABLE_VPID             (1ULL << 5)
 #define SEC_EXEC_UNRESTRICTED_GUEST      (1ULL << 7)
+#define SEC_EXEC_MONITOR_TRAP_FLAG       (1ULL << 26)
 
 /* ===== VM-exit controls ===== */
 #define VM_EXIT_SAVE_DEBUG_CONTROLS      (1ULL << 2)
@@ -269,6 +270,7 @@
 #define EXIT_VMXOFF                      26
 #define EXIT_VMXON                       27
 #define EXIT_CONTROL_ACCESS              28
+#define EXIT_MTF                         29
 #define EXIT_IO_INSTRUCTION              30
 #define EXIT_RDPMC                       15
 #define EXIT_RDTSC                       16
@@ -306,6 +308,11 @@
 /* ===== Public API ===== */
 int vmx_supported(void);
 int vmx_enable(void);
+/* 每 CPU VMXON。BSP 用 vmx_enable()（等价 vmx_cpu_enable(0)），
+ * AP 在自己的 C 入口调用 vmx_cpu_enable(1)。 */
+int vmx_cpu_enable(u32 cpu_index);
+int vmx_cpu_enabled(u32 cpu_index);
+u32 vmx_cpu_owner(void);
 int vmx_disable(void);
 int vmx_vmcs_alloc(u64 *phys_out);
 int vmx_vmcs_load(u64 phys);

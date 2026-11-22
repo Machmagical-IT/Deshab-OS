@@ -23,6 +23,15 @@ void pit_oneshot_ms(u32 ms) {
     outb(PIT_CH0_DATA, (u8)((div >> 8) & 0xFF));
 }
 
+void pit_oneshot_us(u32 us) {
+    u64 div = (PIT_BASE_HZ * (u64)us) / 1000000ULL;
+    if (div == 0) div = 1;
+    if (div > 65535) div = 65535;
+    outb(PIT_CMD, 0x30);
+    outb(PIT_CH0_DATA, (u8)(div & 0xFF));
+    outb(PIT_CH0_DATA, (u8)((div >> 8) & 0xFF));
+}
+
 u16 pit_latch_count(void) {
     outb(PIT_CMD, 0x00);   /* ch0 latch 计数（读前锁存） */
     u16 lo = inb(PIT_CH0_DATA);

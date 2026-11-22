@@ -13,6 +13,7 @@
 #include <utsm/virtio_mmio.h>
 #include <utsm/instr.h>
 #include <utsm/lapic_timer.h>
+#include <utsm/guest_progress.h>
 #include "../arch/x86_64/limine.h"
 
 /* VM-Exit 处理器：从 VMCS 读取 exit reason 与 guest 状态，分发处理。
@@ -324,7 +325,49 @@ static int g_rx_head, g_rx_tail;
 static u8 g_com1_dll, g_com1_dlm, g_com1_ier, g_com1_fcr;
 static u8 g_com1_lcr, g_com1_mcr, g_com1_scr;
 
+/* 滑窗匹配 COM1 出站文本：每个字节 push 一次，再按尾部比对。 */
+static char g_com1_hist[32];
+static u32  g_com1_hist_n;
+
+static void com1_hist_push(char c) {
+    if (g_com1_hist_n < sizeof(g_com1_hist)) {
+        g_com1_hist[g_com1_hist_n++] = c;
+    } else {
+        for (u32 i = 0; i + 1 < sizeof(g_com1_hist); i++)
+            g_com1_hist[i] = g_com1_hist[i + 1];
+        g_com1_hist[sizeof(g_com1_hist) - 1] = c;
+    }
+}
+
+static int com1_hist_match(const char *tail, u32 len) {
+    if (len == 0 || len > sizeof(g_com1_hist)) return 0;
+    if (g_com1_hist_n < len) return 0;
+    for (u32 i = 0; i < len; i++)
+        if (g_com1_hist[g_com1_hist_n - len + i] != tail[i]) return 0;
+    return 1;
+}
+
 static int g_win_trace_arm;
+
+/* ===== Windows bootmgr MTF 单步轨迹环 =====
+ * 桥接打印 "starting Microsoft Boot Manager" 时给 BSP 挂 MTF，
+ * 每条指令一次 VM-exit 记录 RIP；"WIN-E28"（StartImage 返回）或
+ * budget 耗尽时倾倒轨迹 + 栈 + MZ/PE 回扫镜像基址。
+ * 目的：定位 BlInitializeLibrary 内把 0xC0000185 交回的那一步。 */
+#define WIN_TRACE_RING_SIZE 262144
+#define WIN_TRACE_BUDGET    2000000ULL
+static u64 g_win_trace_rip[WIN_TRACE_RING_SIZE];
+static u32 g_win_trace_head, g_win_trace_filled;
+static u64 g_win_trace_steps;
+static u64 g_win_trace_budget;
+static int g_win_trace_armed_mtf;
+static int g_win_trace_dumped;
+static u64 g_win_trace_arm_exits;
+static u64 g_win_trace_old_exc_bitmap;
+static u64 g_win_trace_old_rflags;
+static int g_win_trace_tf_on;
+static void win_trace_arm(void);
+static void win_trace_dump(void);
 
 static u64 com1_io(u32 port, int is_in, u64 value) {
     u32 reg = port - 0x3F8;
@@ -359,8 +402,21 @@ static u64 com1_io(u32 port, int is_in, u64 value) {
             /* Direct host UART write. serial_putc() waits on the same
              * COM1 LSR and can stall guest printk under file-backed serial. */
             char c = (char)(value & 0xFF);
-            if (c == 'M' && windows_platform_disk_reads() >= 15)
+            com1_hist_push(c);
+            guest_progress_note_serial(c);
+            /* 锚点不能带 '\n'：桥接 serial_write() 会在 '\n' 前插入 '\r'，
+             * 实际字节流是 "...Manager\r\n"，带换行的尾匹配永远失败。 */
+            if (com1_hist_match("starting Microsoft Boot Manager", 31)) {
+                /* 锚点即开始单步：bootmgfw 调用固件服务时 RIP 落在 OVMF，
+                 * 按 RIP 门控抓不到它，只能在整段窗口内单步。 */
                 g_win_trace_arm = 1;
+                win_trace_arm();
+            }
+            if (com1_hist_match("WIN-E28 ", 8) && g_win_trace_arm) {
+                /* 桥接 "[WINBOOT] WIN-E28 boot manager returned ..."：
+                 * StartImage 已返回 0xC0000185，倾倒失败窗口轨迹。 */
+                win_trace_dump();
+            }
             if (c == '\n') {
                 for (int i = 0; i < 10000 && !(inb(0x3F8 + 5) & 0x20); i++) {}
                 outb(0x3F8, '\r');
@@ -882,7 +938,10 @@ static void vmexit_before_resume(void) {
         windows_platform_tick();
         if (windows_platform_irq_armed())
             maybe_inject_irq();
-        windows_vcpu_on_resume(0);
+        /* 单步窗口内禁止 vCPU 切换：TF 是写在当前 VMCS 上的，
+         * 切到 AP 之后 BSP 的步进就断了（实测步进到 0xd0000 后停滞）。 */
+        if (!g_win_trace_armed_mtf)
+            windows_vcpu_on_resume(0);
         return;
     }
     if (vm_machine_profile_active(VM_PROFILE_ZT5)) {
@@ -1027,6 +1086,143 @@ static int guest_fetch_at_cr3(u64 gva, u8 *buf, u64 len, u64 cr3) {
         buf[i] = *(volatile u8 *)(hhdm + hpa);
     }
     return 0;
+}
+
+/* ===== Windows bootmgr 单步轨迹 =====
+ * 实测：嵌套 KVM 下 L2 的 Monitor Trap Flag 会被静默忽略（VMCS 里 bit26
+ * 置上了，但 43 次 exit 里没有一次 reason=29）。因此改用 guest 可见的
+ * RFLAGS.TF 单步 + 拦截 #DB(vector 1)，KVM 不会吞掉这条路径。 */
+
+static void win_trace_record(u64 rip) {
+    g_win_trace_rip[g_win_trace_head] = rip;
+    g_win_trace_head = (g_win_trace_head + 1) % WIN_TRACE_RING_SIZE;
+    if (g_win_trace_filled < WIN_TRACE_RING_SIZE)
+        g_win_trace_filled++;
+    g_win_trace_steps++;
+}
+
+static void win_trace_arm(void) {
+    struct vm_vcpu *v = vm_vcpu_active();
+    if (!v || v->id != 0 || g_win_trace_armed_mtf) return;
+    /* 已经倒过一次就不再挂：dump 是一次性的，重复挂载会让 guest 无限单步。 */
+    if (g_win_trace_dumped) return;
+    g_win_trace_old_exc_bitmap = vmx_vmcs_read(VMCS_EXCEPTION_BITMAP);
+    g_win_trace_old_rflags = vmx_vmcs_read(VMCS_GUEST_RFLAGS);
+    vmx_vmcs_write(VMCS_EXCEPTION_BITMAP, g_win_trace_old_exc_bitmap | 0x2ULL);
+    vmx_vmcs_write(VMCS_GUEST_RFLAGS, g_win_trace_old_rflags | 0x100ULL);
+    g_win_trace_tf_on = 1;
+    g_win_trace_arm_exits = g_vmexit_count;
+    g_win_trace_armed_mtf = 1;
+    g_win_trace_head = 0;
+    g_win_trace_filled = 0;
+    g_win_trace_steps = 0;
+    g_win_trace_budget = WIN_TRACE_BUDGET;
+    log_hex64("[WTR] exc bitmap=",
+              vmx_vmcs_read(VMCS_EXCEPTION_BITMAP));
+    log_hex64("[WTR] rflags=", vmx_vmcs_read(VMCS_GUEST_RFLAGS));
+    log_warn("[WTR] single-step armed on starting Microsoft Boot Manager");
+}
+
+static void win_trace_dump(void) {
+    if (g_win_trace_dumped || !g_win_trace_arm) return;
+    g_win_trace_dumped = 1;
+    if (g_win_trace_tf_on) {
+        vmx_vmcs_write(VMCS_GUEST_RFLAGS, g_win_trace_old_rflags);
+        vmx_vmcs_write(VMCS_EXCEPTION_BITMAP, g_win_trace_old_exc_bitmap);
+        g_win_trace_tf_on = 0;
+    }
+    g_win_trace_armed_mtf = 0;
+    log_warn("[WTR] ================= dump begin ================");
+    log_hex64("[WTR] dump steps=", g_win_trace_steps);
+    log_hex64("[WTR] dump filled=", g_win_trace_filled);
+    log_hex64("[WTR] exits since arm=", g_vmexit_count - g_win_trace_arm_exits);
+    if (g_win_trace_filled == 0) {
+        log_warn("[WTR] ring empty");
+        log_warn("[WTR] ================= dump end =================");
+        return;
+    }
+    u32 base = (g_win_trace_head + WIN_TRACE_RING_SIZE -
+                g_win_trace_filled) % WIN_TRACE_RING_SIZE;
+    u64 first_rip = g_win_trace_rip[base] & 0x00FFFFFFFFFFFFFFULL;
+
+    /* 最早 32 条：bootmgr 刚进 StartImage 的轨迹起点 */
+    u32 head_n = g_win_trace_filled < 32 ? g_win_trace_filled : 32;
+    for (u32 i = 0; i < head_n; i++) {
+        u32 idx = (base + i) % WIN_TRACE_RING_SIZE;
+        log_hex64("[WTR] first idx=", i);
+        log_hex64("[WTR] first rip=",
+                  g_win_trace_rip[idx] & 0x00FFFFFFFFFFFFFFULL);
+    }
+
+    /* 最近 512 条：失败前的最后动作 */
+    u32 tail_n = g_win_trace_filled < 512 ? g_win_trace_filled : 512;
+    for (u32 i = 0; i < tail_n; i++) {
+        u32 p = (g_win_trace_head + WIN_TRACE_RING_SIZE - tail_n + i) %
+                WIN_TRACE_RING_SIZE;
+        log_hex64("[WTR] idx=", g_win_trace_steps - tail_n + i + 1);
+        log_hex64("[WTR] rip=",
+                  g_win_trace_rip[p] & 0x00FFFFFFFFFFFFFFULL);
+    }
+
+    /* 尾部指令流：供离线与 bootmgfw.efi 反汇编字节级对位 */
+    u64 cr3 = guest_current_cr3();
+    u32 code_n = tail_n < 16 ? tail_n : 16;
+    for (u32 i = 0; i < code_n; i++) {
+        u32 p = (g_win_trace_head + WIN_TRACE_RING_SIZE - tail_n + i) %
+                WIN_TRACE_RING_SIZE;
+        u64 r = g_win_trace_rip[p] & 0x00FFFFFFFFFFFFFFULL;
+        u8 raw[16];
+        u64 w0 = 0, w1 = 0;
+        if (guest_fetch_at_cr3(r, raw, 16, cr3) == 0) {
+            for (int b = 0; b < 8; b++) {
+                w0 |= (u64)raw[b] << (8 * b);
+                w1 |= (u64)raw[8 + b] << (8 * b);
+            }
+        }
+        log_hex64("[WTR] code at=", r);
+        log_hex64("[WTR] code hi=", w1);
+        log_hex64("[WTR] code lo=", w0);
+    }
+
+    /* 失败时 RSP 栈字：RBP/返回地址链 */
+    u64 rsp = vmx_vmcs_read(VMCS_GUEST_RSP);
+    log_hex64("[WTR] rsp=", rsp);
+    for (u32 s = 0; s < 24; s++) {
+        u8 raw[8];
+        u64 word = 0;
+        if (guest_fetch_at_cr3(rsp + (u64)s * 8, raw, 8, cr3) != 0) break;
+        for (int b = 0; b < 8; b++) word |= (u64)raw[b] << (8 * b);
+        log_hex64("[WTR] stk=", word);
+    }
+
+    /* MZ/PE 回扫：从轨迹起点向下找 bootmgfw 镜像基址（≤64MB） */
+    u64 page = first_rip & ~0xFFFULL;
+    u64 imgbase = 0;
+    for (u32 p = 0; p < 16384; p++) {
+        u8 mz[2];
+        if (guest_fetch_at_cr3(page, mz, 2, cr3) == 0 &&
+            mz[0] == 'M' && mz[1] == 'Z') {
+            u8 pe[4];
+            u64 lfanew = 0;
+            if (guest_fetch_at_cr3(page + 0x3C, pe, 4, cr3) == 0) {
+                lfanew = (u64)pe[0] | ((u64)pe[1] << 8) |
+                         ((u64)pe[2] << 16) | ((u64)pe[3] << 24);
+                u8 sig[4];
+                if (lfanew && lfanew < 0x1000 &&
+                    guest_fetch_at_cr3(page + lfanew, sig, 4, cr3) == 0 &&
+                    sig[0] == 'P' && sig[1] == 'E' &&
+                    sig[2] == 0 && sig[3] == 0) {
+                    imgbase = page;
+                    break;
+                }
+            }
+        }
+        if (page < 0x1000) break;
+        page -= 0x1000;
+    }
+    if (imgbase) log_hex64("[WTR] imgbase=", imgbase);
+    else log_warn("[WTR] imgbase not found");
+    log_warn("[WTR] ================= dump end =================");
 }
 
 static int guest_fetch(u64 gva, u8 *buf, u64 len) {
@@ -1952,6 +2148,7 @@ int vmexit_dispatch(void) {
     u64 rip = vmx_vmcs_read(VMCS_GUEST_RIP);
     u64 instr_len = vmx_vmcs_read(VMCS_INSTRUCTION_LENGTH);
     int resume = 0;
+    int skip_pre_resume = 0;
 
     if (vm_machine_profile_active(VM_PROFILE_LINUX))
         linux_cet_restore_host();
@@ -1961,7 +2158,25 @@ int vmexit_dispatch(void) {
     if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
         static u64 win_exits;
         win_exits++;
-        if (g_win_trace_arm) {
+        /* 单步只在 guest 进入"非 OVMF、非桥接自身"的高地址代码后才挂。
+         * 实测：bootmgfw 首选基址 0x10000000 并未使用；锚点后的 exit 只看到
+         * OVMF(0x3E..0x3F) 与 0x1400001xxx（桥接自身的串口轮询）。 */
+        {
+            static u32 win_start_logs;
+            if (g_win_trace_arm && win_start_logs < 200) {
+                win_start_logs++;
+                log_hex64("[WINW] reason=", reason);
+                log_hex64("[WINW] rip=", rip);
+            }
+        }
+        if (g_win_trace_arm && !g_win_trace_armed_mtf && !g_win_trace_dumped &&
+            rip >= 0x10000000ULL &&
+            !(rip >= 0x3E000000ULL && rip < 0x40000000ULL) &&
+            !(rip >= 0x140000000ULL && rip < 0x140002000ULL)) {
+            log_hex64("[WTR] first traced rip=", rip);
+            win_trace_arm();
+        }
+        if (g_win_trace_arm && !g_win_trace_armed_mtf) {
             u64 port = reason == 0x1E ? (qualification >> 16) : 0;
             int poll = reason == 0x1E &&
                        (port == 0x60 || port == 0x64 || port == 0x608 ||
@@ -2092,6 +2307,34 @@ int vmexit_dispatch(void) {
     }
     case EXIT_EXCEPTION_NMI:
         INSTR_PROBE(EXCP, qualification, rip, 0, 0);
+        /* TF 单步：拦截 #DB(vector 1)，记录即将执行的 RIP 并吞掉，
+         * 让 RFLAGS.TF 保持置位以产生下一步。 */
+        if (g_win_trace_armed_mtf && g_win_trace_arm &&
+            vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+            u64 info = vmx_vmcs_read(VMCS_EXIT_INTR_INFO);
+            if ((info & 0xFF) == 1 && !(info & (1ULL << 11))) {
+                win_trace_record(rip);
+                if (g_win_trace_budget > 0)
+                    g_win_trace_budget--;
+                if ((g_win_trace_steps & 0xFFFFu) == 0) {
+                    log_hex64("[WTR] step=", g_win_trace_steps);
+                    log_hex64("[WTR] step rip=", rip);
+                }
+                if (g_win_trace_budget == 0) {
+                    log_warn("[WTR] budget exhausted");
+                    win_trace_dump();
+                }
+                /* 我们吞掉了 #DB，CPU 可能在交付路径里清过 TF：补回。 */
+                {
+                    u64 rf = vmx_vmcs_read(VMCS_GUEST_RFLAGS);
+                    if (!(rf & 0x100ULL))
+                        vmx_vmcs_write(VMCS_GUEST_RFLAGS, rf | 0x100ULL);
+                }
+                skip_pre_resume = 1;
+                resume = 1;
+                break;
+            }
+        }
         handle_exception(qualification, rip, &resume);
         break;
     case EXIT_TRIPLE_FAULT:
@@ -2191,6 +2434,25 @@ int vmexit_dispatch(void) {
         /* legacy 设备模拟：COM1 UART / PIC / PIT / 其余端口吞掉 */
         handle_io(qualification, rip, instr_len, &resume);
         break;
+    case EXIT_MTF: {
+        /* Monitor Trap Flag：嵌套 KVM 下实测不会发生，保留兜底。 */
+        if (vm_machine_profile_active(VM_PROFILE_WINDOWS) &&
+            g_win_trace_arm && g_win_trace_armed_mtf) {
+            win_trace_record(rip);
+            if (g_win_trace_budget > 0)
+                g_win_trace_budget--;
+            if (g_win_trace_budget == 0)
+                win_trace_dump();
+            resume = 1;
+        } else {
+            u64 ctl = vmx_vmcs_read(VMCS_SECONDARY_VM_EXEC_CONTROL);
+            vmx_vmcs_write(VMCS_SECONDARY_VM_EXEC_CONTROL,
+                           ctl & ~SEC_EXEC_MONITOR_TRAP_FLAG);
+            g_win_trace_armed_mtf = 0;
+            resume = 1;
+        }
+        break;
+    }
     case EXIT_INTERRUPT_WINDOW:
         INSTR_STAT_INC(intr_window);
         /* guest 刚开中断（RFLAGS.IF=1）：尝试注入 pending IRQ */
@@ -2305,6 +2567,21 @@ int vmexit_dispatch(void) {
             break;
         }
         if (msr == 0xC0000080ULL) { /* IA32_EFER */
+            if (vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
+                static u32 efer_logs;
+                if (efer_logs < 8) {
+                    efer_logs++;
+                    u64 cur = vmx_vmcs_read(VMCS_GUEST_IA32_EFER);
+                    u64 arg = (g_guest_regs.rax & 0xFFFFFFFFULL) |
+                              (g_guest_regs.rdx << 32);
+                    log_hex64("[WIN] efer op=",
+                              reason == EXIT_RDMSR ? 0 : 1);
+                    log_hex64("[WIN] efer rip=", rip);
+                    log_hex64("[WIN] efer val=",
+                              reason == EXIT_RDMSR ? cur : arg);
+                    log_hex64("[WIN] efer vmcs=", cur);
+                }
+            }
             if (reason == EXIT_RDMSR) {
                 u64 val = vmx_vmcs_read(VMCS_GUEST_IA32_EFER);
                 g_guest_regs.rax = val & 0xFFFFFFFFULL;
@@ -2371,6 +2648,7 @@ int vmexit_dispatch(void) {
         if (msr == 0x1A0 && vm_machine_profile_active(VM_PROFILE_WINDOWS)) {
             static u64 misc_enable;
             static int misc_valid;
+            static u32 misc_logs;
             if (reason == EXIT_RDMSR) {
                 u64 val = 0;
                 if (!misc_valid) {
@@ -2380,12 +2658,24 @@ int vmexit_dispatch(void) {
                     misc_valid = 1;
                 }
                 val = misc_enable;
+                if (misc_logs < 8) {
+                    misc_logs++;
+                    log_hex64("[WIN] misc rd idx=", misc_logs);
+                    log_hex64("[WIN] misc rd rip=", rip);
+                    log_hex64("[WIN] misc rd val=", val);
+                }
                 g_guest_regs.rax = val & 0xFFFFFFFFULL;
                 g_guest_regs.rdx = (val >> 32) & 0xFFFFFFFFULL;
             } else {
                 misc_enable = (g_guest_regs.rax & 0xFFFFFFFFULL) |
                               (g_guest_regs.rdx << 32);
                 misc_valid = 1;
+                if (misc_logs < 8) {
+                    misc_logs++;
+                    log_hex64("[WIN] misc wr idx=", misc_logs);
+                    log_hex64("[WIN] misc wr rip=", rip);
+                    log_hex64("[WIN] misc wr val=", misc_enable);
+                }
             }
             vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
             resume = 1;
@@ -2451,7 +2741,15 @@ int vmexit_dispatch(void) {
             }
             /* 不允许的写直接吞掉 */
             if (!allowed) {
-                log_hex64("[VMEXIT] WRMSR blocked msr=", msr);
+                static u32 blocked;
+                if (blocked < 8) {
+                    blocked++;
+                    log_hex64("[WIN] wrmsr blocked msr=", msr);
+                    log_hex64("[WIN] wrmsr blocked rip=", rip);
+                    log_hex64("[WIN] wrmsr blocked val=",
+                              (g_guest_regs.rax & 0xFFFFFFFFULL) |
+                              (g_guest_regs.rdx << 32));
+                }
             }
         }
         vmx_vmcs_write(VMCS_GUEST_RIP, rip + instr_len);
@@ -2483,7 +2781,7 @@ int vmexit_dispatch(void) {
     /* resume 前例行工作：仅在继续跑 guest 时注入 IRQ / 轮询设备。
      * 不要在 HLT/timeslice 归还 host 时调用——那会在 host 栈上走 guest
      * virtio poll，已触发 CR2=3 的 host #PF。下次 linux_resume 入口再准备。 */
-    if (resume) {
+    if (resume && !skip_pre_resume) {
         INSTR_STAT_INC(pre_resume);
         vmexit_before_resume();
     }

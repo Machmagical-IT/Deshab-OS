@@ -10,7 +10,8 @@ LDFLAGS := -nostdlib -static -pie -z max-page-size=0x1000 -T linker.ld
 C_SOURCES := main.c input.c wm.c compositor.c apps_builtin.c appreg.c \
              launcher.c lxc.c shell.c pages.c f32io.c ascii_font.c zhfont.c \
              wallpaper.c taskbar.c textures.c prank.c files.c \
-             launchpad.c aqua_draw.c dock.c menubar.c glass.c motion.c blit.c
+             launchpad.c aqua_draw.c dock.c menubar.c glass.c guest_banner.c \
+             motion.c blit.c
 OBJECTS := $(C_SOURCES:.c=.o)
 
 .PHONY: all clean

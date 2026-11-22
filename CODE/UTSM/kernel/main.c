@@ -20,6 +20,9 @@
 #include "../arch/x86_64/limine.h"
 #include <utsm/boot_status.h>
 #include <utsm/lapic_timer.h>
+#include <utsm/smp.h>
+#include <utsm/gdt.h>
+#include <utsm/percpu.h>
 #include "../pe/pe_dll_manager.h"
 
 void arch_halt_forever(void);
@@ -254,6 +257,9 @@ void kernel_main(void) {
     serial_init();
     log_info("[UTSM] boot");
 
+    /* R5：per-CPU 表 + GS_BASE 最先就绪（其后 any 代码可安全用 this_cpu） */
+    smp_early_init();
+
     /* ==== 真机硬件特征早期检测 (在任何初始化之前) ====
      * 检测项目:
      *   1. CPU vendor (GenuineIntel / AuthenticAMD / etc.)
@@ -346,6 +352,8 @@ void kernel_main(void) {
     /* ---- 插桩: IDT 初始化耗时 ---- */
     INSTR_TS_DECL(ts_idt);
     INSTR_TS_BEGIN(ts_idt);
+    /* R5：内核自持 GDT（AP 与 BSP 一致），再装 IDT */
+    gdt_init();
     idt_init();
     INSTR_TS_END(ts_idt, "idt_init");
 
@@ -452,20 +460,60 @@ void kernel_main(void) {
     INSTR_TS_DECL(ts_dkm);
     INSTR_TS_BEGIN(ts_dkm);
     dkm_init();
-    boot_status_register();
+    /* 服务总线在 dkm_fill_platform_info 内才挂入 kernel_api.bus；
+     * kern.boot.dismiss 必须在其之后注册，否则 boot_status_register 静默
+     * 返回，session 侧 probe 永远失败。 */
     dkm_fill_platform_info();
+    boot_status_register();
     /* 转圈任务从此和启动主流程并发。guest 运行期间把主机定时器罩住，
      * 避免 LAPIC tick 把 guest 打成 external-interrupt 退出风暴。 */
     boot_status_spawn();
     INSTR_TS_END(ts_dkm, "dkm_init");
 
+    /* === R5：SMP bringup（调度器多核） ===
+     * 放在 dkm 之后：AP 只需要 GDT/IDT/arena/调度器结构，不需要驱动。
+     * FUCK [sched] smp=0 或不满足多核条件 → 单核路径（行为与今日等价）。
+     * 双 guest 后台模式优先占用 AP：此时不把 AP 交给调度器。 */
+    int want_guest_background =
+        ini_get_bool(cfg, "boot", "vmm", 1) &&
+        ini_get_bool(cfg, "boot", "smp", 1) &&
+        ini_get_bool(cfg, "boot", "guest_background", 1) &&
+        (ini_get_bool(cfg, "boot", "linux_guest", 1) ||
+         ini_get_bool(cfg, "boot", "windows_guest", 0));
+    {
+        int s_smp = ini_get_bool(cfg, "sched", "smp", 1);
+        u32 s_ap_to = (u32)ini_get_int(cfg, "sched", "ap_timeout_ms", 1000);
+        int s_migrate = ini_get_bool(cfg, "sched", "migrate_drv_tasks", 0);
+        utsm_sched_set_migrate_drv(s_migrate);
+        if (want_guest_background) {
+            log_info("[SMP] AP reserved for background guest runner");
+            attest_report("smp", "SMP-E10", 1);
+        } else if (s_smp) {
+            int aps = smp_bringup_all(s_ap_to);
+            if (aps < 0) {
+                panic_full("SMP-E07 SMP BRINGUP FAILED",
+                           "smp_bringup_all reported failure", 0);
+            }
+            /* 单核（MADT 只有 1 个 CPU）是设计内回退，同样记就绪 */
+            attest_report("smp", "SMP-E10", smp_is_enabled() || smp_cpu_count() <= 1);
+        } else {
+            log_info("[SMP] disabled by FUCK [sched] smp=0");
+            attest_report("smp", "SMP-E10", 1);   /* 显式关多核：单核路径合法 */
+        }
+    }
+
     /* === VMM — 可通过 FUCK [boot] vmm=0 跳过 ===
      * P8.4: Moved BEFORE DKM driver loading so VMM self-test runs even if
      * a stage2 driver (e.g. fat32) crashes under KVM nested VMX. */
     int run_vmm = ini_get_bool(cfg, "boot", "vmm", 1);
+    /* 后台 guest 模式：BSP 只做 VMM 自检，Linux/Windows 装载移交 AP
+     * （session.drv → kern.guest.start）。smp=0 / guest_background=0 时
+     * 保持旧的进桌面前同步装载路径。 */
+    int guest_background_mode = 0;
     g_vmm_init_ok = 0;
     if (run_vmm && vmm_init() == 0) {
         g_vmm_init_ok = 1;
+        guest_background_mode = want_guest_background && !smp_is_enabled();
         INSTR_TS_DECL(ts_vmm);
         INSTR_TS_BEGIN(ts_vmm);
         log_info("[UTSM] VMM init ok");
@@ -485,6 +533,7 @@ void kernel_main(void) {
             INSTR_TS_END(ts_vmm, "vmm_init+selftest");
             log_info("[UTSM] VMM self-test PASS");
 
+            if (!guest_background_mode) {
             /* Only pci+ahci before linux_launch. Loading apic/stage0 first
              * left the guest in an IDTR=0 VM-exit storm. Remaining DKM
              * still loads after the guest parks.
@@ -512,9 +561,11 @@ void kernel_main(void) {
                 int launched = 0;
                 if (ipc_shm_init() == 0) {
                     log_info("[UTSM] IPC shm init ok");
+                    smp_park_aps();          /* R5：guest 独占 BSP，AP 停驻 */
                     lapic_irq_quiesce(1);
                     lin_st = linux_launch();
                     lapic_irq_quiesce(0);
+                    smp_resume_aps();
                     __asm__ volatile("sti" ::: "memory");
                     launched = 1;
                 } else {
@@ -566,9 +617,11 @@ void kernel_main(void) {
                 } else {
                     log_info("[UTSM] Windows guest prepared (launch on request)");
                     if (ini_get_bool(cfg, "boot", "windows_autostart", 0)) {
+                        smp_park_aps();
                         lapic_irq_quiesce(1);
                         int win_st = windows_guest_launch();
                         lapic_irq_quiesce(0);
+                        smp_resume_aps();
                         __asm__ volatile("sti" ::: "memory");
                         if (win_st != 0) {
                             panic_full("WIN-E24 WINDOWS AUTOSTART FAILED",
@@ -579,6 +632,7 @@ void kernel_main(void) {
             } else {
                 log_info("[UTSM] Windows guest disabled by FUCK (windows_guest=0)");
             }
+            }   /* !guest_background_mode（同步 guest 路径） */
         } else {
             INSTR_TS_END(ts_vmm, "vmm_init+selftest");
             log_error("[UTSM] VMM self-test FAIL");
@@ -587,6 +641,7 @@ void kernel_main(void) {
                        "VMM self-test failed (non-zero status)", 0);
         }
 
+        if (!guest_background_mode) {
         /* === OpenXJ380 guest — 可通过 FUCK [boot] xj380_guest=0 跳过 ===
          * 三内核架构路线 B：XJ380 作为第二 guest（与 Linux 并列）。
          * 严格错误策略：xj380_guest=1 即"请求了 guest"——模块缺失或
@@ -600,9 +655,11 @@ void kernel_main(void) {
             INSTR_TS_DECL(ts_xj380);
             INSTR_TS_BEGIN(ts_xj380);
             log_info("[UTSM] XJ380 loader init ok");
+            smp_park_aps();
             lapic_irq_quiesce(1);
             int xj_st = xj380_launch();
             lapic_irq_quiesce(0);
+            smp_resume_aps();
             __asm__ volatile("sti" ::: "memory");
             INSTR_TS_END(ts_xj380, "xj380_launch");
             if (xj_st == 0) {
@@ -631,9 +688,11 @@ void kernel_main(void) {
             INSTR_TS_DECL(ts_zt5);
             INSTR_TS_BEGIN(ts_zt5);
             log_info("[UTSM] ZT5 loader init ok");
+            smp_park_aps();
             lapic_irq_quiesce(1);
             int zst = zt5_launch();
             lapic_irq_quiesce(0);
+            smp_resume_aps();
             __asm__ volatile("sti" ::: "memory");
             INSTR_TS_END(ts_zt5, "zt5_launch");
             if (zst == 0) {
@@ -646,6 +705,7 @@ void kernel_main(void) {
         } else {
             log_info("[UTSM] ZT5 guest disabled by FUCK ([zt5] enable=0)");
         }
+        }   /* !guest_background_mode（XJ380/ZT5） */
     } else {
         log_warn("[UTSM] VMM unavailable (VMX not supported or disabled by FUCK)");
     }

@@ -2,6 +2,7 @@
 #include <utsm/types.h>
 #include <utsm/panic.h>
 #include <utsm/drr.h>
+#include <utsm/smp.h>
 
 /* ===================================================================
  *  F1: machmagic 崩溃屏（panic_full）
@@ -67,9 +68,9 @@ static int g_panic_fallback;
 static u32 g_panic_fallback_hits;
 
 void panic_set_fallback(int enable) {
-    (void)enable;
-    g_panic_fallback = 0;
-    log_info("[PANIC] mode=strict (fallback ignored, bug points halt)");
+    g_panic_fallback = enable ? 1 : 0;
+    log_info(g_panic_fallback ? "[PANIC] mode=fallback (panic points take backup paths)"
+                              : "[PANIC] mode=strict (zero degradation)");
 }
 
 int panic_fallback_enabled(void) {
@@ -81,12 +82,22 @@ u32 panic_fallback_hits(void) {
 }
 
 void panic_full(const char *symbol, const char *msg, const panic_regs *regs) {
+    if (g_panic_fallback && !regs) {
+        g_panic_fallback_hits++;
+        log_warn("[PANIC:FALLBACK] panic point hit, taking backup path");
+        if (symbol) log_warn(symbol);
+        if (msg) log_warn(msg);
+        log_hex64("[PANIC:FALLBACK] hits=", g_panic_fallback_hits);
+        return;
+    }
     panic_halt(symbol, msg, regs);
 }
 
 /* ---- DRR 归档（drr.h 声明，drr_stub.c 提供；未初始化时返回 -1） ---- */
 
 void panic_halt(const char *symbol, const char *msg, const panic_regs *regs) {
+    /* R5：先让其它 CPU 停下（避免它们继续推进状态/抢串口） */
+    smp_halt_others();
     log_error("[PANIC] ==========================================");
     log_error("[PANIC] panic_full: machmagic");
     if (symbol) { log_error("[PANIC] symbol:"); log_error(symbol); }

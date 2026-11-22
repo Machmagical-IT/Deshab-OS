@@ -105,7 +105,9 @@ static void linux_vmcs_setup_host_state(void) {
     vmx_vmcs_write(VMCS_HOST_FS_SELECTOR, 0);
     vmx_vmcs_write(VMCS_HOST_GS_SELECTOR, 0);
     vmx_vmcs_write(VMCS_HOST_FS_BASE, 0);
-    vmx_vmcs_write(VMCS_HOST_GS_BASE, 0);
+    /* host GS 必须是本 CPU 的 per-CPU 基址；写 0 会让 VM-Exit 后
+     * smp_current_cpu()/%gs 访问地址 0（AP guest 路径必炸）。 */
+    vmx_vmcs_write(VMCS_HOST_GS_BASE, vmx_read_msr(0xC0000101));
 
     /* Host GDT/IDT + TR */
     {

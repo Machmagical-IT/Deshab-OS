@@ -63,7 +63,7 @@ static void zt5_vmcs_setup_host_state(void) {
     vmx_vmcs_write(VMCS_HOST_FS_SELECTOR, 0);
     vmx_vmcs_write(VMCS_HOST_GS_SELECTOR, 0);
     vmx_vmcs_write(VMCS_HOST_FS_BASE, 0);
-    vmx_vmcs_write(VMCS_HOST_GS_BASE, 0);
+    vmx_vmcs_write(VMCS_HOST_GS_BASE, vmx_read_msr(0xC0000101));
     {
         struct __attribute__((packed)) { u16 limit; u64 base; } gdtr, idtr;
         __asm__ volatile("sgdt %0" : "=m"(gdtr));

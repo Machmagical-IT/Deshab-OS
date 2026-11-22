@@ -92,7 +92,11 @@ static __inline__ int dkm_input_kbd(dkm_input *in, u8 *sc) {
     return 1;
 }
 
-/* 有新鼠标数据包时返回 1，并给出相对上一次的增量与当前按钮位。 */
+/* 有新鼠标数据包时返回 1，并给出相对上一次的增量与当前按钮位。
+ * 注意：dx/dy 只是"驱动坐标的变化量"（VSCode 转发等场景需要）；光标定位
+ * 应直接使用 in->mouse_x / in->mouse_y（驱动绝对坐标，唯一真值）——
+ * 相对包模式下驱动从 fb 中心起步并自行钳位，消费方再把差分累加到自己的
+ * 起点会因原点不同而永远到不了屏幕下半/右半。 */
 static __inline__ int dkm_input_mouse_step(dkm_input *in,
                                            int *dx, int *dy, u32 *buttons) {
     dkm_input_mouse m;

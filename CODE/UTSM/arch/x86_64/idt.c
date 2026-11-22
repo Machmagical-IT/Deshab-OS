@@ -474,6 +474,18 @@ static void idt_set_entry(u8 vector, void *handler, u8 ist, u8 type) {
     g_idt[vector].reserved     = 0;
 }
 
+void idt_reload(void) {
+    idt_ptr idtr;
+    idtr.limit = (u16)(sizeof(g_idt) - 1);
+    idtr.base  = (u64)&g_idt;
+    __asm__ volatile ("lidt %0" :: "m"(idtr));
+}
+
+/* R5：AP 入口加载同一张 IDT（表内容全局一致，各 CPU 只是重装 IDTR）。 */
+void idt_load_this_cpu(void) {
+    idt_reload();
+}
+
 void idt_init(void) {
     log_info("[IDT] init begin");
 
@@ -481,11 +493,7 @@ void idt_init(void) {
         idt_set_entry((u8)i, g_isr_table[i], 0, 0x8E);  /* present, ring0, 64-bit interrupt gate */
     }
 
-    idt_ptr idtr;
-    idtr.limit = (u16)(sizeof(g_idt) - 1);
-    idtr.base  = (u64)&g_idt;
-
-    __asm__ volatile ("lidt %0" :: "m"(idtr));
+    idt_reload();
 
     pic_remap();
     log_info("[IDT] PIC remapped (master=0x20 slave=0x28)");

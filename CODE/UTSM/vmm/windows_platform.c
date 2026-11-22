@@ -105,9 +105,14 @@ static void pci_config_write(u8 bus, u8 dev, u8 fn, u8 reg, u32 value) {
 #define WIN_VBLK_QSZ 64u
 
 static u32 g_disk_reads;
+static u32 g_disk_writes;
 
 u32 windows_platform_disk_reads(void) {
     return g_disk_reads;
+}
+
+u32 windows_platform_disk_writes(void) {
+    return g_disk_writes;
 }
 
 static int gpa_copy(u64 gpa, u8 *host, u32 len, int to_guest) {
@@ -139,6 +144,7 @@ static void virtio_blk_complete(void) {
     if (gpa_copy(avail + 2, (u8 *)&avail_idx, 2, 0) != 0) return;
     u8 *image = (u8 *)info->esp_image;
     static u32 reads;
+    static u32 writes;
     while (g_pc.vblk_last_avail != avail_idx) {
         u16 slot = g_pc.vblk_last_avail % WIN_VBLK_QSZ;
         u16 head = 0;
@@ -190,6 +196,7 @@ static void virtio_blk_complete(void) {
         for (u32 b = 0; b < 8; b++) sector |= (u64)hdr[8 + b] << (b * 8);
         u64 off = sector * 512u;
         u32 data_len = 0;
+        u32 why = 0;   /* 0=ok 1=hdr<16 2=frags>8 3=越界 4=方向不匹配 5=拷贝失败 */
         int data_write = frags > 0 && frags <= 8;
         if (data_write) {
             for (u32 f = 0; f < frags; f++) {
@@ -198,8 +205,10 @@ static void virtio_blk_complete(void) {
                 if (type == 1 && frag_wr[f]) data_write = 0;
             }
         }
-        if (hdr_len >= 16 && frags <= 8 &&
-            off + data_len <= info->esp_image_size) {
+        if (hdr_len < 16) why = 1;
+        else if (frags > 8) why = 2;
+        else if (off + data_len > info->esp_image_size) why = 3;
+        if (!why) {
             if (type == 0 && data_write) {
                 u64 cursor = off;
                 int copied = 1;
@@ -215,8 +224,7 @@ static void virtio_blk_complete(void) {
                     status = 0;
                     reads++;
                     g_disk_reads = reads;
-                    if (reads <= 24 || reads == 32 || reads == 64 ||
-                        reads == 256 || reads == 1024) {
+                    if (reads <= 4096) {
                         log_hex64("[WIN] disk n=", reads);
                         log_hex64("[WIN] disk lba=", sector);
                         log_hex64("[WIN] disk len=", data_len);
@@ -238,6 +246,8 @@ static void virtio_blk_complete(void) {
                             }
                         }
                     }
+                } else {
+                    why = 5;
                 }
             } else if (type == 1 && data_write) {
                 u64 cursor = off;
@@ -250,7 +260,18 @@ static void virtio_blk_complete(void) {
                     }
                     cursor += frag_len[f];
                 }
-                if (copied) status = 0;
+                if (copied) {
+                    status = 0;
+                    writes++;
+                    g_disk_writes = writes;
+                    if (writes <= 256) {
+                        log_hex64("[WIN] disk wr n=", writes);
+                        log_hex64("[WIN] disk wr lba=", sector);
+                        log_hex64("[WIN] disk wr len=", data_len);
+                    }
+                } else {
+                    why = 5;
+                }
             } else if ((type == 4 || type == 8) && data_len == 0) {
                 status = 0;
             } else if (type == 8 && data_write && frags) {
@@ -265,13 +286,16 @@ static void virtio_blk_complete(void) {
                 status = 0;
             } else if (type == 4) {
                 status = 0;
+            } else {
+                why = 4;
             }
         }
         if (status != 0) {
             static u32 fails;
-            if (fails < 12) {
+            if (fails < 64) {
                 fails++;
                 log_hex64("[WIN] disk fail n=", fails);
+                log_hex64("[WIN] disk fail why=", why);
                 log_hex64("[WIN] disk fail type=", type);
                 log_hex64("[WIN] disk fail lba=", sector);
                 log_hex64("[WIN] disk fail meta=",

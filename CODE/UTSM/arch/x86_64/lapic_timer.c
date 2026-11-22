@@ -33,12 +33,17 @@ extern u8 inb(u16 port);
 #define LAPIC_DIV_CONF   0x3E0u
 #define LAPIC_INIT_CNT   0x380u
 #define LAPIC_CUR_CNT    0x390u
+#define LAPIC_ID         0x020u
+#define LAPIC_ICR_LOW    0x300u
+#define LAPIC_ICR_HIGH   0x310u
 
 #define LVT_MASK   (1u << 16)
 #define LVT_PERIODIC (1u << 17)
 
 static volatile u32 *g_lapic = 0;
 static int g_timer_vector = -1;
+static u32 g_init_count = 0;      /* BSP 校准得到的周期计数值（AP 复用） */
+static int g_calibrated = 0;
 
 static inline u64 rdmsr_(u32 msr) {
     u32 lo, hi;
@@ -155,6 +160,8 @@ int lapic_timer_init(u32 freq_hz) {
     lapic_write(LAPIC_LVT_TIMER,
                 ((u32)g_timer_vector & 0xFFu) | LVT_MASK | LVT_PERIODIC);
     lapic_write(LAPIC_INIT_CNT, (u32)init);
+    g_init_count = (u32)init;
+    g_calibrated = 1;
 
     log_info("[LAPIC] timer calibrated");
     log_hex64("[LAPIC]   ticks/10ms=", delta);
@@ -224,4 +231,70 @@ void lapic_irq_quiesce(int on) {
         lapic_write(LAPIC_LVT0, g_saved_lvt0);
         g_lvt_saved = 0;
     }
+}
+
+/* ===================================================================
+ *  R5：每 CPU LAPIC timer / IPI
+ * =================================================================== */
+
+int lapic_timer_ready(void) {
+    return g_calibrated && g_lapic && g_timer_vector >= 0;
+}
+
+void lapic_timer_this_cpu_init(void) {
+    if (!g_lapic || g_timer_vector < 0) return;
+
+    /* SVR 软件使能（bit8），保留既有向量 */
+    u32 svr = lapic_read(LAPIC_SPURIOUS);
+    if (!(svr & 0x100u)) {
+        u8 vec = (u8)(svr & 0xFFu);
+        if (vec == 0) vec = 0xFFu;
+        lapic_write(LAPIC_SPURIOUS, (u32)vec | 0x100u);
+    }
+    lapic_write(LAPIC_TPR, 0);
+
+    /* 复用 BSP 校准值（同一总线时钟；QEMU/真机均成立） */
+    u32 init = g_init_count;
+    if (init == 0) init = 1;
+    lapic_write(LAPIC_DIV_CONF, 0x3);
+    lapic_write(LAPIC_LVT_TIMER,
+                ((u32)g_timer_vector & 0xFFu) | LVT_MASK | LVT_PERIODIC);
+    lapic_write(LAPIC_INIT_CNT, init);
+}
+
+void lapic_timer_this_cpu_start(void) {
+    if (!g_lapic || g_timer_vector < 0) return;
+    lapic_write(LAPIC_LVT_TIMER,
+                ((u32)g_timer_vector & 0xFFu) | LVT_PERIODIC);
+}
+
+void lapic_timer_this_cpu_stop(void) {
+    if (!g_lapic) return;
+    lapic_write(LAPIC_LVT_TIMER, lapic_read(LAPIC_LVT_TIMER) | LVT_MASK);
+    lapic_write(LAPIC_INIT_CNT, 0);
+}
+
+void lapic_send_ipi(u32 apic_id, u8 vector) {
+    /* 固定投递（000）+ 物理目的（0）+ 边沿（0）+ assert（bit14=1） */
+    lapic_send_icr(apic_id, (u32)vector | (1u << 14));
+}
+
+void lapic_send_icr(u32 apic_id, u32 icr_low) {
+    if (!g_lapic) return;
+    /* 等上一次投递完成（Delivery Status bit12 = 0） */
+    u32 spins = 0;
+    while ((lapic_read(LAPIC_ICR_LOW) & (1u << 12)) && spins < 100000u) {
+        __asm__ volatile("pause");
+        spins++;
+    }
+    lapic_write(LAPIC_ICR_HIGH, (apic_id & 0xFFu) << 24);
+    lapic_write(LAPIC_ICR_LOW, icr_low);
+}
+
+u32 lapic_id_this_cpu(void) {
+    if (g_lapic) return (lapic_read(LAPIC_ID) >> 24) & 0xFFu;
+    u32 a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    (void)a; (void)c; (void)d;
+    return (b >> 24) & 0xFFu;
 }

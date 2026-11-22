@@ -221,6 +221,11 @@ static void launch_elf_data(u8 *data, u32 size, int app_id) {
 }
 
 void launch_external_elf(const char *name11) {
+#ifdef DESHAB_HOST
+    /* 宿主演示：外部 .elf 依赖裸机地址空间，不能在本进程内执行 */
+    host_demo_unapp(name11);
+    return;
+#else
     u8 *data = 0; u32 size = 0;
     if (f32_read_root_file_w(name11, &data, &size) != 0) {
         slog("elf not found");
@@ -228,10 +233,15 @@ void launch_external_elf(const char *name11) {
         return;
     }
     launch_elf_data(data, size, -1);
+#endif
 }
 
 /* M3: 按路径启动外部 ELF（STARTMENU.CNF 的 bin/xxx.elf 条目） */
 void launch_external_elf_path(const char *path) {
+#ifdef DESHAB_HOST
+    host_demo_unapp(path);
+    return;
+#else
     u8 *data = 0; u32 size = 0;
     if (f32_read_path_lfn_w(path, &data, &size) != 0) {
         slog("elf path not found");
@@ -240,6 +250,7 @@ void launch_external_elf_path(const char *path) {
         return;
     }
     launch_elf_data(data, size, -1);
+#endif
 }
 
 /* 按内部名启动（串口验证通道用）；返回 1 = 已发起 */
@@ -316,6 +327,15 @@ void launch_app(int app_id) {
         return;
     }
     app_descriptor *app = &g_apps[app_id];
+
+#ifdef DESHAB_HOST
+    /* 宿主演示：外部 ELF / PE / Linux guest 应用无法在宿主进程内执行，
+     * 统一给出提示并返回；内置应用（on_create 回调）保持完整功能。 */
+    if (app->elf_path || app->elf_name || app->pe_file || app->linux_path) {
+        host_demo_unapp(app->name ? app->name : "app");
+        return;
+    }
+#endif
 
     /* VSCode Phase 5: Linux guest 应用走 exec_async 共享启动路径 */
     if (app->linux_path) {

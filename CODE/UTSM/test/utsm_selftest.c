@@ -353,6 +353,18 @@ int utsm_selftest_run(void) {
         log_info("[SCHED] selftest: block/wake PASS");
     }
 
+    /* ==== DRR-0: CRC64 参考向量（CRC-64/XZ） ==== */
+    {
+        u64 kat = drr_crc64("123456789", 9);
+        if (kat != 0x995DC9BBDF1939FAULL) {
+            log_hex64("[DRR] crc64 kat=", kat);
+            panic_full("TST-E45 DRR CRC64 KAT FAIL",
+                       "utsm_selftest: CRC64 table/poly mismatch (expect 995DC9BBDF1939FA)", 0);
+            return UTSM_ERR_INVALID;
+        }
+        log_info("[DRR] crc64 KAT ok");
+    }
+
     /* ==== DRR-1: 真实脏页快照 + 页级回滚 ====
      * 写 P1 → 快照（捕获 P1 密文页）→ 写 P2 覆盖 → 回滚 → 读回 P1 */
     {
@@ -381,6 +393,19 @@ int utsm_selftest_run(void) {
             panic_full("TST-E30 DRR META VERIFY FAILED",
                        "utsm_selftest: checkpoint meta verify failed", 0);
             return UTSM_ERR_INVALID;
+        }
+        /* 最新槽必须被选中（而不是永远回退到旧槽） */
+        {
+            u32 cur_slot = drr_test_active_slot();
+            u64 slot_seq = drr_test_slot_seq(cur_slot);
+            if (meta.seq == 0 || meta.seq != slot_seq) {
+                log_hex64("[DRR] meta seq=", meta.seq);
+                log_hex64("[DRR] slot seq=", slot_seq);
+                panic_full("TST-E46 DRR NEWEST SLOT NOT SELECTED",
+                           "utsm_selftest: recover did not select the newest committed slot", 0);
+                return UTSM_ERR_INVALID;
+            }
+            log_hex64("[DRR] active slot seq=", slot_seq);
         }
         status = utsm_write(cap, 512, p2, plen);
         if (status != UTSM_OK) {
@@ -514,16 +539,45 @@ int utsm_selftest_run(void) {
                        "utsm_selftest: A/B fallback to old stable slot failed", 0);
             return UTSM_ERR_INVALID;
         }
+        /* 元数据 fallback 成功，但旧槽与数据区代际不同：必须拒绝恢复。
+         * 关闭复位（dry-run），断言返回 -5 且内存未被改写。 */
+        drr_set_reboot_enabled(0);
         int rb = drr_rollback_system();
+        log_hex64("[DRR] stale system rollback rc=", (u64)(i64)rb);
+        if (rb != -5) {
+            drr_set_reboot_enabled(1);
+            log_error("[DRR] stale snapshot accepted");
+            panic_full("TST-E47 DRR STALE SNAPSHOT ACCEPTED",
+                       "utsm_selftest: inconsistent metadata/region must be rejected with -5", 0);
+            return UTSM_ERR_INVALID;
+        }
+        status = utsm_read(cap, 512, readback, vlen);
+        if (status != UTSM_OK || memcmp(readback, v5, vlen) != 0) {
+            drr_set_reboot_enabled(1);
+            log_error("[DRR] stale rollback wrote memory");
+            panic_full("TST-E47 DRR STALE SNAPSHOT ACCEPTED",
+                       "utsm_selftest: stale rollback must not modify pages", 0);
+            return UTSM_ERR_INVALID;
+        }
+        /* 重新快照让槽与数据区同代际，正常路径恢复 V5 */
+        if (drr_ckpt_snapshot_dirty() < 1) {
+            drr_set_reboot_enabled(1);
+            panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
+                       "utsm_selftest: system rollback realign snapshot failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        rb = drr_rollback_system();
         log_hex64("[DRR] system rollback pages=", (u64)(i64)rb);
         if (rb < 1) {
+            drr_set_reboot_enabled(1);
             log_error("[DRR] selftest system rollback failed");
             panic_full("TST-E42 SYSTEM ROLLBACK FAILED",
                        "utsm_selftest: system-level rollback failed", 0);
             return UTSM_ERR_INVALID;
         }
         status = utsm_read(cap, 512, readback, vlen);
-        if (status != UTSM_OK || memcmp(readback, v4, vlen) != 0) {
+        if (status != UTSM_OK || memcmp(readback, v5, vlen) != 0) {
+            drr_set_reboot_enabled(1);
             log_error("[DRR] system rollback verify FAIL");
             panic_full("TST-E43 SYSTEM ROLLBACK VERIFY FAIL",
                        "utsm_selftest: system rollback verify mismatch", 0);
@@ -532,19 +586,77 @@ int utsm_selftest_run(void) {
         /* 系统继续跑：回滚后正常写读 */
         status = utsm_write(cap, 512, v6, vlen);
         if (status != UTSM_OK) {
+            drr_set_reboot_enabled(1);
             panic_full("TST-E44 POST-ROLLBACK LIVENESS FAIL",
                        "utsm_selftest: post-rollback write failed", 0);
             return status;
         }
         status = utsm_read(cap, 512, readback, vlen);
         if (status != UTSM_OK || memcmp(readback, v6, vlen) != 0) {
+            drr_set_reboot_enabled(1);
             log_error("[DRR] post-rollback liveness FAIL");
             panic_full("TST-E44 POST-ROLLBACK LIVENESS FAIL",
                        "utsm_selftest: post-rollback readback mismatch", 0);
             return UTSM_ERR_INVALID;
         }
+        drr_set_reboot_enabled(1);
+        log_info("[DRR] stale snapshot rejected on fallback");
         log_info("[DRR] system rollback verify ok");
         log_info("[DRR] post-rollback liveness ok");
+    }
+
+    /* ==== DRR-5: 槽元数据与快照区代际不一致必须拒绝 ====
+     * 单快照区下，旧槽元数据不能安全回滚新数据区；rollback 必须返回 -2
+     * 且不写任何页，随后用新快照把槽与数据区重新对齐。 */
+    {
+        const char *w5 = "DRR5-REGION-GEN-STATE";
+        u64 wlen = strlen(w5) + 1;
+        status = utsm_write(cap, 512, w5, wlen);
+        if (status != UTSM_OK) {
+            panic_full("TST-E47 DRR STALE SNAPSHOT ACCEPTED",
+                       "utsm_selftest: DRR-5 pre write failed", 0);
+            return status;
+        }
+        if (drr_ckpt_snapshot_dirty() < 1) {
+            panic_full("TST-E47 DRR STALE SNAPSHOT ACCEPTED",
+                       "utsm_selftest: DRR-5 snapshot failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        drr_test_bump_region_gen();       /* 制造 generation 不一致 */
+        int rb = drr_rollback_pages();
+        if (rb != -2) {
+            log_hex64("[DRR] stale rollback rc=", (u64)(i64)rb);
+            panic_full("TST-E47 DRR STALE SNAPSHOT ACCEPTED",
+                       "utsm_selftest: generation mismatch must be rejected with -2", 0);
+            return UTSM_ERR_INVALID;
+        }
+        status = utsm_read(cap, 512, readback, wlen);
+        if (status != UTSM_OK || memcmp(readback, w5, wlen) != 0) {
+            panic_full("TST-E47 DRR STALE SNAPSHOT ACCEPTED",
+                       "utsm_selftest: stale rollback must not modify pages", 0);
+            return UTSM_ERR_INVALID;
+        }
+        /* 新快照覆盖区域头，槽与数据区重新同代际 */
+        if (drr_ckpt_snapshot_dirty() < 0) {
+            panic_full("TST-E47 DRR STALE SNAPSHOT ACCEPTED",
+                       "utsm_selftest: DRR-5 realign snapshot failed", 0);
+            return UTSM_ERR_INVALID;
+        }
+        log_info("[DRR] stale snapshot rejected");
+    }
+
+    /* ==== SMP-1（R5）：双 CPU 并发 + 1000 帧无双重执行 ====
+     * 单核（MADT 只报 1 个 CPU）属设计内回退，utsm_sched_selftest_smp
+     * 内部打印 skipped 并返回 0。 */
+    {
+        extern int utsm_sched_selftest_smp(void);
+        int s = utsm_sched_selftest_smp();
+        if (s != 0) {
+            log_hex64("[SCHED] smp selftest rc=", (u64)(i64)s);
+            panic_full("TST-E51 SMP SELFTEST FAILED",
+                       "utsm_selftest: smp selftest returned non-zero", 0);
+            return UTSM_ERR_INVALID;
+        }
     }
 
     return UTSM_OK;

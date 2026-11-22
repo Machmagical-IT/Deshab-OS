@@ -1,0 +1,10 @@
+#include <windows.h>
+
+/* 窗口/任务栏图标 */
+200 ICON "deshab.ico"
+
+/* 1 24 = RT_MANIFEST（DPI 感知） */
+1 24 "demo.manifest"
+
+/* 内嵌最小 FAT32 卷：真实壁纸/字库/FUCK/菜单注册表（由 build_esp.sh 生成） */
+301 RCDATA "esp.img"

@@ -350,17 +350,18 @@ static void dg_write_gpt(struct dg_disk *d, u64 esp_sz, u64 data_sz, u64 win_sz,
 /* ---------------- FAT32 ---------------- */
 
 static u32 dg_fat_secs(u32 reserved, u32 fats, u32 spc, u32 total) {
-    u32 fat = 1;
-    for (int n = 0; n < 16; n++) {
-        u32 data, clusters, need;
-        if (reserved + fats * fat >= total) return 0;
-        data = reserved + fats * fat;
-        clusters = (total - data) / spc;
-        need = ((clusters + 2u) * 4u + 511u) / 512u;
-        if (need < 1) need = 1;
-        if (need <= fat) return fat;
-        fat = need;
-    }
+    u64 numer, denom;
+    u32 fat;
+    if (total <= reserved) return 0;
+    /* 精确解不动点 fat = ceil((clusters+2)*4/512)，clusters 由 fat 自身决定：
+     *   fat*512*spc >= (total - reserved - fats*fat + 2*spc) * 4
+     * 旧实现从 fat=1 迭代，首次估算的 need 偏大后直接返回过冲值
+     * （7GiB ESP 上多算 112 个 FAT 扇区），使小增量扩容被元数据吃掉。 */
+    numer = 4ull * (u64)(total - reserved) + 8ull * spc;
+    denom = 512ull * spc + 4ull * fats;
+    fat = (u32)((numer + denom - 1ull) / denom);
+    if (fat < 1) fat = 1;
+    if (reserved + fats * fat >= total) return 0;
     return fat;
 }
 
@@ -459,12 +460,27 @@ static int dg_grow_fat32(u32 dev, u64 part, u64 part_secs) {
         if (old_data > old_total || new_data >= fs_total) dg_panic("FIRSTI-E13 FAT32 LAYOUT");
         old_clusters = (old_total - old_data) / spc;
         new_clusters = (fs_total - new_data) / spc_new;
-        if (new_clusters < 0x0FFFFFF0u - 2u && new_clusters >= old_clusters) break;
-        if (spc_new >= 128u) dg_panic("FIRSTI-E13 FAT32 FORMAT MAX");
-        spc_new *= 2u;
+        /* 只有 FAT32 簇号上限才需要加粗簇。加粗必然减少簇数，
+         * 不能把它当成"扩容量"的手段（旧实现在这里死循环到 128 后 panic）。 */
+        if (new_clusters >= 0x0FFFFFF0u - 2u) {
+            if (spc_new >= 128u) dg_panic("FIRSTI-E13 FAT32 FORMAT MAX");
+            spc_new *= 2u;
+            continue;
+        }
+        if (spc_new == spc && new_clusters < old_clusters) {
+            /* 分区只比 VBR total 多几十个扇区，FAT 元数据增长就吃掉增量：
+             * 强行扩容会丢簇，保持当前文件系统尺寸（分区留空几十扇区）。 */
+            dg_note("ESP growth below FAT32 resize threshold; keep current size");
+            return 0;
+        }
+        break;
     }
     if (new_data < old_data) dg_panic("FIRSTI-E13 FAT32 FAT SHRANK");
-    if ((u64)old_clusters * spc_new + new_data > fs_total) dg_panic("FIRSTI-E13 FAT32 SHIFT");
+    if ((u64)old_clusters * spc_new + new_data > fs_total) {
+        /* 加粗簇后旧簇数放不进新数据区：扩容不可行，保持现状。 */
+        dg_note("ESP cannot hold old clusters at larger cluster size; keep current size");
+        return 0;
+    }
     new_total = fs_total;
 
     dg_note("Growing ESP");
@@ -1357,9 +1373,13 @@ void firstinit_disk_grow(const struct dkm_kernel_api *api,
         moved = 1;
         dg_info("[firstinit] GPT expanded");
     }
-    fat = dg_grow_fat32(disk.dev, disk.esp.start, n1);
-    ext4 = dg_grow_ext4(disk.dev, p2_new, n2);
-    ntfs = dg_grow_ntfs(disk.dev, p3_new, n3);
+    /* 只有分区本身变大才扩文件系统。打包器按 25GiB 定长切片，VBR/SB 的
+     * "total" 通常比分区少几十个扇区（mkfs 对齐），若此时仍强行扩，
+     * FAT32 会因元数据吃掉增量而失败、NTFS 也会在校验位图时 panic。
+     * 分区尺寸没变 = 文件系统已在 mkfs 定好的可用范围内，直接跳过。 */
+    fat = n1 > disk.esp.size ? dg_grow_fat32(disk.dev, disk.esp.start, n1) : 0;
+    ext4 = n2 > disk.data.size ? dg_grow_ext4(disk.dev, p2_new, n2) : 0;
+    ntfs = n3 > disk.win.size ? dg_grow_ntfs(disk.dev, p3_new, n3) : 0;
     if (moved || fat || ext4) dg_reload(fat || moved, ext4 || moved);
     if (moved || fat || ext4 || ntfs) dg_note("Partition expand done");
     else dg_info("[firstinit] disk grow: already full");
