@@ -38,12 +38,18 @@ static void serial_write(const char *text) {
     }
 }
 
-static void serial_status(const char *label, EFI_STATUS status) {
-    static const char hex[] = "0123456789abcdef";
+static void serial_hex(const char *label, u64 value) {
     serial_write(label);
-    for (int shift = 60; shift >= 0; shift -= 4)
-        serial_putc(hex[(status >> shift) & 0xF]);
+    /* 不查表：全部算术生成，避免依赖 .rdata 里的常量数组。 */
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        u32 v = (u32)((value >> shift) & 0xF);
+        serial_putc((char)(v < 10 ? ('0' + (char)v) : ('a' + (char)(v - 10))));
+    }
     serial_write("\n");
+}
+
+static void serial_status(const char *label, EFI_STATUS status) {
+    serial_hex(label, (u64)status);
 }
 
 static const EFI_GUID EFI_DEVICE_PATH_PROTOCOL_GUID =
@@ -217,6 +223,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     if (status != EFI_SUCCESS || !child) {
         serial_write("[WINBOOT] WIN-E27 bootmgfw LoadImage failed\n");
         return EFI_ABORTED;
+    }
+    /* 打印子映像的加载信息：确认 bootmgfw 到底被装到哪、多大。 */
+    {
+        EFI_LOADED_IMAGE_PROTOCOL *cli = 0;
+        if (st->BootServices->HandleProtocol(
+                child, (EFI_GUID *)&EFI_LOADED_IMAGE_PROTOCOL_GUID,
+                (void **)&cli) == EFI_SUCCESS && cli) {
+            u64 *raw = (u64 *)cli;      /* ImageBase @ +64, ImageSize @ +72 */
+            serial_hex("[WINBOOT] child base ", raw[8]);
+            serial_hex("[WINBOOT] child size ", raw[9]);
+        } else {
+            serial_write("[WINBOOT] child loaded-image unavailable\n");
+        }
     }
     serial_write("[WINBOOT] starting Microsoft Boot Manager\n");
     usize exit_size = 0;
